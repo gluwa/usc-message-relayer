@@ -1,0 +1,91 @@
+# usc-message-relayer configuration reference.
+#
+# Load with:  message-relayer --config config.yaml
+# The two Creditcoin RPC URLs are passed via CLI/env, not this file (see README §Configuration):
+#   --cc3-rpc-url / RELAYER_CC3_RPC_URL                  (Substrate RPC, reserved)
+#   --creditcoin-eth-rpc-url / RELAYER_CC3_ETH_RPC_URL   (Creditcoin EVM RPC — Outbox reads)
+#
+# Secrets: any ${PLACEHOLDER} you leave in this file must be substituted before start
+# (the Helm chart does this from mounted secret files); the binary does not expand env vars here.
+
+# HTTP server: GET /health, GET /metrics (Prometheus), GET /votes/{message_hash}.
+bind_host: "0.0.0.0"
+bind_port: 3200
+
+p2p:
+  # libp2p (QUIC+TCP) port for the gossipsub mesh shared with the attestors.
+  port: 9100
+  # Optional stable identity (32-byte hex seed `0x…` or a BIP39 mnemonic). Without it a fresh
+  # ephemeral key is generated per start and the PeerId changes on every restart.
+  # identity: "${P2P_IDENTITY}"
+  # Multiaddrs of attestor bootnodes to dial at startup.
+  boot_nodes:
+    - "/dns4/attestor-0.example.internal/udp/9000/quic-v1"
+  # Advertised external address (behind NAT / k8s service).
+  # public_addr: "/dns4/relayer.example.internal/udp/9100/quic-v1"
+  # Disable mDNS peer discovery (keep true outside of local dev).
+  no_mdns: true
+
+# In-memory vote pool bounds (RAM ∝ max_messages × attestor-set size).
+vote_cache:
+  ttl_seconds: 1800
+  max_messages: 10000
+
+delivery:
+  # eth_call deliverMessage before paying gas; catches vote-validation reverts for free.
+  simulate_before_send: true
+  # RPC-level retries inside the delivery worker (the pool adds its own bounded redispatch on top).
+  max_retries: 5
+  gas_multiplier: 1.2
+
+# Blocks to rewind the persisted scan cursors on startup. Pool votes and the pending-ack queue are
+# memory-only, so work in flight when the process died is re-discovered by re-scanning a recent
+# window; already-finished items resolve idempotently. 0 disables.
+scan_lookback_blocks: 600
+
+# One entry per (Creditcoin chain_key → destination chain) route.
+routes:
+  - # USC chain key of the destination chain, as registered in the runtime's SupportedChains.
+    chain_key: 7
+    # EVM chain id of the Creditcoin chain (bound into messageHash).
+    creditcoin_chain_id: 102035
+    # Outbox on Creditcoin publishing this route's messages. Required until the OutboxFactory
+    # resolver ships (the factory-based resolution is a stub).
+    outbox_address: "0x9D77bb69Bff057Db66d523F1D1a37e6a976a3af9"
+    # Destination-chain RPC. https:// is preferred over wss:// — discovery is polling-based, and
+    # idle websockets get killed by RPC load balancers (hourly reconnect noise).
+    destination_rpc_url: "https://ethereum-sepolia-rpc.publicnode.com"
+    # Inbox on the destination chain receiving deliverMessage.
+    inbox_address: "0x1111111111111111111111111111111111111111"
+    # Destination-chain key paying gas for deliverMessage (hex private key).
+    signer_key: "${ROUTE_0_SIGNER_KEY}"
+    # Creditcoin blocks to lag the Outbox scan behind the tip. Creditcoin has deterministic
+    # (GRANDPA) finality, so a small value is safe.
+    block_confirmation_depth: 0
+    # First Creditcoin block to scan on the very first run (no checkpoint yet). Omit = start at head.
+    # start_block: 12345
+
+    # Attestor allowlist + quorum. Threshold is ⌊2N/3⌋+1 unless threshold_override is set.
+    attestor_set:
+      # On-chain source (recommended): read attestors()/threshold() from the EOAValidator on the
+      # destination chain, hot-reloaded every 30s — set changes need no relayer restart.
+      kind: evm_contract
+      address: "0x71A21Ea8d28D3a0618d61d478Ee20DCB64be8082"
+      # -- or a static list (must match EOAValidator.threshold() or delivery reverts): --
+      # kind: static
+      # addresses:
+      #   - "0x000000000000000000000000000000000000000a"
+      #   - "0x000000000000000000000000000000000000000b"
+    # threshold_override: 9
+
+    # Optional trust-minimized acknowledgment submitter (proof-based, permissionless).
+    ack:
+      # proof-gen API serving native USC proofs: GET /api/v1/proof-by-tx/{chain_key}/{tx_hash}.
+      proof_gen_url: "http://proof-gen-api:3100"
+      # AcknowledgmentValidator on Creditcoin (the submit target).
+      validator_address: "0x98f31a518964479d07b280BA156477682A66a8D6"
+      # Creditcoin key paying gas for submitAcknowledgment (needs funds, not authority).
+      signer_key: "${ROUTE_0_ACK_SIGNER_KEY}"
+      # Destination blocks to lag the MessageDelivered scan (reorg safety on the unsafe head).
+      confirmation_depth: 32
+      # start_block: 0

@@ -1,0 +1,51 @@
+[workspace]
+members = ["message-relayer", "write-ability"]
+resolver = "2"
+
+[workspace.package]
+authors = ["Gluwa Inc. Developer Support <support.dev@gluwa.com>"]
+edition = "2021"
+license = "Unlicense"
+publish = false
+repository = "https://github.com/gluwa/usc-message-relayer/"
+version = "0.1.0"
+
+# Versions are kept aligned with the creditcoin3 workspace the attestor builds from —
+# `alloy`, `libp2p`, `parity-scale-codec`, and `sha3` in particular sit on the wire path
+# (vote envelopes, message hashing) and must not drift. See write-ability/README.md.
+[workspace.dependencies]
+alloy = { version = "0.11", features = [
+    "node-bindings",
+    "providers",
+    "provider-http",
+    "provider-ws",
+    "rpc-client",
+    "rpc-types",
+    "rpc-types-eth",
+    "consensus",
+    "rlp",
+    "contract",
+    "sol-types",
+    "signers",
+] }
+anyhow = { version = "1.0.68", default-features = false }
+async-trait = { version = "0.1.42" }
+axum = { version = "0.8" }
+clap = { version = "4.5.3", features = ["derive", "env"] }
+futures = { version = "0.3.30" }
+hex = { version = "0.4.3", default-features = false }
+libp2p = { version = "0.56", default-features = false }
+parity-scale-codec = { version = "3.6", default-features = false }
+prometheus-client = { version = "0.24.0" }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1.0.197", default-features = false }
+serde_json = { version = "1.0.145", default-features = false }
+serde_yaml = { version = "0.9.34" }
+sha3 = { version = "0.10", default-features = false }
+sysinfo = { version = "0.37.2" }
+tempfile = { version = "3.10", default-features = false }
+tokio = { version = "1.37.0" }
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+write-ability = { path = "write-ability" }
+zeroize = { version = "1.8", features = ["derive"] }
