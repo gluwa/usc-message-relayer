@@ -12,8 +12,8 @@ use alloy::primitives::Address;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use message_relayer::config::{
-    AckConfig, AttestorSet, ChainRoute, Config, P2pConfig, DEFAULT_BLOCK_CONFIRMATION_DEPTH,
-    DEFAULT_P2P_PORT,
+    AckConfig, AttestorSet, ChainRoute, ClaimConfig, Config, P2pConfig,
+    DEFAULT_BLOCK_CONFIRMATION_DEPTH, DEFAULT_P2P_PORT,
 };
 use message_relayer::Server;
 use tracing::{debug, info};
@@ -116,6 +116,29 @@ struct Cli {
     /// reorg guard). 0 for instant-finality destinations.
     #[arg(long, default_value_t = 0, env = "RELAYER_ACK_CONFIRMATION_DEPTH")]
     ack_confirmation_depth: u64,
+
+    // ---------- claim submitter (opt-in; all four required to enable) --------------------------
+    /// Proof-gen API base URL for claim proofs. Enables the claim submitter ("relayer on both
+    /// sides") when set together with the other three `--claim-*` flags.
+    #[arg(long, env = "RELAYER_CLAIM_PROOF_GEN_URL", required = false)]
+    claim_proof_gen_url: Option<String>,
+
+    /// Contract on the destination (client) chain whose `Locked` events are watched.
+    #[arg(long, env = "RELAYER_CLAIM_SOURCE_BRIDGE_ADDRESS", required = false)]
+    claim_source_bridge_address: Option<String>,
+
+    /// Proof consumer on Creditcoin the claim is submitted to (currently `CcBridge`).
+    #[arg(long, env = "RELAYER_CLAIM_TARGET_ADDRESS", required = false)]
+    claim_target_address: Option<String>,
+
+    /// Hex private key for the Creditcoin-side claim wallet (needs gas, not authority).
+    #[arg(long, env = "RELAYER_CLAIM_SIGNER_KEY", required = false)]
+    claim_signer_key: Option<String>,
+
+    /// Blocks to lag behind the client-chain tip when scanning for locks (≈ chain finality,
+    /// e.g. 64 for Sepolia).
+    #[arg(long, default_value_t = 0, env = "RELAYER_CLAIM_CONFIRMATION_DEPTH")]
+    claim_confirmation_depth: u64,
 
     // ---------- durability --------------------------------------------------------------------
     /// File for persistent per-watcher block cursors so the relayer resumes from the last processed
@@ -251,6 +274,34 @@ fn single_route_config(cli: Cli) -> Result<Config> {
         ),
     };
 
+    // Claim submitter is opt-in: enabled only when all four flags are present.
+    let claim = match (
+        cli.claim_proof_gen_url,
+        cli.claim_source_bridge_address,
+        cli.claim_target_address,
+        cli.claim_signer_key,
+    ) {
+        (Some(proof_gen_url), Some(source_raw), Some(target_raw), Some(signer_key)) => {
+            let source_bridge_address = Address::from_str(source_raw.trim())
+                .with_context(|| format!("invalid --claim-source-bridge-address: {source_raw}"))?;
+            let target_address = Address::from_str(target_raw.trim())
+                .with_context(|| format!("invalid --claim-target-address: {target_raw}"))?;
+            Some(ClaimConfig {
+                proof_gen_url,
+                source_bridge_address,
+                target_address,
+                signer_key,
+                confirmation_depth: cli.claim_confirmation_depth,
+                start_block: None,
+            })
+        }
+        (None, None, None, None) => None,
+        _ => bail!(
+            "--claim-proof-gen-url, --claim-source-bridge-address, --claim-target-address and \
+             --claim-signer-key must all be set together to enable the claim submitter"
+        ),
+    };
+
     let route = ChainRoute {
         chain_key,
         creditcoin_chain_id: cc3_chain_id,
@@ -263,6 +314,7 @@ fn single_route_config(cli: Cli) -> Result<Config> {
         attestor_set: AttestorSet::Static(attestor_addresses),
         threshold_override: cli.threshold_override,
         ack,
+        claim,
     };
 
     let checkpoint = checkpoint_path_opt(&cli.checkpoint_path);

@@ -80,6 +80,7 @@ Workers communicate over `mpsc` channels only — the pool owns all aggregation 
 | p2p worker (one swarm) | `src/p2p/` | gossipsub mesh with the attestors: receive votes, publish reobservation requests |
 | Delivery worker (per route) | `src/delivery/` | Simulate + send `deliverMessage`, classify outcomes, bounded retries |
 | Ack submitter (per route, opt-in) | `src/ack/` | `MessageDelivered` → proof-gen → `submitAcknowledgment` |
+| Claim submitter (per route, opt-in) | `src/claim/` | bridge `Locked` → proof-gen → `CcBridge.claim` on Creditcoin ("relayer on both sides": users only send the lock tx) |
 | Attestor-set watcher (per on-chain route) | `src/attestor_set.rs` | Poll `EOAValidator.attestors()/threshold()` every 30 s, hot-reload the pool |
 | HTTP + metrics | `src/prom/` | `/health`, `/metrics`, `/votes/{message_hash}` |
 
@@ -242,6 +243,9 @@ Dockerfile               two-stage image build
   discovery lands when the `OutboxFactory` contract ships.
 - **`cc3_active_set` attestor source is unimplemented** — use `evm_contract` (hot-reloaded) or
   `static`.
-- **Bridge claim submission** (relayer submitting `CcBridge.claim` on behalf of users — "relayer
-  on both sides") is designed but not yet built; it mirrors the ack submitter with a `Locked`
-  watcher and a `claimed()` pre-check.
+- **Generic intent target** — the claim submitter currently targets the bridge PoC's
+  `CcBridge.claim`; when the reviewed `IUSCBridgeInbound.bridgeFromIntent` contracts deploy, the
+  swap is an ABI + config change confined to `src/claim/` (identical proof arguments).
+- **Fee integration** — quote-gated delivery (`getMessageInfo` / gas-limit pre-check /
+  `requestTopUp`) and the `RelayerFeeVault.claimDelivery` payment loop land once the
+  RelayerContract/vault/Quoter suite deploys; today the relayer delivers and claims for free.

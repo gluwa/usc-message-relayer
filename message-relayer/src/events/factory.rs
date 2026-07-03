@@ -74,6 +74,7 @@ mod tests {
             )]),
             threshold_override: None,
             ack: None,
+            claim: None,
         }
     }
 

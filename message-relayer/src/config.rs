@@ -82,6 +82,11 @@ pub struct ChainRoute {
     /// and submits it to the source-chain `AcknowledgmentValidator`. `None` disables ack for the
     /// route (the default).
     pub ack: Option<AckConfig>,
+    /// Opt-in claim submission ("relayer on both sides"). When set, the relayer watches the
+    /// destination (client) chain for the configured intent event (`Locked` on the bridge),
+    /// fetches a native USC proof, and submits it to the Creditcoin-side claim target so the
+    /// user never has to claim manually. `None` disables it for the route (the default).
+    pub claim: Option<ClaimConfig>,
 }
 
 /// Off-chain acknowledgment submitter config (research §05/§10). See [`ChainRoute::ack`].
@@ -100,6 +105,29 @@ pub struct AckConfig {
     /// ack for a delivery that later disappears). 0 for instant-finality destinations.
     pub confirmation_depth: u64,
     /// First destination block to scan on first run when no persisted ack checkpoint exists.
+    pub start_block: Option<u64>,
+}
+
+/// Claim submitter config ("relayer on both sides"). See [`ChainRoute::claim`].
+#[derive(Debug, Clone)]
+pub struct ClaimConfig {
+    /// Base URL of the proof-gen API server (e.g. `http://127.0.0.1:3100`). The submitter calls
+    /// `GET {base}/api/v1/proof-by-tx/{chain_key}/{tx_hash}`.
+    pub proof_gen_url: String,
+    /// Contract on the destination (client) chain whose intent events are watched — currently the
+    /// bridge emitting `Locked(address indexed, uint256, uint256)`.
+    pub source_bridge_address: Address,
+    /// Proof consumer on Creditcoin the claim is submitted to — currently `CcBridge.claim(..)`;
+    /// swaps to `IUSCBridgeInbound.bridgeFromIntent(..)` when the generic contract deploys.
+    pub target_address: Address,
+    /// EVM key used to sign claim txs on Creditcoin. Claims are permissionless (payouts go to the
+    /// recipients proven in the logs), so this only needs gas, not authority.
+    pub signer_key: String,
+    /// Blocks to lag behind the client-chain tip when scanning for locks. Should approximate the
+    /// chain's finality (e.g. 64 for Sepolia's EvmFinalized); proof-gen additionally gates on
+    /// attestation, so a smaller value just means more BlockNotReady deferrals.
+    pub confirmation_depth: u64,
+    /// First client-chain block to scan on first run when no persisted claim checkpoint exists.
     pub start_block: Option<u64>,
 }
 
@@ -312,12 +340,26 @@ pub struct ChainRouteFile {
     pub threshold_override: Option<u32>,
     #[serde(default)]
     pub ack: Option<AckConfigFile>,
+    #[serde(default)]
+    pub claim: Option<ClaimConfigFile>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct AckConfigFile {
     pub proof_gen_url: String,
     pub validator_address: String,
+    pub signer_key: String,
+    #[serde(default)]
+    pub confirmation_depth: u64,
+    #[serde(default)]
+    pub start_block: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ClaimConfigFile {
+    pub proof_gen_url: String,
+    pub source_bridge_address: String,
+    pub target_address: String,
     pub signer_key: String,
     #[serde(default)]
     pub confirmation_depth: u64,
@@ -467,6 +509,33 @@ impl ChainRouteFile {
             })
             .transpose()?;
 
+        let claim = self
+            .claim
+            .map(|c| {
+                let source_bridge_address =
+                    parse_address(&c.source_bridge_address).with_context(|| {
+                        format!(
+                            "invalid claim.source_bridge_address for chain_key {}",
+                            self.chain_key
+                        )
+                    })?;
+                let target_address = parse_address(&c.target_address).with_context(|| {
+                    format!(
+                        "invalid claim.target_address for chain_key {}",
+                        self.chain_key
+                    )
+                })?;
+                anyhow::Ok(ClaimConfig {
+                    proof_gen_url: c.proof_gen_url,
+                    source_bridge_address,
+                    target_address,
+                    signer_key: c.signer_key,
+                    confirmation_depth: c.confirmation_depth,
+                    start_block: c.start_block,
+                })
+            })
+            .transpose()?;
+
         Ok(ChainRoute {
             chain_key: self.chain_key,
             creditcoin_chain_id: self.creditcoin_chain_id,
@@ -479,6 +548,7 @@ impl ChainRouteFile {
             attestor_set,
             threshold_override: self.threshold_override,
             ack,
+            claim,
         })
     }
 }
@@ -521,6 +591,12 @@ routes:
       addresses:
         - "0x000000000000000000000000000000000000000a"
         - "0x000000000000000000000000000000000000000b"
+    claim:
+      proof_gen_url: "http://localhost:3100"
+      source_bridge_address: "0x0000000000000000000000000000000000000003"
+      target_address: "0x0000000000000000000000000000000000000004"
+      signer_key: "0x0000000000000000000000000000000000000000000000000000000000000001"
+      confirmation_depth: 64
 "#
     }
 
@@ -534,6 +610,14 @@ routes:
         assert_eq!(cfg.routes[0].chain_key, 2);
         assert_eq!(cfg.cc3_rpc_url, "ws://cc3:9944");
         assert!(matches!(cfg.routes[0].attestor_set, AttestorSet::Static(_)));
+        let claim = cfg.routes[0].claim.as_ref().expect("claim block parsed");
+        assert_eq!(claim.confirmation_depth, 64);
+        assert_eq!(
+            claim.source_bridge_address,
+            "0x0000000000000000000000000000000000000003"
+                .parse::<Address>()
+                .unwrap()
+        );
     }
 
     #[test]

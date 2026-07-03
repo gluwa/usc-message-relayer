@@ -34,13 +34,16 @@ pub mod abi;
 pub mod ack;
 pub mod attestor_set;
 pub mod checkpoint;
+pub mod claim;
 pub mod config;
 pub mod delivery;
 pub mod events;
 pub mod hash;
 pub mod p2p;
+pub mod pending;
 pub mod pool;
 pub mod prom;
+pub mod proofgen;
 pub mod revert;
 
 pub use config::{
@@ -215,6 +218,24 @@ impl Server {
                 &mut tasks,
                 format!("ack submitter (chain_key {})", route.chain_key),
                 ack::run(
+                    route.clone(),
+                    self.config.creditcoin_eth_rpc_url.clone(),
+                    checkpoint.clone(),
+                    self.config.scan_lookback_blocks,
+                    cancel.clone(),
+                ),
+            );
+        }
+
+        // Claim submitters (per route, opt-in — the "relayer on both sides"). Each watches the
+        // destination (client) chain for bridge `Locked` events, fetches a native USC proof, and
+        // submits the claim on Creditcoin so users never claim manually. Routes without `claim`
+        // config are skipped.
+        for route in self.config.routes.iter().filter(|r| r.claim.is_some()) {
+            spawn_worker(
+                &mut tasks,
+                format!("claim submitter (chain_key {})", route.chain_key),
+                claim::run(
                     route.clone(),
                     self.config.creditcoin_eth_rpc_url.clone(),
                     checkpoint.clone(),

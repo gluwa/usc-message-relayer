@@ -18,26 +18,25 @@
 //! call. A transaction whose block is not yet attested returns HTTP 422 (`BlockNotReady`) from the
 //! proof-gen API and is retried on the next tick.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy::network::EthereumWallet;
-use alloy::primitives::{Bytes, B256};
+use alloy::primitives::B256;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::Filter;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::{SolError, SolEvent};
 use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
-use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::abi::{ContinuityProof, IInbox, IOutbox, MerkleProof, MerkleProofEntry};
+use crate::abi::{IInbox, IOutbox};
 use crate::checkpoint::CheckpointStore;
 use crate::config::{AckConfig, ChainRoute};
+use crate::pending::{BoundedSeen, PendingTxs};
+use crate::proofgen::{ProofFetch, ProofGenClient};
 
 /// Poll cadence for the destination `MessageDelivered` watcher and the pending-proof retry queue.
 pub const ACK_POLL_INTERVAL_SECS: u64 = 6;
@@ -87,12 +86,9 @@ const NOT_READY_RETRY: Duration = Duration::from_secs(15);
 /// far beyond any healthy finality + attestation latency.
 const MAX_ACK_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Exponential backoff for *transient* submit failures (RPC down, timeout, nonce). Doubles from
-/// the base per failed attempt, capped, and gives up loudly after [`MAX_ACK_TRANSIENT_ATTEMPTS`] —
-/// a permanently failing submit (e.g. unfunded ack signer) must not hammer the RPC every tick
-/// forever.
-const TRANSIENT_BACKOFF_BASE: Duration = Duration::from_secs(30);
-const TRANSIENT_BACKOFF_MAX: Duration = Duration::from_secs(10 * 60);
+/// Give up loudly after this many *transient* submit failures (RPC down, timeout, nonce) — a
+/// permanently failing submit (e.g. unfunded ack signer) must not hammer the RPC forever. The
+/// per-attempt exponential backoff lives in [`crate::pending`].
 const MAX_ACK_TRANSIENT_ATTEMPTS: u32 = 20;
 
 /// Spawn the acknowledgment submitter for one route. Returns immediately when the route has no
@@ -187,7 +183,7 @@ pub async fn run(
     };
 
     // Destination tx hashes seen but not yet acknowledged (proof not ready / transient failure).
-    let mut pending = PendingAcks::new(MAX_PENDING_ACKS);
+    let mut pending = PendingTxs::new(MAX_PENDING_ACKS);
     // Tx hashes already acknowledged (or terminally skipped) — never re-submitted (bounded).
     let mut done = BoundedSeen::new(MAX_DONE_TRACKED);
 
@@ -244,7 +240,7 @@ async fn discover_delivered<P: Provider>(
     confirmation_depth: u64,
     provider: &P,
     last_seen: &mut u64,
-    pending: &mut PendingAcks,
+    pending: &mut PendingTxs,
     done: &BoundedSeen,
 ) -> Result<()> {
     let tip = provider.get_block_number().await?;
@@ -295,7 +291,7 @@ async fn discover_delivered<P: Provider>(
             continue;
         }
         if pending.contains(&tx_hash) {
-            pending.note_message_id(&tx_hash, message_id);
+            pending.note_meta(&tx_hash, message_id);
             continue;
         }
         if let Some(evicted) = pending.insert(tx_hash, Instant::now(), vec![message_id]) {
@@ -323,7 +319,7 @@ async fn process_pending<P: Provider>(
     outbox: Option<alloy::primitives::Address>,
     client: &ProofGenClient,
     source_provider: &P,
-    pending: &mut PendingAcks,
+    pending: &mut PendingTxs,
     done: &mut BoundedSeen,
 ) {
     // Retry oldest-first, a bounded batch per tick, so a large backlog cannot make one tick run
@@ -406,159 +402,6 @@ async fn process_pending<P: Provider>(
                         %err,
                         "ack attempt failed transiently; will retry with backoff"
                     );
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Bounded tracking structures
-// ---------------------------------------------------------------------------
-
-/// One destination tx awaiting acknowledgment.
-struct PendingAck {
-    /// When the delivery was first observed — drives cap eviction and the [`MAX_ACK_AGE`] cutoff.
-    first_seen: Instant,
-    /// Earliest next attempt ([`NOT_READY_RETRY`] deferral or transient backoff).
-    next_attempt_at: Instant,
-    /// Transient submit failures so far (NotReady deferrals do not count).
-    transient_attempts: u32,
-    /// messageIds decoded from this tx's `MessageDelivered` logs, for the requiresAck pre-check.
-    message_ids: Vec<B256>,
-}
-
-/// Destination tx hashes awaiting acknowledgment, bounded by [`MAX_PENDING_ACKS`]. Retried
-/// oldest-first; on overflow the oldest entry is evicted (an unacknowledged delivery we give up
-/// on) so the queue cannot grow without limit during a proof-gen outage.
-struct PendingAcks {
-    seen: HashMap<B256, PendingAck>,
-    cap: usize,
-}
-
-impl PendingAcks {
-    fn new(cap: usize) -> Self {
-        Self {
-            seen: HashMap::new(),
-            cap,
-        }
-    }
-
-    fn contains(&self, tx: &B256) -> bool {
-        self.seen.contains_key(tx)
-    }
-
-    fn remove(&mut self, tx: &B256) {
-        self.seen.remove(tx);
-    }
-
-    /// How long `tx` has been tracked, or `None` if unknown.
-    fn age(&self, tx: &B256, now: Instant) -> Option<Duration> {
-        self.seen
-            .get(tx)
-            .map(|e| now.saturating_duration_since(e.first_seen))
-    }
-
-    /// Track a newly-observed tx (no-op if already tracked). Returns the tx hash evicted to honour
-    /// the cap, if any — the caller logs it as an unacknowledged delivery being abandoned.
-    fn insert(&mut self, tx: B256, now: Instant, message_ids: Vec<B256>) -> Option<B256> {
-        if self.seen.contains_key(&tx) {
-            return None;
-        }
-        self.seen.insert(
-            tx,
-            PendingAck {
-                first_seen: now,
-                next_attempt_at: now,
-                transient_attempts: 0,
-                message_ids,
-            },
-        );
-        if self.seen.len() > self.cap {
-            if let Some((&oldest, _)) = self.seen.iter().min_by_key(|(_, e)| e.first_seen) {
-                self.seen.remove(&oldest);
-                return Some(oldest);
-            }
-        }
-        None
-    }
-
-    /// Append another delivered messageId to an already-tracked tx (a tx may emit several
-    /// `MessageDelivered` logs discovered across scans).
-    fn note_message_id(&mut self, tx: &B256, message_id: B256) {
-        if let Some(entry) = self.seen.get_mut(tx) {
-            if !entry.message_ids.contains(&message_id) {
-                entry.message_ids.push(message_id);
-            }
-        }
-    }
-
-    /// The oldest `n` tx hashes whose next attempt is due, oldest-first, with their messageIds.
-    fn ready(&self, n: usize, now: Instant) -> Vec<(B256, Vec<B256>)> {
-        let mut entries: Vec<(B256, Instant, Vec<B256>)> = self
-            .seen
-            .iter()
-            .filter(|(_, e)| e.next_attempt_at <= now)
-            .map(|(&h, e)| (h, e.first_seen, e.message_ids.clone()))
-            .collect();
-        entries.sort_by_key(|&(_, first_seen, _)| first_seen);
-        entries
-            .into_iter()
-            .take(n)
-            .map(|(h, _, ids)| (h, ids))
-            .collect()
-    }
-
-    /// Defer the next attempt for `tx` (proof not ready — not a failure).
-    fn defer(&mut self, tx: &B256, until: Instant) {
-        if let Some(entry) = self.seen.get_mut(tx) {
-            entry.next_attempt_at = until;
-        }
-    }
-
-    /// Record a transient submit failure: bump the attempt counter and schedule the next try with
-    /// exponential backoff. Returns the attempts so far so the caller can enforce the budget.
-    fn record_transient_failure(&mut self, tx: &B256, now: Instant) -> u32 {
-        let Some(entry) = self.seen.get_mut(tx) else {
-            return 0;
-        };
-        entry.transient_attempts += 1;
-        let exp = entry.transient_attempts.saturating_sub(1).min(31);
-        let backoff = TRANSIENT_BACKOFF_BASE
-            .saturating_mul(2u32.saturating_pow(exp))
-            .min(TRANSIENT_BACKOFF_MAX);
-        entry.next_attempt_at = now + backoff;
-        entry.transient_attempts
-    }
-}
-
-/// A FIFO set of fixed capacity: insertion past `cap` evicts the oldest entry. Used to remember
-/// recently-finished tx hashes for in-session dedup without leaking memory over long uptimes.
-struct BoundedSeen {
-    set: HashSet<B256>,
-    order: VecDeque<B256>,
-    cap: usize,
-}
-
-impl BoundedSeen {
-    fn new(cap: usize) -> Self {
-        Self {
-            set: HashSet::new(),
-            order: VecDeque::new(),
-            cap,
-        }
-    }
-
-    fn contains(&self, tx: &B256) -> bool {
-        self.set.contains(tx)
-    }
-
-    fn insert(&mut self, tx: B256) {
-        if self.set.insert(tx) {
-            self.order.push_back(tx);
-            if self.set.len() > self.cap {
-                if let Some(old) = self.order.pop_front() {
-                    self.set.remove(&old);
                 }
             }
         }
@@ -747,197 +590,9 @@ fn describe_revert(err: &impl std::fmt::Display) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// proof-gen API client
-// ---------------------------------------------------------------------------
-
-/// Minimal HTTP client for the proof-gen API server's `proof-by-tx` endpoint.
-struct ProofGenClient {
-    http: reqwest::Client,
-    base: String,
-}
-
-enum ProofFetch {
-    Ready(SingleContinuityResponse),
-    /// HTTP 422 — the block containing the tx is not yet attested.
-    NotReady,
-}
-
-impl ProofGenClient {
-    fn new(base_url: &str) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .context("failed to build proof-gen HTTP client")?;
-        Ok(Self {
-            http,
-            base: base_url.trim_end_matches('/').to_string(),
-        })
-    }
-
-    async fn proof_by_tx(&self, chain_key: u64, tx_hash: B256) -> Result<ProofFetch> {
-        let url = format!(
-            "{}/api/v1/proof-by-tx/{}/{:#x}",
-            self.base, chain_key, tx_hash
-        );
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {url} failed"))?;
-
-        // 422 (BlockNotReady) is expected while the destination block is still being attested.
-        if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-            return Ok(ProofFetch::NotReady);
-        }
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .with_context(|| format!("reading body of {url}"))?;
-        if !status.is_success() {
-            anyhow::bail!("proof-gen returned {status} for {url}: {body}");
-        }
-        let parsed: SingleContinuityResponse = serde_json::from_str(&body)
-            .with_context(|| format!("decoding proof-gen response from {url}"))?;
-        Ok(ProofFetch::Ready(parsed))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// proof-gen response shape (mirrors proof-gen-api-server SingleContinuityResponse)
-// ---------------------------------------------------------------------------
-
-/// Subset of the proof-gen `SingleContinuityResponse` the submitter needs. Field names are
-/// camelCase to match the server's `#[serde(rename_all = "camelCase")]`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SingleContinuityResponse {
-    header_number: u64,
-    /// Hex-encoded prover `txBytes` (encoded tx + receipt). `None` when the server only returned a
-    /// continuity proof (no merkle inclusion) — which would not satisfy the validator.
-    tx_bytes: Option<String>,
-    continuity_proof: ContinuityProofJson,
-    merkle_proof: MerkleProofJson,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ContinuityProofJson {
-    lower_endpoint_digest: String,
-    roots: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MerkleProofJson {
-    root: String,
-    siblings: Vec<MerkleProofEntryJson>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MerkleProofEntryJson {
-    hash: String,
-    is_left: bool,
-}
-
-impl SingleContinuityResponse {
-    /// Hex-decode the prover `txBytes` into the calldata the validator expects.
-    fn encoded_transaction(&self) -> Result<Bytes> {
-        let raw = self.tx_bytes.as_deref().context(
-            "proof-gen response missing txBytes (continuity-only proof cannot be acked)",
-        )?;
-        let bytes =
-            hex::decode(raw.trim_start_matches("0x")).context("txBytes is not valid hex")?;
-        Ok(Bytes::from(bytes))
-    }
-
-    /// Convert the JSON proof bundle into the `sol!`-generated argument structs.
-    fn to_proofs(&self) -> Result<(MerkleProof, ContinuityProof)> {
-        let merkle = MerkleProof {
-            root: parse_b256(&self.merkle_proof.root).context("merkle_proof.root")?,
-            siblings: self
-                .merkle_proof
-                .siblings
-                .iter()
-                .map(|s| {
-                    Ok(MerkleProofEntry {
-                        hash: parse_b256(&s.hash).context("merkle_proof.siblings[].hash")?,
-                        isLeft: s.is_left,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?,
-        };
-
-        let continuity = ContinuityProof {
-            lowerEndpointDigest: parse_b256(&self.continuity_proof.lower_endpoint_digest)
-                .context("continuity_proof.lower_endpoint_digest")?,
-            roots: self
-                .continuity_proof
-                .roots
-                .iter()
-                .map(|r| parse_b256(r).context("continuity_proof.roots[]"))
-                .collect::<Result<Vec<_>>>()?,
-        };
-
-        Ok((merkle, continuity))
-    }
-}
-
-fn parse_b256(s: &str) -> Result<B256> {
-    B256::from_str(s.trim()).with_context(|| format!("not a 32-byte hex value: {s}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const SAMPLE: &str = r#"{
-        "chainKey": 2,
-        "headerNumber": 123,
-        "txIndex": 0,
-        "txHash": "0x1111111111111111111111111111111111111111111111111111111111111111",
-        "txBytes": "0xdeadbeef",
-        "continuityProof": {
-            "lowerEndpointDigest": "0x2222222222222222222222222222222222222222222222222222222222222222",
-            "roots": [
-                "0x3333333333333333333333333333333333333333333333333333333333333333",
-                "0x4444444444444444444444444444444444444444444444444444444444444444"
-            ]
-        },
-        "merkleProof": {
-            "root": "0x5555555555555555555555555555555555555555555555555555555555555555",
-            "siblings": [
-                { "hash": "0x6666666666666666666666666666666666666666666666666666666666666666", "isLeft": true },
-                { "hash": "0x7777777777777777777777777777777777777777777777777777777777777777", "isLeft": false }
-            ]
-        },
-        "cached": false,
-        "generatedAt": "2026-06-24T00:00:00Z"
-    }"#;
-
-    #[test]
-    fn decodes_proof_gen_response() {
-        let parsed: SingleContinuityResponse = serde_json::from_str(SAMPLE).unwrap();
-        assert_eq!(parsed.header_number, 123);
-
-        let enc = parsed.encoded_transaction().unwrap();
-        assert_eq!(enc.to_vec(), vec![0xde, 0xad, 0xbe, 0xef]);
-
-        let (merkle, continuity) = parsed.to_proofs().unwrap();
-        assert_eq!(merkle.siblings.len(), 2);
-        assert!(merkle.siblings[0].isLeft);
-        assert!(!merkle.siblings[1].isLeft);
-        assert_eq!(continuity.roots.len(), 2);
-    }
-
-    #[test]
-    fn missing_tx_bytes_is_error() {
-        let json = SAMPLE.replace("\"txBytes\": \"0xdeadbeef\",", "");
-        let parsed: SingleContinuityResponse = serde_json::from_str(&json).unwrap();
-        assert!(parsed.encoded_transaction().is_err());
-    }
 
     #[test]
     fn terminal_revert_classification() {
@@ -989,109 +644,5 @@ mod tests {
             crate::abi::IOutbox::MessageNotFound::SELECTOR,
             [0x5d, 0x80, 0x3c, 0xca]
         );
-    }
-
-    fn tx(n: u8) -> B256 {
-        B256::from([n; 32])
-    }
-
-    /// `ready(..)` tx hashes only, for FIFO assertions.
-    fn ready_txs(p: &PendingAcks, n: usize, now: Instant) -> Vec<B256> {
-        p.ready(n, now).into_iter().map(|(h, _)| h).collect()
-    }
-
-    #[test]
-    fn pending_dedupes_and_reports_no_eviction_under_cap() {
-        let mut p = PendingAcks::new(4);
-        let now = Instant::now();
-        assert!(p.insert(tx(1), now, vec![tx(9)]).is_none());
-        assert!(p.contains(&tx(1)));
-        // Re-inserting the same tx is a no-op (no eviction, still tracked once).
-        assert!(p.insert(tx(1), now, vec![tx(9)]).is_none());
-        assert_eq!(ready_txs(&p, 10, now), vec![tx(1)]);
-        // The messageIds ride along for the requiresAck pre-check.
-        assert_eq!(p.ready(10, now)[0].1, vec![tx(9)]);
-        // note_message_id appends without duplicating.
-        p.note_message_id(&tx(1), tx(9));
-        p.note_message_id(&tx(1), tx(8));
-        assert_eq!(p.ready(10, now)[0].1, vec![tx(9), tx(8)]);
-    }
-
-    #[test]
-    fn pending_evicts_oldest_on_overflow() {
-        let mut p = PendingAcks::new(2);
-        let t0 = Instant::now();
-        // Distinct, increasing timestamps so "oldest" is unambiguous.
-        assert!(p.insert(tx(1), t0, Vec::new()).is_none());
-        assert!(p
-            .insert(tx(2), t0 + Duration::from_millis(1), Vec::new())
-            .is_none());
-        // Third insert exceeds cap → evicts tx(1), the oldest.
-        let evicted = p.insert(tx(3), t0 + Duration::from_millis(2), Vec::new());
-        assert_eq!(evicted, Some(tx(1)));
-        assert!(!p.contains(&tx(1)));
-        assert!(p.contains(&tx(2)));
-        assert!(p.contains(&tx(3)));
-    }
-
-    #[test]
-    fn pending_ready_is_fifo_and_bounded_by_n() {
-        let mut p = PendingAcks::new(100);
-        let t0 = Instant::now();
-        for i in 0..5u8 {
-            p.insert(tx(i), t0 + Duration::from_millis(u64::from(i)), Vec::new());
-        }
-        let now = t0 + Duration::from_secs(1);
-        assert_eq!(ready_txs(&p, 3, now), vec![tx(0), tx(1), tx(2)]);
-        p.remove(&tx(0));
-        assert_eq!(ready_txs(&p, 3, now), vec![tx(1), tx(2), tx(3)]);
-    }
-
-    #[test]
-    fn pending_defer_and_backoff_gate_readiness() {
-        let mut p = PendingAcks::new(10);
-        let t0 = Instant::now();
-        p.insert(tx(1), t0, Vec::new());
-        assert_eq!(ready_txs(&p, 10, t0), vec![tx(1)]);
-
-        // NotReady deferral: hidden until `until`, no attempt counted.
-        p.defer(&tx(1), t0 + NOT_READY_RETRY);
-        assert!(ready_txs(&p, 10, t0).is_empty());
-        assert_eq!(ready_txs(&p, 10, t0 + NOT_READY_RETRY), vec![tx(1)]);
-
-        // Transient failures back off exponentially: 30s, 60s, 120s, … capped at 10min.
-        assert_eq!(p.record_transient_failure(&tx(1), t0), 1);
-        assert!(ready_txs(&p, 10, t0 + TRANSIENT_BACKOFF_BASE - Duration::from_secs(1)).is_empty());
-        assert_eq!(ready_txs(&p, 10, t0 + TRANSIENT_BACKOFF_BASE), vec![tx(1)]);
-        assert_eq!(p.record_transient_failure(&tx(1), t0), 2);
-        assert!(ready_txs(&p, 10, t0 + TRANSIENT_BACKOFF_BASE).is_empty());
-        assert_eq!(
-            ready_txs(&p, 10, t0 + TRANSIENT_BACKOFF_BASE * 2),
-            vec![tx(1)]
-        );
-        // Deep attempt counts saturate at the cap instead of overflowing.
-        for _ in 0..40 {
-            p.record_transient_failure(&tx(1), t0);
-        }
-        assert_eq!(ready_txs(&p, 10, t0 + TRANSIENT_BACKOFF_MAX), vec![tx(1)]);
-
-        // Age is measured from first_seen, unaffected by deferrals.
-        assert_eq!(
-            p.age(&tx(1), t0 + Duration::from_secs(5)),
-            Some(Duration::from_secs(5))
-        );
-        assert_eq!(p.age(&tx(2), t0), None);
-    }
-
-    #[test]
-    fn bounded_seen_is_fifo_capped() {
-        let mut s = BoundedSeen::new(2);
-        s.insert(tx(1));
-        s.insert(tx(1)); // idempotent
-        s.insert(tx(2));
-        s.insert(tx(3)); // evicts tx(1)
-        assert!(!s.contains(&tx(1)));
-        assert!(s.contains(&tx(2)));
-        assert!(s.contains(&tx(3)));
     }
 }

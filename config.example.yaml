@@ -89,3 +89,22 @@ routes:
       # Destination blocks to lag the MessageDelivered scan (reorg safety on the unsafe head).
       confirmation_depth: 32
       # start_block: 0
+
+    # Optional claim submitter ("relayer on both sides", proof-based, permissionless): watches the
+    # destination chain for bridge Locked events, fetches a native USC proof, and submits
+    # CcBridge.claim on Creditcoin — the user only ever sends the lock tx. Claims cannot be
+    # redirected (the contract pays the recipients proven in the logs) and racing a manual claim
+    # is harmless (AlreadyClaimed dedup).
+    claim:
+      # proof-gen API serving native USC proofs for this route's chain_key.
+      proof_gen_url: "http://proof-gen-api:3100"
+      # Contract on the destination chain emitting Locked(address indexed, uint256, uint256).
+      source_bridge_address: "0x89A9f943280b6EDa949A75AB1Bb884048701D932"
+      # Proof consumer on Creditcoin (CcBridge today; IUSCBridgeInbound.bridgeFromIntent later).
+      target_address: "0x37267A7586d4163FD6BFB7C9367c8418FD4C3ef4"
+      # Creditcoin key paying gas for claim (needs funds, not authority).
+      signer_key: "${ROUTE_0_CLAIM_SIGNER_KEY}"
+      # Destination blocks to lag the Locked scan — approximate the chain's finality
+      # (64 ≈ Sepolia EvmFinalized); proof-gen additionally gates on attestation.
+      confirmation_depth: 64
+      # start_block: 0
