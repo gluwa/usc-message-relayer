@@ -14,7 +14,7 @@
 # /bin/sh wrapper substitutes mounted secrets into the config, then execs the binary.
 
 # Matches rust-toolchain.toml.
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.96-bookworm AS builder
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         clang libclang-dev cmake pkg-config libssl-dev protobuf-compiler && \
