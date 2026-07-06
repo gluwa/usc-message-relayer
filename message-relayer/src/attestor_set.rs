@@ -49,7 +49,7 @@ pub async fn run(
     };
 
     let provider = ProviderBuilder::new()
-        .on_builtin(&route.destination_rpc_url)
+        .connect(&route.destination_rpc_url)
         .await
         .with_context(|| {
             format!(
@@ -117,15 +117,13 @@ async fn read_set<P: Provider>(provider: &P, validator: Address) -> Result<(Vec<
         .attestors()
         .call()
         .await
-        .context("IVoteValidator.attestors() call failed")?
-        ._0;
+        .context("IVoteValidator.attestors() call failed")?;
 
     let threshold_u256 = validator
         .threshold()
         .call()
         .await
-        .context("IVoteValidator.threshold() call failed")?
-        ._0;
+        .context("IVoteValidator.threshold() call failed")?;
     // Saturate rather than panic on an absurd on-chain value; an over-large threshold simply means
     // "never deliver", which is the safe direction.
     let threshold = u64::try_from(threshold_u256).unwrap_or(u64::MAX) as usize;

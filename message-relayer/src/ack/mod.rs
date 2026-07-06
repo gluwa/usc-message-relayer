@@ -111,7 +111,7 @@ pub async fn run(
 
     // Read-only provider on the destination chain (where MessageDelivered is emitted).
     let dest_provider = ProviderBuilder::new()
-        .on_builtin(&route.destination_rpc_url)
+        .connect(&route.destination_rpc_url)
         .await
         .with_context(|| {
             format!(
@@ -129,7 +129,7 @@ pub async fn run(
     let submitter_address = signer.address();
     let source_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
-        .on_builtin(&creditcoin_eth_rpc_url)
+        .connect(&creditcoin_eth_rpc_url)
         .await
         .with_context(|| {
             format!(
@@ -280,7 +280,7 @@ async fn discover_delivered<P: Provider>(
         }
         // The delivered messageId feeds the requiresAck pre-check on the source Outbox, so bridge
         // traffic never costs a proof fetch. A tx may carry several MessageDelivered logs.
-        let message_id = match IInbox::MessageDelivered::decode_log(&log.inner, true) {
+        let message_id = match IInbox::MessageDelivered::decode_log(&log.inner) {
             Ok(decoded) => decoded.data.messageId,
             Err(err) => {
                 warn!(chain_key, %tx_hash, %err, "could not decode MessageDelivered log; skipping");
@@ -530,7 +530,6 @@ async fn any_requires_ack<P: Provider>(
             .call()
             .await
             .context("IOutbox.messageRequiresAck call failed")?
-            ._0
         {
             continue;
         }

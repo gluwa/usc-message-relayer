@@ -178,7 +178,7 @@ pub async fn run(
 
     // Read-only provider on the client chain (where the intent events are emitted).
     let client_provider = ProviderBuilder::new()
-        .on_builtin(&route.destination_rpc_url)
+        .connect(&route.destination_rpc_url)
         .await
         .with_context(|| {
             format!(
@@ -197,7 +197,7 @@ pub async fn run(
     let submitter_address = signer.address();
     let cc_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
-        .on_builtin(&creditcoin_eth_rpc_url)
+        .connect(&creditcoin_eth_rpc_url)
         .await
         .with_context(|| {
             format!(
@@ -330,7 +330,7 @@ async fn discover_locks<P: Provider>(
             warn!(chain_key, "Locked log without transaction_hash; skipping");
             continue;
         };
-        let key = match ISourceBridge::Locked::decode_log(&log.inner, true) {
+        let key = match ISourceBridge::Locked::decode_log(&log.inner) {
             Ok(decoded) => claim_key(
                 decoded.data.ccRecipient,
                 decoded.data.amount,
@@ -546,7 +546,6 @@ async fn any_unclaimed<P: Provider>(provider: &P, target: Address, keys: &[B256]
             .call()
             .await
             .context("IClaimTarget.claimed call failed")?
-            ._0
         {
             return Ok(true);
         }
