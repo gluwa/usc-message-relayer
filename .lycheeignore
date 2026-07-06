@@ -1,0 +1,5 @@
+# Internal service URLs referenced in config examples/docs — not reachable from CI.
+# proof-gen API is an in-cluster service (see config.example.yaml ack/claim routes).
+http://proof-gen-api(.*)
+# MegaLinter issue link in the workflow comment (valid URL, intermittently 502s in CI).
+https://github.com/oxsecurity/megalinter/issues(.*)
