@@ -33,6 +33,23 @@ jobs:
       - name: Check dependabot.yml covers all ecosystems/directories
         run: bash .github/scripts/check-dependabot-coverage.sh
 
+  rustc-version-match:
+    name: Dockerfile rustc matches rust-toolchain.toml
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare rustc versions
+        run: |
+          set -euo pipefail
+          version=$(grep channel rust-toolchain.toml | grep -oE '[0-9]+\.[0-9]+')
+          if ! grep -q "FROM rust:$version" Dockerfile; then
+            echo "::error::Dockerfile does not pin canonical rustc $version from rust-toolchain.toml"
+            grep -i '^FROM rust:' Dockerfile
+            exit 1
+          fi
+          echo "Dockerfile pins canonical rustc $version"
+
   cargo-fmt:
     runs-on: ubuntu-24.04
     steps:
