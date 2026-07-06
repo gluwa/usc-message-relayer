@@ -9,6 +9,10 @@ on:
     branches: [main]
     tags: ["v*"]
 
+# Least-privilege default for the GITHUB_TOKEN; jobs opt into more as needed
+# (github-release sets contents: write). Satisfies checkov CKV2_GHA_1.
+permissions: read-all
+
 env:
   IMAGE: gluwa/usc-message-relayer
 
