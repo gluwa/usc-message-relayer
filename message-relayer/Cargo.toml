@@ -85,7 +85,7 @@ default = []
 integration-tests = []
 
 [dev-dependencies]
-alloy-node-bindings = "0.11"
+alloy-node-bindings = "0.12"
 async-trait = { workspace = true }
 parameterized = "2.1.0"
 tempfile = { workspace = true }
