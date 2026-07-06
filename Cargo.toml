@@ -36,13 +36,13 @@ futures = { version = "0.3.30" }
 hex = { version = "0.4.3", default-features = false }
 libp2p = { version = "0.56", default-features = false }
 parity-scale-codec = { version = "3.6", default-features = false }
-prometheus-client = { version = "0.24.0" }
+prometheus-client = { version = "0.25.0" }
 reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1.0.197", default-features = false }
 serde_json = { version = "1.0.145", default-features = false }
 serde_yaml = { version = "0.9.34" }
-sha3 = { version = "0.10", default-features = false }
-sysinfo = { version = "0.37.2" }
+sha3 = { version = "0.12", default-features = false }
+sysinfo = { version = "0.39.5" }
 tempfile = { version = "3.10", default-features = false }
 tokio = { version = "1.37.0" }
 tracing = "0.1.37"
