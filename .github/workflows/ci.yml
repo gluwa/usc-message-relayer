@@ -22,6 +22,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  dependabot-coverage:
+    name: Dependabot config coverage
+    runs-on: ubuntu-24.04
+    # Warns (and fails) if a Cargo.toml/Cargo.lock, Dockerfile*, workflow, or
+    # other manifest exists in the tree but isn't registered in
+    # .github/dependabot.yml.
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check dependabot.yml covers all ecosystems/directories
+        run: bash .github/scripts/check-dependabot-coverage.sh
+
   cargo-fmt:
     runs-on: ubuntu-24.04
     steps:
