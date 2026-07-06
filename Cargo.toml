@@ -14,7 +14,7 @@ version = "0.1.0"
 # `alloy`, `libp2p`, `parity-scale-codec`, and `sha3` in particular sit on the wire path
 # (vote envelopes, message hashing) and must not drift. See write-ability/README.md.
 [workspace.dependencies]
-alloy = { version = "0.11", features = [
+alloy = { version = "0.12", features = [
     "node-bindings",
     "providers",
     "provider-http",
