@@ -75,7 +75,7 @@ pub async fn watch_outbox(
     let chain_key = route.chain_key;
     let checkpoint_key = format!("outbox:{chain_key}");
     let provider = ProviderBuilder::new()
-        .on_builtin(&creditcoin_eth_rpc_url)
+        .connect(&creditcoin_eth_rpc_url)
         .await
         .with_context(|| {
             format!(
@@ -210,7 +210,7 @@ async fn poll_once<P: Provider>(
         .with_context(|| format!("eth_getLogs from {from_block} to {to_block} failed"))?;
 
     for log in logs {
-        match IOutbox::MessagePublished::decode_log(&log.inner, true) {
+        match IOutbox::MessagePublished::decode_log(&log.inner) {
             Ok(decoded) => {
                 let Some(tx_hash) = log.transaction_hash else {
                     warn!(

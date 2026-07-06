@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{Address, PrimitiveSignature, B256};
+use alloy::primitives::{Address, Signature, B256};
 use anyhow::Result;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -682,7 +682,7 @@ impl RouteState {
 }
 
 fn recover_signer(hash: &B256, raw: &[u8; 65]) -> Result<Address> {
-    let sig: PrimitiveSignature = raw[..]
+    let sig: Signature = raw[..]
         .try_into()
         .map_err(|e| anyhow::anyhow!("malformed signature bytes: {e}"))?;
     sig.recover_address_from_prehash(hash)

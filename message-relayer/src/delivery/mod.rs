@@ -107,7 +107,7 @@ pub async fn run(
     let wallet = EthereumWallet::from(signer);
     let provider = ProviderBuilder::new()
         .wallet(wallet)
-        .on_builtin(&route.destination_rpc_url)
+        .connect(&route.destination_rpc_url)
         .await
         .with_context(|| {
             format!(
@@ -407,7 +407,7 @@ fn spawn_pending_retry<P: Provider + 'static>(
             tokio::time::sleep(*delay).await;
             // Someone (a dApp user, another relayer) may have completed the retry meanwhile.
             match inbox.isPending(message_id).call().await {
-                Ok(ret) if !ret._0 => {
+                Ok(ret) if !ret => {
                     info!(chain_key, %message_id, "♻️ pending message already resolved");
                     return;
                 }
