@@ -66,14 +66,19 @@ echo ""
 # --- 2. Every runs-on in every workflow -------------------------------------
 echo "Checking runs-on values in ${WORKFLOW_DIR}:"
 if [[ -d "${WORKFLOW_DIR}" ]]; then
+  # Literal GitHub Actions expression opener. We match it as a literal substring
+  # and never want it expanded, so single quotes are intentional here.
+  # shellcheck disable=SC2016
+  expr_open='${{'
   while IFS= read -r wf; do
+    rel="${wf#"${REPO_ROOT}"/}"
     # Extract the value after `runs-on:` on each line; ignore matrix refs.
     while IFS= read -r line; do
       val="$(echo "${line}" | sed -E 's/.*runs-on:[[:space:]]*//; s/[[:space:]]*$//')"
       # Skip templated / matrix expressions like ${{ matrix.os }} — nothing to
       # compare statically, but flag them so they don't silently bypass the check.
-      if [[ "${val}" == *'${{'* ]]; then
-        echo "::error file=${wf#${REPO_ROOT}/}::runs-on uses a dynamic expression ('${val}'); pin it to ${RUNNER_LABEL} for sync enforcement"
+      if [[ "${val}" == *"${expr_open}"* ]]; then
+        echo "::error file=${rel}::runs-on uses a dynamic expression ('${val}'); pin it to ${RUNNER_LABEL} for sync enforcement"
         fail=1
         continue
       fi
@@ -81,9 +86,9 @@ if [[ -d "${WORKFLOW_DIR}" ]]; then
       val="${val%\"}"; val="${val#\"}"
       val="${val%\'}"; val="${val#\'}"
       if [[ "${val}" == "${RUNNER_LABEL}" ]]; then
-        echo "  ok   ${wf#${REPO_ROOT}/}: runs-on: ${val}"
+        echo "  ok   ${rel}: runs-on: ${val}"
       else
-        echo "::error file=${wf#${REPO_ROOT}/}::runs-on '${val}' does not match canonical '${RUNNER_LABEL}'"
+        echo "::error file=${rel}::runs-on '${val}' does not match canonical '${RUNNER_LABEL}'"
         fail=1
       fi
     done < <(grep -nE '^[[:space:]]*runs-on:' "${wf}" || true)
