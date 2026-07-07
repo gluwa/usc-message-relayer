@@ -13,9 +13,9 @@
 # a shell, matching how the creditcoin-message-relayer Helm chart invokes it — the chart's
 # /bin/sh wrapper substitutes mounted secrets into the config, then execs the binary.
 #
-# The runtime stage uses ubuntu:24.04 to match the CI runner OS (ubuntu-24.04); the
+# The runtime stage uses ubuntu:26.04 to match the CI runner OS (ubuntu-26.04); the
 # check-image-sync CI job enforces that these stay aligned. Building on the older
-# rust:1.96-bookworm (glibc 2.36) and running on ubuntu:24.04 (glibc 2.39) is the safe
+# rust:1.96-bookworm (glibc 2.36) and running on ubuntu:26.04 (glibc 2.39) is the safe
 # forward-compatible direction — an older build glibc links fine against a newer runtime glibc.
 
 # Matches rust-toolchain.toml.
@@ -36,9 +36,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp target/release/message-relayer /message-relayer
 
 
-# Runtime base is kept in sync with the CI runner OS (ubuntu-24.04) by
+# Runtime base is kept in sync with the CI runner OS (ubuntu-26.04) by
 # .github/scripts/check-image-sync.sh — update both together.
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates libssl3 && \
     rm -rf /var/lib/apt/lists/* && \
