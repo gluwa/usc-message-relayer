@@ -33,6 +33,17 @@ jobs:
       - name: Check dependabot.yml covers all ecosystems/directories
         run: bash .github/scripts/check-dependabot-coverage.sh
 
+  image-os-sync:
+    name: Docker runtime base matches CI runner OS
+    runs-on: ubuntu-24.04
+    # Fails if the Dockerfile runtime base (ubuntu:24.04) and every workflow
+    # runs-on (ubuntu-24.04) drift apart, which risks a glibc mismatch between
+    # the CI-built binary and the image it ships in.
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check Docker runtime base and CI runners are in sync
+        run: bash .github/scripts/check-image-sync.sh
+
   rustc-version-match:
     name: Dockerfile rustc matches rust-toolchain.toml
     runs-on: ubuntu-24.04
