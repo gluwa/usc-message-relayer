@@ -22,7 +22,7 @@ set -euo pipefail
 
 # --- Canonical CI/runtime Ubuntu version -------------------------------------
 # Keep this in sync with the Dockerfile runtime FROM and all workflow runs-on.
-UBUNTU_VERSION="24.04"
+UBUNTU_VERSION="26.04"
 
 DOCKER_IMAGE="ubuntu:${UBUNTU_VERSION}"
 RUNNER_LABEL="ubuntu-${UBUNTU_VERSION}"

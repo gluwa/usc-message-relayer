@@ -24,7 +24,7 @@ env:
 jobs:
   dependabot-coverage:
     name: Dependabot config coverage
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # Warns (and fails) if a Cargo.toml/Cargo.lock, Dockerfile*, workflow, or
     # other manifest exists in the tree but isn't registered in
     # .github/dependabot.yml.
@@ -35,9 +35,9 @@ jobs:
 
   image-os-sync:
     name: Docker runtime base matches CI runner OS
-    runs-on: ubuntu-24.04
-    # Fails if the Dockerfile runtime base (ubuntu:24.04) and every workflow
-    # runs-on (ubuntu-24.04) drift apart, which risks a glibc mismatch between
+    runs-on: ubuntu-26.04
+    # Fails if the Dockerfile runtime base (ubuntu:26.04) and every workflow
+    # runs-on (ubuntu-26.04) drift apart, which risks a glibc mismatch between
     # the CI-built binary and the image it ships in.
     steps:
       - uses: actions/checkout@v7
@@ -46,7 +46,7 @@ jobs:
 
   rustc-version-match:
     name: Dockerfile rustc matches rust-toolchain.toml
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
 
@@ -62,7 +62,7 @@ jobs:
           echo "Dockerfile pins canonical rustc $version"
 
   cargo-fmt:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
 
@@ -93,7 +93,7 @@ jobs:
           taplo format --check
 
   cargo-clippy:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
 
@@ -125,7 +125,7 @@ jobs:
           args: --workspace --all-targets --locked -- -D warnings
 
   cargo-machete:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
 
@@ -147,7 +147,7 @@ jobs:
         uses: bnjbvr/cargo-machete@main
 
   cargo-test:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
 
@@ -173,7 +173,7 @@ jobs:
 
   docker:
     name: Docker build (no push)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # Image publishing happens in release.yml; this just proves the Dockerfile
     # stays buildable.
     steps:
