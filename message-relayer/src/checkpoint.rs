@@ -72,6 +72,49 @@ impl CheckpointStore {
     }
 }
 
+/// Cross-task cursor holdback for the Outbox watchers (per `chain_key`).
+///
+/// The Outbox checkpoint is written by the watcher, but "is this message finished?" is pool state —
+/// a message can sit undelivered (below quorum, or destination down) long after the scan cursor
+/// passed its block. Persisting the raw cursor therefore loses undelivered messages across a
+/// restart once they age out of the fixed lookback window: the rescan no longer reaches them, stray
+/// votes are dropped by the chain-first allowlist, and no reobservation is ever requested. The pool
+/// publishes the oldest unfinished (undelivered, non-terminal) message block per route here on its
+/// prune tick; the watcher clamps the *persisted* cursor to `oldest - 1` so a restart always
+/// re-indexes every unfinished message. The in-memory cursor is not clamped — the live scan never
+/// re-reads.
+#[derive(Debug, Default)]
+pub struct CursorHoldback {
+    /// `chain_key` → oldest unfinished message block (`None` = route has no unfinished messages).
+    oldest: Mutex<HashMap<u64, Option<u64>>>,
+}
+
+impl CursorHoldback {
+    /// Publish the oldest unfinished block for `chain_key` (`None` clears the holdback).
+    pub fn update(&self, chain_key: u64, oldest_block: Option<u64>) {
+        self.oldest
+            .lock()
+            .expect("holdback mutex")
+            .insert(chain_key, oldest_block);
+    }
+
+    /// Clamp `cursor` so it does not advance past the oldest unfinished block for `chain_key`.
+    /// Identity when the route has no unfinished messages (or has not reported yet).
+    pub fn clamp(&self, chain_key: u64, cursor: u64) -> u64 {
+        match self
+            .oldest
+            .lock()
+            .expect("holdback mutex")
+            .get(&chain_key)
+            .copied()
+            .flatten()
+        {
+            Some(oldest) => cursor.min(oldest.saturating_sub(1)),
+            None => cursor,
+        }
+    }
+}
+
 /// Write `bytes` to `path` atomically via a sibling temp file + rename.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -108,6 +151,23 @@ mod tests {
         assert_eq!(reloaded.get("outbox:2"), Some(150));
         assert_eq!(reloaded.get("ack:2"), Some(250));
         assert_eq!(reloaded.get("missing"), None);
+    }
+
+    #[test]
+    fn holdback_clamps_only_when_unfinished_work_reported() {
+        let hb = CursorHoldback::default();
+        // Unreported route: identity.
+        assert_eq!(hb.clamp(2, 1000), 1000);
+        // Unfinished message at block 400 → cursor pinned to 399.
+        hb.update(2, Some(400));
+        assert_eq!(hb.clamp(2, 1000), 399);
+        // A cursor already below the holdback is untouched.
+        assert_eq!(hb.clamp(2, 300), 300);
+        // Another route is independent.
+        assert_eq!(hb.clamp(7, 1000), 1000);
+        // Clearing (all delivered/terminal) releases the cursor.
+        hb.update(2, None);
+        assert_eq!(hb.clamp(2, 1000), 1000);
     }
 
     #[test]

@@ -354,12 +354,13 @@ impl MetricsTrait for RelayerMetrics {
 pub fn build_router(
     metrics: Arc<RelayerMetrics>,
     query_tx: tokio::sync::mpsc::Sender<crate::pool::PoolQuery>,
+    health: Arc<crate::health::Health>,
 ) -> axum::Router {
     use axum::routing::get;
     use axum::Extension;
 
     axum::Router::new()
-        .route("/health", get(|| async { axum::http::StatusCode::OK }))
+        .route("/health", get(health_handler))
         .route(
             "/metrics",
             get(|Extension(m): Extension<Arc<RelayerMetrics>>| async move {
@@ -369,6 +370,23 @@ pub fn build_router(
         .route("/votes/{message_hash}", get(votes_handler))
         .layer(Extension(metrics))
         .layer(Extension(query_tx))
+        .layer(Extension(health))
+}
+
+/// `GET /health` — `200 ok` when every registered worker has reported progress within the deadline,
+/// `503` naming the stale worker(s) otherwise, so the k8s liveness probe restarts a wedged relayer.
+async fn health_handler(
+    axum::Extension(health): axum::Extension<Arc<crate::health::Health>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match health.status() {
+        (true, _) => (axum::http::StatusCode::OK, "ok").into_response(),
+        (false, stale) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!("stale workers: {}", stale.join(", ")),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /votes/{message_hash}` — return the votes the relayer has accumulated for a message, so it

@@ -100,10 +100,12 @@ pub async fn run(
     creditcoin_eth_rpc_url: String,
     checkpoint: Option<Arc<CheckpointStore>>,
     scan_lookback_blocks: u64,
+    health: Arc<crate::health::Health>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let chain_key = route.chain_key;
     let checkpoint_key = format!("ack:{chain_key}");
+    let health_key = checkpoint_key.clone();
     let Some(ack) = route.ack.clone() else {
         debug!(chain_key, "ack disabled for route; submitter not started");
         return Ok(());
@@ -190,6 +192,9 @@ pub async fn run(
     let mut tick = tokio::time::interval(Duration::from_secs(ACK_POLL_INTERVAL_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // Register at startup so a worker that wedges before its first successful scan still goes stale.
+    health.heartbeat(&health_key);
+
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
@@ -207,8 +212,19 @@ pub async fn run(
                     &done,
                 ).await {
                     Ok(()) => {
+                        // Successful destination scan = loop progress (C2r).
+                        health.heartbeat(&health_key);
                         if let Some(cp) = &checkpoint {
-                            if let Err(err) = cp.set(&checkpoint_key, last_seen) {
+                            // Clamp the *persisted* cursor so it never advances past a tx that is
+                            // still pending (proof not ready / retrying): a restart then rescans
+                            // from before the oldest unfinished tx and re-discovers it, no matter
+                            // how long it was pending. The in-memory cursor keeps advancing, so the
+                            // live scan never re-reads; re-discovery on restart is idempotent
+                            // (requiresAck / AlreadyAcknowledged pre-checks).
+                            let persist = pending
+                                .oldest_pending_block()
+                                .map_or(last_seen, |b| last_seen.min(b.saturating_sub(1)));
+                            if let Err(err) = cp.set(&checkpoint_key, persist) {
                                 warn!(chain_key, %err, "failed to persist ack checkpoint");
                             }
                         }
@@ -270,14 +286,14 @@ async fn discover_delivered<P: Provider>(
             );
             continue;
         };
-        if log.block_number.is_none() {
+        let Some(block) = log.block_number else {
             warn!(
                 chain_key,
                 %tx_hash,
                 "MessageDelivered log without block_number; skipping"
             );
             continue;
-        }
+        };
         // The delivered messageId feeds the requiresAck pre-check on the source Outbox, so bridge
         // traffic never costs a proof fetch. A tx may carry several MessageDelivered logs.
         let message_id = match IInbox::MessageDelivered::decode_log(&log.inner) {
@@ -294,7 +310,7 @@ async fn discover_delivered<P: Provider>(
             pending.note_meta(&tx_hash, message_id);
             continue;
         }
-        if let Some(evicted) = pending.insert(tx_hash, Instant::now(), vec![message_id]) {
+        if let Some(evicted) = pending.insert(tx_hash, Instant::now(), block, vec![message_id]) {
             warn!(
                 chain_key,
                 %evicted,
@@ -383,17 +399,25 @@ async fn process_pending<P: Provider>(
             }
             Err(err) => {
                 let attempts = pending.record_transient_failure(&tx_hash, now);
+                // Do NOT drop after a fixed budget. The old give-up removed the tx and marked it
+                // `done`, so a multi-hour proof-gen / Creditcoin-RPC outage (proof-gen infra errors
+                // are `Err`, not `NotReady`) silently and *permanently* lost every ack discovered
+                // before it — unrecoverable even across restarts, because the discovery cursor
+                // already advanced past the tx and the ~2.7h exhaustion time exceeds the scan
+                // lookback window (C1r/C2). Keep retrying at the capped backoff instead
+                // (TRANSIENT_BACKOFF_MAX = 10min): re-submission is idempotent on-chain
+                // (AlreadyAcknowledged), and the queue stays memory-bounded by its cap. Escalate the
+                // log past the old budget so a genuinely stuck ack is alertable.
                 if attempts >= MAX_ACK_TRANSIENT_ATTEMPTS {
                     warn!(
                         chain_key,
                         %tx_hash,
                         attempts,
                         %err,
-                        "ack transient-failure budget exhausted; giving up (operator action likely \
-                         required — check the ack signer balance and the Creditcoin RPC)"
+                        "ack still failing after {MAX_ACK_TRANSIENT_ATTEMPTS}+ transient attempts; \
+                         continuing to retry at capped backoff (operator action likely required — \
+                         check the ack signer balance, proof-gen, and the Creditcoin RPC)"
                     );
-                    pending.remove(&tx_hash);
-                    done.insert(tx_hash);
                 } else {
                     warn!(
                         chain_key,

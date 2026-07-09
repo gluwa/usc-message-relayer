@@ -39,6 +39,7 @@ pub mod config;
 pub mod delivery;
 pub mod events;
 pub mod hash;
+pub mod health;
 pub mod p2p;
 pub mod pending;
 pub mod pool;
@@ -108,6 +109,16 @@ impl Server {
     pub async fn run(self) -> Result<()> {
         let cancel = CancellationToken::new();
         let metrics: Metrics = self.prom_metrics.clone() as Metrics;
+
+        // Progress-aware liveness: each polling worker heartbeats on a successful iteration, and
+        // `/health` returns 503 when any has gone silent past the deadline so k8s restarts a wedged
+        // relayer (dead provider, stalled pool) instead of leaving it live behind a green check.
+        let health = health::Health::new(health::PROGRESS_DEADLINE);
+
+        // Outbox-cursor holdback: the pool reports its oldest unfinished message per route; the
+        // outbox watchers clamp their persisted checkpoints to it so restart-recovery always
+        // re-indexes undelivered messages (never lost to the lookback window).
+        let holdback = Arc::new(checkpoint::CursorHoldback::default());
 
         // Persistent block cursors (resume after restart instead of from the chain head). Disabled
         // when `checkpoint_path` is None.
@@ -182,8 +193,10 @@ impl Server {
                     set_update_rx: set_rx,
                     reobs_tx,
                     query_rx,
+                    holdback: holdback.clone(),
                 },
                 metrics.clone(),
+                health.clone(),
                 cancel.clone(),
             ),
         );
@@ -202,6 +215,8 @@ impl Server {
                     resolver.clone(),
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
+                    health.clone(),
+                    holdback.clone(),
                     cancel.clone(),
                 ),
             );
@@ -222,6 +237,7 @@ impl Server {
                     self.config.creditcoin_eth_rpc_url.clone(),
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
+                    health.clone(),
                     cancel.clone(),
                 ),
             );
@@ -240,6 +256,7 @@ impl Server {
                     self.config.creditcoin_eth_rpc_url.clone(),
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
+                    health.clone(),
                     cancel.clone(),
                 ),
             );
@@ -258,7 +275,12 @@ impl Server {
             spawn_worker(
                 &mut tasks,
                 format!("attestor-set watcher (chain_key {})", route.chain_key),
-                attestor_set::run(route.clone(), set_tx.clone(), cancel.clone()),
+                attestor_set::run(
+                    route.clone(),
+                    set_tx.clone(),
+                    health.clone(),
+                    cancel.clone(),
+                ),
             );
         }
         // Drop the parent set_tx so the pool's set-update branch closes once every watcher exits
@@ -275,6 +297,7 @@ impl Server {
                 vote_tx,
                 reobs_rx,
                 metrics.clone(),
+                health.clone(),
                 cancel.clone(),
             ),
         );
@@ -295,7 +318,7 @@ impl Server {
                 )
             })?;
         let bind_addr = SocketAddr::new(ip, self.config.bind_port);
-        let app = prom::build_router(self.prom_metrics.clone(), query_tx);
+        let app = prom::build_router(self.prom_metrics.clone(), query_tx, health.clone());
         let listener = tokio::net::TcpListener::bind(bind_addr)
             .await
             .with_context(|| format!("failed to bind HTTP listener at {bind_addr}"))?;

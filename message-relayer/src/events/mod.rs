@@ -70,10 +70,15 @@ pub async fn watch_outbox(
     resolver: Arc<dyn OutboxResolver>,
     checkpoint: Option<Arc<CheckpointStore>>,
     scan_lookback_blocks: u64,
+    health: Arc<crate::health::Health>,
+    holdback: Arc<crate::checkpoint::CursorHoldback>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let chain_key = route.chain_key;
     let checkpoint_key = format!("outbox:{chain_key}");
+    let health_key = checkpoint_key.clone();
+    // Register at startup so a watcher that wedges before its first successful scan still goes stale.
+    health.heartbeat(&health_key);
     let provider = ProviderBuilder::new()
         .connect(&creditcoin_eth_rpc_url)
         .await
@@ -163,8 +168,17 @@ pub async fn watch_outbox(
                     &cancel,
                 ).await {
                     Ok(()) => {
+                        // Successful scan = forward progress; a dead provider errors here instead,
+                        // so the heartbeat goes stale and /health trips a restart (C2r).
+                        health.heartbeat(&health_key);
                         if let Some(cp) = &checkpoint {
-                            if let Err(err) = cp.set(&checkpoint_key, last_seen) {
+                            // Clamp the *persisted* cursor to before the pool's oldest undelivered
+                            // message (fed on its prune tick), so a restart re-indexes every
+                            // unfinished message no matter how long it has been stalled. The
+                            // in-memory cursor keeps advancing; re-indexing is idempotent
+                            // (duplicate slots kept, delivery resolves AlreadyValidated).
+                            let persist = holdback.clamp(chain_key, last_seen);
+                            if let Err(err) = cp.set(&checkpoint_key, persist) {
                                 warn!(chain_key, %err, "failed to persist Outbox checkpoint");
                             }
                         }
