@@ -167,10 +167,12 @@ pub async fn run(
     creditcoin_eth_rpc_url: String,
     checkpoint: Option<Arc<CheckpointStore>>,
     scan_lookback_blocks: u64,
+    health: Arc<crate::health::Health>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let chain_key = route.chain_key;
     let checkpoint_key = format!("claim:{chain_key}");
+    let health_key = checkpoint_key.clone();
     let Some(claim) = route.claim.clone() else {
         debug!(chain_key, "claim disabled for route; submitter not started");
         return Ok(());
@@ -252,6 +254,9 @@ pub async fn run(
     let mut tick = tokio::time::interval(Duration::from_secs(CLAIM_POLL_INTERVAL_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // Register at startup so a worker that wedges before its first successful scan still goes stale.
+    health.heartbeat(&health_key);
+
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
@@ -269,8 +274,18 @@ pub async fn run(
                     &done,
                 ).await {
                     Ok(()) => {
+                        // Successful client-chain scan = loop progress (C2r).
+                        health.heartbeat(&health_key);
                         if let Some(cp) = &checkpoint {
-                            if let Err(err) = cp.set(&checkpoint_key, last_seen) {
+                            // Never persist the cursor past a still-pending lock: a restart then
+                            // rescans from before the oldest unfinished tx and re-discovers it —
+                            // regardless of how long it was pending (proof-gen outage, backoff).
+                            // The in-memory cursor keeps advancing; re-discovery is idempotent via
+                            // the `claimed()` pre-check.
+                            let persist = pending
+                                .oldest_pending_block()
+                                .map_or(last_seen, |b| last_seen.min(b.saturating_sub(1)));
+                            if let Err(err) = cp.set(&checkpoint_key, persist) {
                                 warn!(chain_key, %err, "failed to persist claim checkpoint");
                             }
                         }
@@ -348,7 +363,10 @@ async fn discover_locks<P: Provider>(
             pending.note_meta(&tx_hash, key);
             continue;
         }
-        if let Some(evicted) = pending.insert(tx_hash, Instant::now(), vec![key]) {
+        // Discovery block anchors the checkpoint holdback below; `from_block` is a safe
+        // (conservative) stand-in on the rare RPC that omits log block numbers.
+        let block = log.block_number.unwrap_or(from_block);
+        if let Some(evicted) = pending.insert(tx_hash, Instant::now(), block, vec![key]) {
             warn!(
                 chain_key,
                 %evicted,
@@ -415,18 +433,22 @@ async fn process_pending<P: Provider>(
             }
             Err(err) => {
                 let attempts = pending.record_transient_failure(&tx_hash, now);
+                // Do NOT drop after a fixed budget (C1r/C2): the old give-up permanently abandoned
+                // the claim once its discovery cursor had advanced past it, so a multi-hour proof-gen
+                // / Creditcoin-RPC outage silently lost every claim discovered before it, even across
+                // restarts. Keep retrying at the capped backoff instead — re-submission is idempotent
+                // on-chain (the `claimed()` pre-check), the queue stays memory-bounded by its cap, and
+                // (unlike acks) a dropped claim is user-recoverable but should not require it.
                 if attempts >= MAX_CLAIM_TRANSIENT_ATTEMPTS {
                     warn!(
                         chain_key,
                         %tx_hash,
                         attempts,
                         %err,
-                        "claim transient-failure budget exhausted; giving up (check the claim \
-                         signer balance and the Creditcoin RPC). The lock stays claimable \
-                         on-chain — the user can claim manually."
+                        "claim still failing after {MAX_CLAIM_TRANSIENT_ATTEMPTS}+ transient attempts; \
+                         continuing to retry at capped backoff (check the claim signer balance, \
+                         proof-gen, and the Creditcoin RPC). The lock also stays claimable on-chain."
                     );
-                    pending.remove(&tx_hash);
-                    done.insert(tx_hash);
                 } else {
                     warn!(
                         chain_key,

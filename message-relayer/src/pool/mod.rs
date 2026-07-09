@@ -42,6 +42,10 @@ const REOBS_REPEAT_EVERY: Duration = Duration::from_secs(60);
 const DELIVERY_RETRY_BASE: Duration = Duration::from_secs(30);
 const DELIVERY_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 const DELIVERY_MAX_DISPATCH_ATTEMPTS: u32 = 5;
+/// Short delay before re-dispatching a job whose per-route delivery channel was full (backpressure).
+/// Long enough for the worker to drain an in-flight job, short enough that delivery isn't needlessly
+/// delayed once the channel clears.
+const DELIVERY_CHANNEL_FULL_REQUEUE_DELAY: Duration = Duration::from_secs(2);
 
 /// Snapshot of the votes accumulated for one message, answered by the pool over [`PoolQuery`] and
 /// served read-only at `GET /votes/{message_hash}`. Lets a relayer act as a queryable "spy node":
@@ -91,6 +95,10 @@ pub struct PoolHandles {
     pub reobs_tx: mpsc::Sender<ReobservationRequest>,
     /// Read-only vote-bundle queries (served at `GET /votes/{message_hash}`).
     pub query_rx: mpsc::Receiver<PoolQuery>,
+    /// Outbox-cursor holdback the pool feeds on its prune tick (oldest unfinished message block per
+    /// route) so the watchers never persist a cursor past an undelivered message. See
+    /// [`crate::checkpoint::CursorHoldback`].
+    pub holdback: std::sync::Arc<crate::checkpoint::CursorHoldback>,
 }
 
 /// Run the pool task. Returns when `cancel` fires or both inputs close.
@@ -99,6 +107,7 @@ pub async fn run(
     cache: VoteCacheConfig,
     handles: PoolHandles,
     metrics: Metrics,
+    health: std::sync::Arc<crate::health::Health>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let mut state = State::new(routes, cache);
@@ -110,6 +119,7 @@ pub async fn run(
         mut set_update_rx,
         reobs_tx,
         mut query_rx,
+        holdback,
     } = handles;
 
     // Publish the starting allowlist sizes (static routes report their configured size; on-chain
@@ -125,6 +135,9 @@ pub async fn run(
     let mut prune_tick = tokio::time::interval(Duration::from_secs(30));
     prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // Register at startup so a pool that wedges before its first prune tick still goes stale (C2r).
+    health.heartbeat("pool");
+
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
@@ -137,8 +150,8 @@ pub async fn run(
                     continue;
                 };
                 for job in state.apply_attestor_set(update, metrics.as_ref()) {
-                    if dispatch_delivery_job(&delivery_txs, job, &cancel, "set-reload dispatch").await {
-                        return Ok(());
+                    if let Err((ck, mh)) = dispatch_delivery_job(&delivery_txs, job, "set-reload dispatch") {
+                        state.requeue_delivery(ck, mh, Instant::now());
                     }
                 }
             }
@@ -155,8 +168,8 @@ pub async fn run(
                     return Ok(());
                 };
                 if let Some(job) = state.note_vote(vote, metrics.as_ref()) {
-                    if dispatch_delivery_job(&delivery_txs, job, &cancel, "vote dispatch").await {
-                        return Ok(());
+                    if let Err((ck, mh)) = dispatch_delivery_job(&delivery_txs, job, "vote dispatch") {
+                        state.requeue_delivery(ck, mh, Instant::now());
                     }
                 }
             }
@@ -166,8 +179,8 @@ pub async fn run(
                     continue;
                 };
                 if let Some(job) = state.note_delivery_result(result, metrics.as_ref()) {
-                    if dispatch_delivery_job(&delivery_txs, job, &cancel, "delivery retry dispatch").await {
-                        return Ok(());
+                    if let Err((ck, mh)) = dispatch_delivery_job(&delivery_txs, job, "delivery retry dispatch") {
+                        state.requeue_delivery(ck, mh, Instant::now());
                     }
                 }
             }
@@ -179,8 +192,17 @@ pub async fn run(
                 let _ = query.reply.send(state.query_bundle(&query.message_hash));
             }
             _ = prune_tick.tick() => {
+                // The prune tick fires unconditionally, so it is the pool's liveness pulse: a
+                // deadlocked/stopped pool stops reaching here and /health trips a restart (C2r).
+                health.heartbeat("pool");
                 state.prune_expired();
                 metrics.set_pool_messages_pending(state.total_pending() as i64);
+                // Publish the oldest unfinished message block per route so the outbox watchers
+                // clamp their persisted cursors — restart-recovery then always re-indexes every
+                // undelivered message, however old (checkpoint-past-unfinished-work fix).
+                for (ck, oldest) in state.oldest_unfinished_blocks() {
+                    holdback.update(ck, oldest);
+                }
                 // Nudge attestors to re-sign anything stuck below quorum. Best effort: a full
                 // request channel just means we try again on the next tick.
                 for req in state.collect_stalled_reobservations(Instant::now()) {
@@ -189,8 +211,8 @@ pub async fn run(
                     }
                 }
                 for job in state.collect_ready_deliveries(metrics.as_ref()) {
-                    if dispatch_delivery_job(&delivery_txs, job, &cancel, "ready retry dispatch").await {
-                        return Ok(());
+                    if let Err((ck, mh)) = dispatch_delivery_job(&delivery_txs, job, "ready retry dispatch") {
+                        state.requeue_delivery(ck, mh, Instant::now());
                     }
                 }
             }
@@ -198,28 +220,45 @@ pub async fn run(
     }
 }
 
-async fn dispatch_delivery_job(
+/// Hand a delivery job to its route's worker **without blocking**. `Ok(())` when sent (or dropped
+/// for a misconfigured/closed channel); `Err((chain_key, message_hash))` when the per-route channel
+/// is full — the caller returns that slot to the pool via [`State::requeue_delivery`] for a
+/// near-term retry. (Returning just the keys, not the whole `DeliveryJob`, keeps the `Err` variant
+/// small.)
+///
+/// Previously this `await`ed `tx.send`, so a slow or wedged destination on one route filled its cap
+/// channel and stalled the single pool task — blocking vote aggregation and indexing for *every*
+/// route (S3r). `try_send` keeps the pool turning; the job isn't lost (its slot stays pending and is
+/// re-dispatched), and shutdown is handled by the run loop's own cancel arm rather than here.
+fn dispatch_delivery_job(
     delivery_txs: &HashMap<u64, mpsc::Sender<DeliveryJob>>,
     job: DeliveryJob,
-    cancel: &CancellationToken,
     context: &'static str,
-) -> bool {
+) -> Result<(), (u64, B256)> {
     let chain_key = job.chain_key;
     let Some(tx) = delivery_txs.get(&chain_key) else {
-        warn!(chain_key, "no delivery worker registered for chain_key");
-        return false;
+        // Impossible with today's wiring (delivery_txs is built from the same route list), but if
+        // it ever happens the slot must not be stranded `in_flight` — undelivered slots are no
+        // longer TTL-evicted, so a leaked in_flight slot would live forever, invisible to retry
+        // and reobservation. Requeue instead: correct, and loudly repetitive rather than silent.
+        warn!(
+            chain_key,
+            context, "no delivery worker registered for chain_key; requeueing"
+        );
+        return Err((chain_key, job.message_hash));
     };
 
-    tokio::select! {
-        res = tx.send(job) => {
-            if res.is_err() {
-                warn!(chain_key, context, "delivery channel closed; dropping job");
-            }
-            false
-        }
-        () = cancel.cancelled() => {
-            info!(context, "🛑 vote pool exiting on cancel");
-            true
+    match tx.try_send(job) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(job)) => Err((job.chain_key, job.message_hash)),
+        Err(mpsc::error::TrySendError::Closed(job)) => {
+            // The delivery worker exited — the supervisor is tearing the process down; requeue
+            // (rather than drop) so the slot isn't left in_flight if teardown races slowly.
+            warn!(
+                chain_key = job.chain_key,
+                context, "delivery channel closed; requeueing (process is shutting down)"
+            );
+            Err((job.chain_key, job.message_hash))
         }
     }
 }
@@ -410,26 +449,37 @@ impl State {
                 return None;
             }
             DeliveryResultKind::Retryable => {
+                // Do NOT give up after a fixed budget. The message has reached quorum and is
+                // validated-ready; the old `terminal = true` after DELIVERY_MAX_DISPATCH_ATTEMPTS
+                // meant permanent non-delivery once the outbox checkpoint advanced past it — a
+                // ~15-20min destination-RPC outage (or a dead WS delivery provider, which fails every
+                // job instantly) silently stranded the message, unrecoverable even across restarts
+                // because the budget outlives the scan lookback (C1r). Keep retrying at the capped
+                // backoff instead (delivery_retry_delay tops out at DELIVERY_RETRY_MAX); re-attempts
+                // are safe via on-chain idempotency (AlreadyValidated), and the slot is still bounded
+                // by the count-based LRU (evict_overflow). Genuine permanent failures (reverts) are
+                // classified `Terminal`, not `Retryable`, so they are unaffected.
+                let delay = delivery_retry_delay(slot.delivery_attempts);
+                slot.next_delivery_attempt_at = Some(Instant::now() + delay);
                 if slot.delivery_attempts >= DELIVERY_MAX_DISPATCH_ATTEMPTS {
+                    // Past the old give-up point: escalate so a persistently failing destination is
+                    // alertable, but keep trying rather than dropping.
                     warn!(
                         chain_key = result.chain_key,
                         message_hash = %result.message_hash,
                         attempts = slot.delivery_attempts,
-                        "delivery retry budget exhausted; marking message terminal"
+                        retry_after_ms = delay.as_millis() as u64,
+                        "delivery still failing after {DELIVERY_MAX_DISPATCH_ATTEMPTS}+ attempts; continuing to retry at capped backoff (check the destination RPC/signer)"
                     );
-                    slot.terminal = true;
-                    metrics.set_pool_messages_pending(self.total_pending() as i64);
-                    return None;
+                } else {
+                    debug!(
+                        chain_key = result.chain_key,
+                        message_hash = %result.message_hash,
+                        attempts = slot.delivery_attempts,
+                        retry_after_ms = delay.as_millis() as u64,
+                        "delivery failed transiently; scheduled bounded retry"
+                    );
                 }
-                let delay = delivery_retry_delay(slot.delivery_attempts);
-                slot.next_delivery_attempt_at = Some(Instant::now() + delay);
-                debug!(
-                    chain_key = result.chain_key,
-                    message_hash = %result.message_hash,
-                    attempts = slot.delivery_attempts,
-                    retry_after_ms = delay.as_millis() as u64,
-                    "delivery failed transiently; scheduled bounded retry"
-                );
             }
         }
         None
@@ -456,6 +506,46 @@ impl State {
 
     fn total_pending(&self) -> usize {
         self.by_route.values().map(|r| r.by_message.len()).sum()
+    }
+
+    /// Oldest unfinished (undelivered, non-terminal) message block per route — the outbox-cursor
+    /// holdback anchors. Delivered and terminal slots don't hold the cursor back: delivered work is
+    /// done, and terminal (genuine revert) messages will never deliver no matter how often they are
+    /// re-indexed.
+    fn oldest_unfinished_blocks(&self) -> Vec<(u64, Option<u64>)> {
+        self.by_route
+            .iter()
+            .map(|(chain_key, route)| {
+                let oldest = route
+                    .by_message
+                    .values()
+                    .filter(|slot| !slot.delivered && !slot.terminal)
+                    .map(|slot| slot.indexed.block_height)
+                    .min();
+                (*chain_key, oldest)
+            })
+            .collect()
+    }
+
+    /// Return a job to its slot after a full delivery channel (backpressure, not a delivery
+    /// failure): clear `in_flight` and schedule a near-term retry so a slow/wedged destination on
+    /// one route can't strand the message (S3r). Undoes the attempt increment `dispatch_if_ready`
+    /// applied, since no delivery was actually attempted.
+    fn requeue_delivery(&mut self, chain_key: u64, message_hash: B256, now: Instant) {
+        let Some(route) = self.by_route.get_mut(&chain_key) else {
+            return;
+        };
+        let Some(slot) = route.by_message.get_mut(&message_hash) else {
+            return;
+        };
+        slot.in_flight = false;
+        slot.delivery_attempts = slot.delivery_attempts.saturating_sub(1);
+        slot.next_delivery_attempt_at = Some(now + DELIVERY_CHANNEL_FULL_REQUEUE_DELAY);
+        debug!(
+            chain_key,
+            %message_hash,
+            "delivery channel full; requeued for near-term retry (destination busy)"
+        );
     }
 
     /// Publish the current allowlist size of every route (called at startup and after a reload).
@@ -657,27 +747,26 @@ impl RouteState {
     }
 
     fn prune_expired(&mut self, now: Instant, ttl: Duration) {
-        // Remove from front of order while expired and not delivered. Stop at the first
-        // non-expired entry — the queue is roughly insertion-ordered.
-        while let Some(front) = self.order.front().copied() {
-            let Some(slot) = self.by_message.get(&front) else {
-                self.order.pop_front();
-                continue;
-            };
-            if slot.delivered {
-                // Drop delivered entries eagerly; we keep idempotency only as long as the slot
-                // exists, but TTL-based eviction will not push duplicates past the chain head.
-                self.order.pop_front();
-                self.by_message.remove(&front);
-                continue;
-            }
-            if now.duration_since(slot.inserted_at) > ttl {
-                self.order.pop_front();
-                self.by_message.remove(&front);
-                continue;
-            }
-            break;
+        // Evict delivered slots eagerly, and `terminal` slots (genuine reverts) once past the TTL.
+        // Undelivered, non-terminal slots are deliberately NOT evicted by age (C1r/C3): a message
+        // that reached quorum but has not been delivered — or is still gathering votes — must not
+        // silently vanish just because it is slow (the old 30-min TTL evicted exactly the messages a
+        // network isolation had starved, ending reobservation for them). They are bounded instead by
+        // the count-based LRU (`evict_overflow`), and reobservation keeps driving them toward
+        // quorum. Full scan rather than a front-prefix walk, because a retained undelivered slot can
+        // sit ahead of reapable ones in insertion order.
+        let expired_removable: Vec<B256> = self
+            .by_message
+            .iter()
+            .filter(|(_, slot)| {
+                slot.delivered || (slot.terminal && now.duration_since(slot.inserted_at) > ttl)
+            })
+            .map(|(&hash, _)| hash)
+            .collect();
+        for hash in expired_removable {
+            self.by_message.remove(&hash);
         }
+        self.order.retain(|h| self.by_message.contains_key(h));
     }
 }
 
@@ -782,6 +871,44 @@ mod tests {
 
     /// Seed a slot with `signers` already accepted (bypassing ecrecover) so we can exercise
     /// `apply_attestor_set`'s re-evaluation directly.
+    #[test]
+    fn oldest_unfinished_blocks_skips_delivered_and_terminal() {
+        let metrics = NoopMetrics::new();
+        let mut state = State::new(
+            vec![route_for(2, vec![])],
+            VoteCacheConfig {
+                ttl_seconds: 600,
+                max_messages: 100,
+            },
+        );
+        // No messages: no holdback.
+        assert_eq!(state.oldest_unfinished_blocks(), vec![(2, None)]);
+
+        let mk = |b: u8, height: u64| {
+            let mut m = indexed_for(2, B256::from([b; 32]));
+            m.block_height = height;
+            m
+        };
+        state.note_indexed(mk(1, 500), metrics.as_ref());
+        state.note_indexed(mk(2, 300), metrics.as_ref());
+        state.note_indexed(mk(3, 400), metrics.as_ref());
+        assert_eq!(state.oldest_unfinished_blocks(), vec![(2, Some(300))]);
+
+        // Delivered and terminal slots release their holdback.
+        let route = state.by_route.get_mut(&2).unwrap();
+        route
+            .by_message
+            .get_mut(&B256::from([2u8; 32]))
+            .unwrap()
+            .delivered = true;
+        route
+            .by_message
+            .get_mut(&B256::from([3u8; 32]))
+            .unwrap()
+            .terminal = true;
+        assert_eq!(state.oldest_unfinished_blocks(), vec![(2, Some(500))]);
+    }
+
     fn seed_slot(state: &mut State, chain_key: u64, hash: B256, signers: &[Address]) {
         let metrics = NoopMetrics::new();
         state.note_indexed(indexed_for(chain_key, hash), metrics.as_ref());

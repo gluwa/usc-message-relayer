@@ -29,6 +29,7 @@ const ATTESTOR_SET_POLL_SECS: u64 = 30;
 pub async fn run(
     route: ChainRoute,
     set_tx: mpsc::Sender<RouteAttestors>,
+    health: std::sync::Arc<crate::health::Health>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let chain_key = route.chain_key;
@@ -39,26 +40,36 @@ pub async fn run(
         AttestorSet::OnChain {
             source: AttestorSource::Cc3 { .. },
         } => {
+            // Not yet implemented — but this worker was still spawned (lib.rs filters on
+            // `OnChain { .. }`, which matches Cc3), and returning here would look to the supervisor
+            // like a worker died, tearing down the whole relayer into a crash-loop (S2r). Park until
+            // shutdown instead: the route simply runs on its startup-resolved set with no hot-reload.
             warn!(
                 chain_key,
-                "cc3 attestor-set source is not implemented; set will not hot-reload"
+                "cc3 attestor-set source is not implemented; set will not hot-reload — parking watcher"
             );
+            cancel.cancelled().await;
             return Ok(());
         }
-        AttestorSet::Static(_) => return Ok(()),
+        // Defensive: static routes are not spawned (lib.rs filters them out), but park rather than
+        // exit-as-fatal if one ever reaches here.
+        AttestorSet::Static(_) => {
+            cancel.cancelled().await;
+            return Ok(());
+        }
     };
 
-    let provider = ProviderBuilder::new()
-        .connect(&route.destination_rpc_url)
-        .await
-        .with_context(|| {
-            format!(
-                "chain_key {chain_key}: attestor-set watcher failed to connect to destination RPC at {}",
-                route.destination_rpc_url
-            )
-        })?;
-
     info!(chain_key, %validator, "🛂 attestor-set watcher online");
+
+    // Health matters more here than for any other worker: an OnChain route starts at
+    // `threshold: usize::MAX`, so until this watcher's first successful read the pool rejects
+    // every vote — a watcher that can never read the validator is a *completely dead route*
+    // (S1r). Heartbeat on every successful read (set changed or not); a persistent read failure
+    // goes stale and `/health` makes it visible/restartable instead of silently dead. Registered
+    // only in this Evm arm — the parked Cc3/static arms above never resolve a set, so registering
+    // them would trip a permanently-stale false positive.
+    let health_key = format!("attestor-set:{chain_key}");
+    health.heartbeat(&health_key);
 
     // Last (set, threshold) we pushed to the pool; `None` until the first successful read.
     let mut last: Option<(Vec<Address>, usize)> = None;
@@ -74,8 +85,14 @@ pub async fn run(
                 return Ok(());
             }
             _ = tick.tick() => {
-                match read_set(&provider, validator).await {
+                // Connect per poll (a bare alloy WS provider's pubsub service exits permanently
+                // after one failed reconnect, which would silently freeze this watcher on a routine
+                // RPC blip — part of C4). A fresh connection each 30s tick is cheap and self-heals.
+                match connect_and_read_set(&route.destination_rpc_url, validator).await {
                     Ok((attestors, threshold)) => {
+                        // Before the unchanged-shortcut: an unchanged set is still a successful
+                        // read and must count as progress.
+                        health.heartbeat(&health_key);
                         let changed = last
                             .as_ref()
                             .is_none_or(|(a, t)| a != &attestors || *t != threshold);
@@ -107,6 +124,15 @@ pub async fn run(
             }
         }
     }
+}
+
+/// Connect to the destination RPC and read `attestors()` + `threshold()`. A fresh connection per
+/// call so a dropped WS transport self-heals on the next poll instead of wedging the watcher.
+async fn connect_and_read_set(url: &str, validator: Address) -> Result<(Vec<Address>, usize)> {
+    let provider = ProviderBuilder::new().connect(url).await.with_context(|| {
+        format!("attestor-set watcher failed to connect to destination RPC at {url}")
+    })?;
+    read_set(&provider, validator).await
 }
 
 /// Read `attestors()` + `threshold()` from the destination validator contract.

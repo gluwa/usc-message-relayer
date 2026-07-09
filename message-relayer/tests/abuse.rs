@@ -55,8 +55,10 @@ async fn pool_drops_unknown_messages_and_emits_no_jobs() {
             set_update_rx: set_rx,
             reobs_tx: mpsc::channel(8).0,
             query_rx: mpsc::channel(8).1,
+            holdback: std::sync::Arc::new(message_relayer::checkpoint::CursorHoldback::default()),
         },
         NoopMetrics::new(),
+        message_relayer::health::Health::new(message_relayer::health::PROGRESS_DEADLINE),
         cancel_for_pool,
     ));
 
@@ -121,8 +123,10 @@ async fn pool_drops_votes_from_unknown_signers() {
             set_update_rx: set_rx,
             reobs_tx: mpsc::channel(8).0,
             query_rx: mpsc::channel(8).1,
+            holdback: std::sync::Arc::new(message_relayer::checkpoint::CursorHoldback::default()),
         },
         NoopMetrics::new(),
+        message_relayer::health::Health::new(message_relayer::health::PROGRESS_DEADLINE),
         cancel_for_pool,
     ));
 

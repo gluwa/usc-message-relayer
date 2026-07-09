@@ -35,6 +35,18 @@ pub use envelope::MessageVote;
 /// transient port conflicts without spamming the log.
 const SWARM_RESTART_BACKOFF: Duration = Duration::from_secs(5);
 
+/// Listen attempts before giving up and running dial-only. Covers a lingering TIME_WAIT / slow
+/// port release from a previous instance (~1 min at [`SWARM_RESTART_BACKOFF`]) without blocking
+/// startup forever on a genuinely taken port.
+const LISTEN_RETRY_ATTEMPTS: u32 = 12;
+
+/// Cadence of the liveness pulse the swarm loop reports into [`crate::health::Health`]. Fired by a
+/// timer arm in the select loop, so it measures "the loop is turning" — an idle-but-healthy mesh
+/// still pulses, while a wedged swarm task goes stale and `/health` trips a restart (C2r). Votes
+/// stop arriving AND reobservation requests stop being published when this loop stalls, so it is
+/// as delivery-critical as the pool.
+const P2P_HEALTH_PULSE: Duration = Duration::from_secs(30);
+
 /// Spawn the libp2p worker. Returns when `cancel` fires or the swarm task exits.
 pub async fn run(
     p2p: P2pConfig,
@@ -42,6 +54,7 @@ pub async fn run(
     vote_tx: mpsc::Sender<MessageVote>,
     mut reobs_rx: mpsc::Receiver<ReobservationRequest>,
     metrics: Metrics,
+    health: std::sync::Arc<crate::health::Health>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let keypair =
@@ -115,10 +128,28 @@ pub async fn run(
         }
     }
 
+    // Actually retry the listen (the old code logged "will retry after backoff", slept once, and
+    // never retried — leaving the relayer silently dial-only after a transient port conflict, S6).
+    // After the budget, proceed dial-only *explicitly*: still functional via bootnode dialing, but
+    // error-logged so it's alertable rather than invisible.
     let listen: libp2p::Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", p2p.port).parse()?;
-    if let Err(err) = swarm.listen_on(listen.clone()) {
-        warn!(%listen, %err, "swarm listen failed; will retry after backoff");
-        tokio::time::sleep(SWARM_RESTART_BACKOFF).await;
+    for attempt in 1..=LISTEN_RETRY_ATTEMPTS {
+        match swarm.listen_on(listen.clone()) {
+            Ok(_) => break,
+            Err(err) if attempt == LISTEN_RETRY_ATTEMPTS => {
+                tracing::error!(
+                    %listen, %err, attempts = attempt,
+                    "swarm listen failed after retries — continuing DIAL-ONLY (inbound peers cannot reach this relayer)"
+                );
+            }
+            Err(err) => {
+                warn!(%listen, %err, attempt, "swarm listen failed; retrying after backoff");
+                tokio::select! {
+                    () = cancel.cancelled() => return Ok(()),
+                    () = tokio::time::sleep(SWARM_RESTART_BACKOFF) => {}
+                }
+            }
+        }
     }
 
     info!(routes = chain_keys.len(), "✅ libp2p subscriber online");
@@ -129,11 +160,19 @@ pub async fn run(
         .collect();
     let mut peer_counts: HashMap<u64, usize> = HashMap::new();
 
+    let mut health_tick = tokio::time::interval(P2P_HEALTH_PULSE);
+    health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Register at startup so a swarm that wedges before its first pulse still goes stale.
+    health.heartbeat("p2p");
+
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
                 info!("🛑 libp2p worker exiting on cancel");
                 return Ok(());
+            }
+            _ = health_tick.tick() => {
+                health.heartbeat("p2p");
             }
             maybe = reobs_rx.recv() => {
                 let Some(req) = maybe else {
