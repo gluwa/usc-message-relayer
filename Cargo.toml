@@ -14,7 +14,7 @@ version = "0.1.0"
 # `alloy`, `libp2p`, `parity-scale-codec`, and `sha3` in particular sit on the wire path
 # (vote envelopes, message hashing) and must not drift. See write-ability/README.md.
 [workspace.dependencies]
-alloy = { version = "1.1", features = [
+alloy = { version = "2.1", features = [
     "node-bindings",
     "providers",
     "provider-http",
@@ -37,7 +37,7 @@ hex = { version = "0.4.3", default-features = false }
 libp2p = { version = "0.56", default-features = false }
 parity-scale-codec = { version = "3.6", default-features = false }
 prometheus-client = { version = "0.25.0" }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1.0.197", default-features = false }
 serde_json = { version = "1.0.145", default-features = false }
 serde_yaml = { version = "0.9.34" }
