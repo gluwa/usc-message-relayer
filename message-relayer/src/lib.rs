@@ -46,6 +46,7 @@ pub mod pool;
 pub mod prom;
 pub mod proofgen;
 pub mod revert;
+pub mod spy_client;
 
 pub use config::{
     AttestorSet, AttestorSource, ChainRoute, Config, DeliveryConfig, P2pConfig, VoteCacheConfig,
@@ -287,20 +288,39 @@ impl Server {
         // (and stays inert when there are no on-chain routes at all).
         drop(set_tx);
 
-        // libp2p worker (one shared swarm).
-        spawn_worker(
-            &mut tasks,
-            "libp2p worker",
-            p2p::run(
-                self.config.p2p.clone(),
-                self.config.routes.iter().map(|r| r.chain_key).collect(),
-                vote_tx,
-                reobs_rx,
-                metrics.clone(),
-                health.clone(),
-                cancel.clone(),
-            ),
-        );
+        // Vote source: a spy-node WS subscription when configured, else the embedded libp2p
+        // swarm. The spy path is the target architecture (spy spec §1); the embedded swarm
+        // remains for standalone deployments and local dev.
+        let route_chain_keys: Vec<u64> = self.config.routes.iter().map(|r| r.chain_key).collect();
+        if let Some(spy) = self.config.spy.clone() {
+            spawn_worker(
+                &mut tasks,
+                "spy client",
+                spy_client::run(
+                    spy,
+                    route_chain_keys,
+                    vote_tx,
+                    reobs_rx,
+                    metrics.clone(),
+                    health.clone(),
+                    cancel.clone(),
+                ),
+            );
+        } else {
+            spawn_worker(
+                &mut tasks,
+                "libp2p worker",
+                p2p::run(
+                    self.config.p2p.clone(),
+                    route_chain_keys,
+                    vote_tx,
+                    reobs_rx,
+                    metrics.clone(),
+                    health.clone(),
+                    cancel.clone(),
+                ),
+            );
+        }
 
         // Hardware metrics gauges (managed worker — drains with the rest on shutdown).
         spawn_worker(
