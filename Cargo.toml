@@ -1,5 +1,5 @@
 [workspace]
-members = ["message-relayer", "write-ability"]
+members = ["message-relayer", "spy-node", "write-ability"]
 resolver = "2"
 
 [workspace.package]

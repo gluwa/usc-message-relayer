@@ -33,6 +33,7 @@ updates:
     directories:
       - "/"
       - "/message-relayer"
+      - "/spy-node"
       - "/write-ability"
     groups:
       prod-dependencies:
