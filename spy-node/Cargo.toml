@@ -1,9 +1,9 @@
 [package]
-name = "spy-node"
-description = "Passive USC write-ability p2p observer: joins the attestor gossip mesh and streams message-attestation events over WebSocket"
 authors.workspace = true
+description = "Passive USC write-ability p2p observer: joins the attestor gossip mesh and streams message-attestation events over WebSocket"
 edition.workspace = true
 license.workspace = true
+name = "spy-node"
 publish.workspace = true
 repository.workspace = true
 version.workspace = true
