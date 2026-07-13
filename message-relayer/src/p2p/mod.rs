@@ -361,7 +361,10 @@ async fn handle_swarm_event(
 /// Build a libp2p ed25519 keypair from the configured identity. If `identity` is `None`,
 /// a fresh ephemeral key is generated and we log a warning so operators understand peers
 /// will see a different `PeerId` each restart.
-fn derive_keypair(identity: Option<&str>) -> Result<libp2p::identity::Keypair> {
+///
+/// `pub` so the spy node (sibling crate) derives its identity the same way — one seed format
+/// (`0x` hex or BIP39 mnemonic) across every mesh participant we ship.
+pub fn derive_keypair(identity: Option<&str>) -> Result<libp2p::identity::Keypair> {
     match identity {
         None => {
             warn!(

@@ -1,0 +1,66 @@
+[package]
+name = "spy-node"
+description = "Passive USC write-ability p2p observer: joins the attestor gossip mesh and streams message-attestation events over WebSocket"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "spy-node"
+path = "bin/spy.rs"
+
+[lints.clippy]
+module_name_repetitions = "allow"
+
+[dependencies]
+clap = { workspace = true }
+dotenvy = "0.15"
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+# Sibling crates: the relayer lib supplies the p2p behavior/protocols + identity derivation +
+# health registry the spy reuses; write-ability supplies the wire envelopes + topic ids.
+message-relayer = { path = "../message-relayer" }
+write-ability = { workspace = true }
+
+# Workspace dependencies
+alloy = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
+futures = { workspace = true }
+hex = { workspace = true }
+prometheus-client = { workspace = true }
+serde = { workspace = true, default-features = false, features = ["derive"] }
+serde_json = { workspace = true, features = ["std"] }
+serde_yaml = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-util = { version = "0.7" }
+tracing = { workspace = true }
+
+# P2P (same feature set as the relayer — one mesh, one stack)
+libp2p = { workspace = true, features = [
+    "tokio",
+    "macros",
+    "ed25519",
+    "dns",
+    "quic",
+    "tcp",
+    "noise",
+    "yamux",
+    "identify",
+    "ping",
+    "mdns",
+    "kad",
+    "gossipsub",
+] }
