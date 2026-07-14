@@ -124,25 +124,37 @@ pub async fn run(
         }
     }
 
-    // Retry the listen; after the budget proceed dial-only, loudly (mirrors the relayer).
-    let listen: libp2p::Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", p2p.port).parse()?;
-    for attempt in 1..=LISTEN_RETRY_ATTEMPTS {
-        match swarm.listen_on(listen.clone()) {
-            Ok(_) => break,
-            Err(err) if attempt == LISTEN_RETRY_ATTEMPTS => {
-                tracing::error!(
-                    %listen, %err, attempts = attempt,
-                    "swarm listen failed after retries — continuing DIAL-ONLY (inbound peers cannot reach this spy)"
-                );
-            }
-            Err(err) => {
-                warn!(%listen, %err, attempt, "swarm listen failed; retrying after backoff");
-                tokio::select! {
-                    () = cancel.cancelled() => return Ok(()),
-                    () = tokio::time::sleep(LISTEN_RETRY_BACKOFF) => {}
+    // Only listen when a `public_addr` is configured. A listening spy leaks its discovered
+    // listen addrs (loopback + cluster-local pod IP) to peers via identify, and the bootnode's
+    // kad table then propagates that record mesh-wide: every attestor — including ones in other
+    // clusters with no route to a pod IP — burns dial attempts on it until their unreachable-peer
+    // eviction kicks in, and a restart (new pod IP, new ephemeral PeerId) leaves the stale record
+    // behind to re-poison the mesh. A dial-only observer needs no inbound reachability at all:
+    // gossipsub delivers over its outbound connections, and with no listen addrs identify has
+    // nothing dialable to advertise.
+    if p2p.public_addr.is_some() {
+        // Retry the listen; after the budget proceed dial-only, loudly (mirrors the relayer).
+        let listen: libp2p::Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", p2p.port).parse()?;
+        for attempt in 1..=LISTEN_RETRY_ATTEMPTS {
+            match swarm.listen_on(listen.clone()) {
+                Ok(_) => break,
+                Err(err) if attempt == LISTEN_RETRY_ATTEMPTS => {
+                    tracing::error!(
+                        %listen, %err, attempts = attempt,
+                        "swarm listen failed after retries — continuing DIAL-ONLY (inbound peers cannot reach this spy)"
+                    );
+                }
+                Err(err) => {
+                    warn!(%listen, %err, attempt, "swarm listen failed; retrying after backoff");
+                    tokio::select! {
+                        () = cancel.cancelled() => return Ok(()),
+                        () = tokio::time::sleep(LISTEN_RETRY_BACKOFF) => {}
+                    }
                 }
             }
         }
+    } else {
+        info!("🕶️ no public_addr configured — dial-only observer; not listening, nothing dialable advertised");
     }
 
     info!(chains = chain_keys.len(), "✅ spy swarm online");
