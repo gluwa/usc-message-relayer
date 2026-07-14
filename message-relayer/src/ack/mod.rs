@@ -507,34 +507,41 @@ async fn acknowledge_tx<P: Provider>(
         .await;
 
     match pending_tx {
-        Ok(builder) => match tokio::time::timeout(RECEIPT_TIMEOUT, builder.get_receipt()).await {
-            Err(_elapsed) => Err(anyhow!(
-                "no receipt within {RECEIPT_TIMEOUT:?} (ack tx possibly stuck)"
-            )),
-            Ok(receipt_result) => match receipt_result {
-                Ok(receipt) if receipt.status() => {
-                    // Report the on-chain gas cost of the submitAcknowledgment call.
-                    // gas_used is cast to u128 so the arithmetic is valid regardless of
-                    // the receipt's integer width; the wide-integer fields are recorded
-                    // via Display (`%`) because `tracing` has no native u128 Value impl.
-                    let gas_used = u128::from(receipt.gas_used);
-                    let effective_gas_price = receipt.effective_gas_price;
-                    let gas_cost_wei = gas_used.saturating_mul(effective_gas_price);
-                    info!(
-                        chain_key,
-                        %tx_hash,
-                        ack_tx_hash = %receipt.transaction_hash,
-                        gas_used = %gas_used,
-                        effective_gas_price_wei = %effective_gas_price,
-                        gas_cost_wei = %gas_cost_wei,
-                        "submitAcknowledgment confirmed",
-                    );
-                    Ok(AckOutcome::Acknowledged)
-                }
-                Ok(_) => Ok(AckOutcome::Terminal("tx mined but reverted".into())),
-                Err(err) => Err(anyhow!("receipt fetch failed: {err}")),
-            },
-        },
+        // `crate::receipt::await_receipt` instead of `builder.get_receipt()`: the latter runs on
+        // alloy's block-decoding heartbeat, which wedges against Frontier's mixHash-less blocks
+        // (see the `receipt` module docs).
+        Ok(builder) => {
+            match tokio::time::timeout(RECEIPT_TIMEOUT, crate::receipt::await_receipt(&builder))
+                .await
+            {
+                Err(_elapsed) => Err(anyhow!(
+                    "no receipt within {RECEIPT_TIMEOUT:?} (ack tx possibly stuck)"
+                )),
+                Ok(receipt_result) => match receipt_result {
+                    Ok(receipt) if receipt.status() => {
+                        // Report the on-chain gas cost of the submitAcknowledgment call.
+                        // gas_used is cast to u128 so the arithmetic is valid regardless of
+                        // the receipt's integer width; the wide-integer fields are recorded
+                        // via Display (`%`) because `tracing` has no native u128 Value impl.
+                        let gas_used = u128::from(receipt.gas_used);
+                        let effective_gas_price = receipt.effective_gas_price;
+                        let gas_cost_wei = gas_used.saturating_mul(effective_gas_price);
+                        info!(
+                            chain_key,
+                            %tx_hash,
+                            ack_tx_hash = %receipt.transaction_hash,
+                            gas_used = %gas_used,
+                            effective_gas_price_wei = %effective_gas_price,
+                            gas_cost_wei = %gas_cost_wei,
+                            "submitAcknowledgment confirmed",
+                        );
+                        Ok(AckOutcome::Acknowledged)
+                    }
+                    Ok(_) => Ok(AckOutcome::Terminal("tx mined but reverted".into())),
+                    Err(err) => Err(anyhow!("receipt fetch failed: {err}")),
+                },
+            }
+        }
         Err(err) if is_terminal_revert(&err) => Ok(AckOutcome::Terminal(describe_revert(&err))),
         Err(err) => Err(anyhow!("submitAcknowledgment send failed: {err}")),
     }

@@ -232,48 +232,54 @@ async fn handle_job<P: Provider + Clone + 'static>(
             .await;
 
         match pending {
-            Ok(builder) => match tokio::time::timeout(RECEIPT_TIMEOUT, builder.get_receipt()).await
-            {
-                Ok(Ok(receipt)) => {
-                    if receipt.status() {
-                        // `deliverMessage` succeeds even when the dApp callback reverts — the
-                        // inbox stores the message and emits `MessagePending` instead of
-                        // `MessageDelivered`. Detect that from the receipt logs; it is NOT a
-                        // revert (see SimpleInbox.deliverMessage's try/catch).
-                        let left_pending = receipt.inner.logs().iter().any(|l| {
-                            l.address() == route.inbox_address
-                                && l.topics().first()
-                                    == Some(&IInbox::MessagePending::SIGNATURE_HASH)
-                        });
-                        if left_pending {
-                            break SendOutcome::Pending;
+            // Poll-based receipt wait — alloy's `get_receipt()` heartbeat wedges against
+            // Frontier's mixHash-less blocks (see the `receipt` module docs). Sepolia is fine
+            // today, but routes are chain-agnostic and a Frontier destination would not be.
+            Ok(builder) => {
+                match tokio::time::timeout(RECEIPT_TIMEOUT, crate::receipt::await_receipt(&builder))
+                    .await
+                {
+                    Ok(Ok(receipt)) => {
+                        if receipt.status() {
+                            // `deliverMessage` succeeds even when the dApp callback reverts — the
+                            // inbox stores the message and emits `MessagePending` instead of
+                            // `MessageDelivered`. Detect that from the receipt logs; it is NOT a
+                            // revert (see SimpleInbox.deliverMessage's try/catch).
+                            let left_pending = receipt.inner.logs().iter().any(|l| {
+                                l.address() == route.inbox_address
+                                    && l.topics().first()
+                                        == Some(&IInbox::MessagePending::SIGNATURE_HASH)
+                            });
+                            if left_pending {
+                                break SendOutcome::Pending;
+                            }
+                            break SendOutcome::Succeeded;
                         }
-                        break SendOutcome::Succeeded;
+                        // Receipt with `status = false` means the tx mined but reverted. For PoC
+                        // we don't decode the revert reason from the receipt — we surface it via
+                        // metrics and stop retrying (the next message will get its own attempt).
+                        break SendOutcome::Reverted("tx mined but reverted".into());
                     }
-                    // Receipt with `status = false` means the tx mined but reverted. For PoC
-                    // we don't decode the revert reason from the receipt — we surface it via
-                    // metrics and stop retrying (the next message will get its own attempt).
-                    break SendOutcome::Reverted("tx mined but reverted".into());
+                    Ok(Err(err)) if attempts <= delivery_config.max_retries => {
+                        warn!(
+                            chain_key = route.chain_key,
+                            message_id = %job.message_id,
+                            attempts,
+                            %err,
+                            "receipt fetch failed; retrying"
+                        );
+                    }
+                    Ok(Err(err)) => break SendOutcome::Failed(format!("receipt: {err}")),
+                    Err(_elapsed) => {
+                        // Stuck / underpriced tx: stop blocking the route. The pool retries with
+                        // backoff; if this tx mines meanwhile, the next simulate resolves it as
+                        // already-validated.
+                        break SendOutcome::Failed(format!(
+                            "no receipt within {RECEIPT_TIMEOUT:?} (tx possibly stuck)"
+                        ));
+                    }
                 }
-                Ok(Err(err)) if attempts <= delivery_config.max_retries => {
-                    warn!(
-                        chain_key = route.chain_key,
-                        message_id = %job.message_id,
-                        attempts,
-                        %err,
-                        "receipt fetch failed; retrying"
-                    );
-                }
-                Ok(Err(err)) => break SendOutcome::Failed(format!("receipt: {err}")),
-                Err(_elapsed) => {
-                    // Stuck / underpriced tx: stop blocking the route. The pool retries with
-                    // backoff; if this tx mines meanwhile, the next simulate resolves it as
-                    // already-validated.
-                    break SendOutcome::Failed(format!(
-                        "no receipt within {RECEIPT_TIMEOUT:?} (tx possibly stuck)"
-                    ));
-                }
-            },
+            }
             Err(err) if revert_already_validated(&err) => {
                 // Lost the race to another relayer (PoC §6.5). Treat as success.
                 break SendOutcome::AlreadyValidated;
@@ -418,7 +424,12 @@ fn spawn_pending_retry<P: Provider + 'static>(
             }
             match inbox.retryPendingMessage(message_id).send().await {
                 Ok(builder) => {
-                    match tokio::time::timeout(RECEIPT_TIMEOUT, builder.get_receipt()).await {
+                    match tokio::time::timeout(
+                        RECEIPT_TIMEOUT,
+                        crate::receipt::await_receipt(&builder),
+                    )
+                    .await
+                    {
                         Ok(Ok(receipt)) if receipt.status() => {
                             info!(chain_key, %message_id, "♻️ retryPendingMessage succeeded");
                             return;
