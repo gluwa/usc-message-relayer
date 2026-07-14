@@ -530,30 +530,37 @@ async fn claim_tx<P: Provider>(
         .await;
 
     match pending_tx {
-        Ok(builder) => match tokio::time::timeout(RECEIPT_TIMEOUT, builder.get_receipt()).await {
-            Err(_elapsed) => Err(anyhow!(
-                "no receipt within {RECEIPT_TIMEOUT:?} (claim tx possibly stuck)"
-            )),
-            Ok(receipt_result) => match receipt_result {
-                Ok(receipt) if receipt.status() => {
-                    let gas_used = u128::from(receipt.gas_used);
-                    let effective_gas_price = receipt.effective_gas_price;
-                    let gas_cost_wei = gas_used.saturating_mul(effective_gas_price);
-                    info!(
-                        chain_key,
-                        %tx_hash,
-                        claim_tx_hash = %receipt.transaction_hash,
-                        gas_used = %gas_used,
-                        effective_gas_price_wei = %effective_gas_price,
-                        gas_cost_wei = %gas_cost_wei,
-                        "claim confirmed",
-                    );
-                    Ok(ClaimOutcome::Claimed)
-                }
-                Ok(_) => Ok(ClaimOutcome::Terminal("tx mined but reverted".into())),
-                Err(err) => Err(anyhow!("receipt fetch failed: {err}")),
-            },
-        },
+        // `crate::receipt::await_receipt` instead of `builder.get_receipt()`: the latter runs on
+        // alloy's block-decoding heartbeat, which wedges against Frontier's mixHash-less blocks
+        // (see the `receipt` module docs).
+        Ok(builder) => {
+            match tokio::time::timeout(RECEIPT_TIMEOUT, crate::receipt::await_receipt(&builder))
+                .await
+            {
+                Err(_elapsed) => Err(anyhow!(
+                    "no receipt within {RECEIPT_TIMEOUT:?} (claim tx possibly stuck)"
+                )),
+                Ok(receipt_result) => match receipt_result {
+                    Ok(receipt) if receipt.status() => {
+                        let gas_used = u128::from(receipt.gas_used);
+                        let effective_gas_price = receipt.effective_gas_price;
+                        let gas_cost_wei = gas_used.saturating_mul(effective_gas_price);
+                        info!(
+                            chain_key,
+                            %tx_hash,
+                            claim_tx_hash = %receipt.transaction_hash,
+                            gas_used = %gas_used,
+                            effective_gas_price_wei = %effective_gas_price,
+                            gas_cost_wei = %gas_cost_wei,
+                            "claim confirmed",
+                        );
+                        Ok(ClaimOutcome::Claimed)
+                    }
+                    Ok(_) => Ok(ClaimOutcome::Terminal("tx mined but reverted".into())),
+                    Err(err) => Err(anyhow!("receipt fetch failed: {err}")),
+                },
+            }
+        }
         Err(err) if is_terminal_revert(&err) => Ok(ClaimOutcome::Terminal(describe_revert(&err))),
         Err(err) => Err(anyhow!("claim send failed: {err}")),
     }

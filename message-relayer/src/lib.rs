@@ -45,6 +45,7 @@ pub mod pending;
 pub mod pool;
 pub mod prom;
 pub mod proofgen;
+pub mod receipt;
 pub mod revert;
 pub mod spy_client;
 
