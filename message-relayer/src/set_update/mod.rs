@@ -58,6 +58,12 @@ struct RouteState {
     current: Option<OnChain>,
     /// digest → recovered signer → signature. One slot per distinct `(newAttestors, nonce)`.
     votes: HashMap<B256, BTreeMap<Address, [u8; 65]>>,
+    /// Digests for which a `submitAttestorSetUpdate` tx has been broadcast at the current nonce and
+    /// not yet confirmed mined. Guards against a duplicate submit if the slot rebuilds to threshold
+    /// again in the send→mine window (review #3): we skip re-submitting an in-flight digest. Cleared
+    /// on the next `refresh` when the on-chain nonce advances (the update mined) — a fresh nonce
+    /// yields fresh digests anyway, so this can never wedge a genuine later update.
+    in_flight: HashSet<B256>,
 }
 
 /// Validate a vote against the validator's current state, returning the canonical attestor order,
@@ -99,9 +105,11 @@ async fn refresh(state: &mut RouteState) -> Result<()> {
     let nonce = contract.attestorSetUpdateNonce().call().await?;
     let chain_id = U256::from(provider.get_chain_id().await?);
 
-    // If the nonce advanced, any accumulated votes are for a spent update — drop them.
+    // If the nonce advanced, any accumulated votes are for a spent update — drop them, and clear the
+    // in-flight guard (a mined update bumps the nonce; the old digests are now permanently invalid).
     if state.current.as_ref().is_some_and(|c| c.nonce != nonce) {
         state.votes.clear();
+        state.in_flight.clear();
     }
     state.current = Some(OnChain {
         attestors,
@@ -168,6 +176,12 @@ async fn handle_vote(states: &mut HashMap<u64, RouteState>, vote: SetUpdateVote)
         return;
     };
 
+    // Already broadcast a tx for this exact (newAttestors, nonce) — don't send a duplicate while it
+    // is still mining (review #3). Cleared when the nonce advances (refresh) — i.e. once it mined.
+    if state.in_flight.contains(&digest) {
+        return;
+    }
+
     let slot = state.votes.entry(digest).or_default();
     if slot.insert(signer, vote.signature).is_some() {
         return; // duplicate signer
@@ -176,13 +190,16 @@ async fn handle_vote(states: &mut HashMap<u64, RouteState>, vote: SetUpdateVote)
         return;
     }
 
-    // Threshold reached — submit. Snapshot the signatures, then clear the slot so a failure retries
-    // on the next vote rather than double-submitting on every subsequent one.
+    // Threshold reached — submit. Snapshot the signatures, clear the slot, and mark the digest
+    // in-flight so a rebuild-to-threshold in the send→mine window doesn't double-submit. On failure,
+    // drop the in-flight mark so the next votes can retry.
     let signatures: Vec<[u8; 65]> = slot.values().copied().collect();
     state.votes.remove(&digest);
+    state.in_flight.insert(digest);
     match submit(state, &canonical, &signatures).await {
         Ok(()) => {}
         Err(err) => {
+            state.in_flight.remove(&digest);
             warn!(chain_key = vote.chain_key, %err, "attestor-set update submission failed — will retry as more votes arrive");
         }
     }
@@ -217,6 +234,7 @@ pub async fn run(
                     dest_rpc_url: route.destination_rpc_url.clone(),
                     current: None,
                     votes: HashMap::new(),
+                    in_flight: HashSet::new(),
                 },
             );
         }
