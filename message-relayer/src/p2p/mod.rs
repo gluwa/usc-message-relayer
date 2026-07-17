@@ -18,7 +18,7 @@ use libp2p::gossipsub::{IdentTopic, MessageAcceptance, TopicHash};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
-use write_ability::envelope::ReobservationRequest;
+use write_ability::envelope::{ReobservationRequest, SetUpdateVote};
 use zeroize::Zeroize;
 
 use crate::config::P2pConfig;
@@ -48,10 +48,12 @@ const LISTEN_RETRY_ATTEMPTS: u32 = 12;
 const P2P_HEALTH_PULSE: Duration = Duration::from_secs(30);
 
 /// Spawn the libp2p worker. Returns when `cancel` fires or the swarm task exits.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     p2p: P2pConfig,
     chain_keys: Vec<u64>,
     vote_tx: mpsc::Sender<MessageVote>,
+    setupdate_vote_tx: mpsc::Sender<SetUpdateVote>,
     mut reobs_rx: mpsc::Receiver<ReobservationRequest>,
     metrics: Metrics,
     health: std::sync::Arc<crate::health::Health>,
@@ -81,6 +83,7 @@ pub async fn run(
     // thing it actively gossips.
     let mut topic_to_chain_key: HashMap<TopicHash, u64> = HashMap::new();
     let mut chain_key_to_reobs_topic: HashMap<u64, IdentTopic> = HashMap::new();
+    let mut setupdate_topic_to_chain_key: HashMap<TopicHash, u64> = HashMap::new();
     for ck in &chain_keys {
         let topic = IdentTopic::new(protocols::message_votes_topic(*ck));
         info!(chain_key = ck, topic = %topic, "📥 subscribing to attestor votes");
@@ -98,6 +101,15 @@ pub async fn run(
             .subscribe(&reobs)
             .with_context(|| format!("subscribe to {reobs} failed"))?;
         chain_key_to_reobs_topic.insert(*ck, reobs);
+
+        let setupdate = IdentTopic::new(protocols::attestor_set_update_topic(*ck));
+        info!(chain_key = ck, topic = %setupdate, "📥 subscribing to attestor-set-update votes");
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&setupdate)
+            .with_context(|| format!("subscribe to {setupdate} failed"))?;
+        setupdate_topic_to_chain_key.insert(setupdate.hash(), *ck);
     }
 
     // Boot nodes (best-effort: parse what we can, log what we cannot).
@@ -197,7 +209,9 @@ pub async fn run(
                     &mut swarm,
                     &topic_to_chain_key,
                     &reobs_topic_hashes,
+                    &setupdate_topic_to_chain_key,
                     &vote_tx,
+                    &setupdate_vote_tx,
                     metrics.as_ref(),
                     &mut peer_counts,
                 ).await;
@@ -206,13 +220,15 @@ pub async fn run(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn handle_swarm_event(
     event: libp2p::swarm::SwarmEvent<behavior::RelayerBehaviorEvent>,
     swarm: &mut libp2p::Swarm<RelayerBehavior>,
     topic_to_chain_key: &HashMap<TopicHash, u64>,
     reobs_topic_hashes: &std::collections::HashSet<TopicHash>,
+    setupdate_topic_to_chain_key: &HashMap<TopicHash, u64>,
     vote_tx: &mpsc::Sender<MessageVote>,
+    setupdate_vote_tx: &mpsc::Sender<SetUpdateVote>,
     metrics: &dyn crate::prom::MetricsTrait,
     peer_counts: &mut HashMap<u64, usize>,
 ) {
@@ -261,6 +277,45 @@ async fn handle_swarm_event(
                         &propagation_source,
                         MessageAcceptance::Accept,
                     );
+                return;
+            }
+            // Attestor-set-update votes (P2-8): hand off to the set-update aggregator. Same
+            // non-blocking / Accept-valid semantics as message votes (shed under backpressure; the
+            // proposer re-emits each cycle). Decode failure / chain_key mismatch → Reject.
+            if let Some(&chain_key) = setupdate_topic_to_chain_key.get(&message.topic) {
+                let acceptance = match SetUpdateVote::decode_bytes(&message.data) {
+                    Ok(vote) if vote.chain_key == chain_key => {
+                        match setupdate_vote_tx.try_send(vote) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                warn!(chain_key, "set-update aggregator saturated; dropping vote");
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                warn!(
+                                    "set-update aggregator channel closed; libp2p worker draining"
+                                );
+                            }
+                        }
+                        MessageAcceptance::Accept
+                    }
+                    Ok(vote) => {
+                        warn!(
+                            %propagation_source,
+                            envelope_chain_key = vote.chain_key,
+                            topic_chain_key = chain_key,
+                            "set-update vote chain_key disagrees with topic — rejecting"
+                        );
+                        MessageAcceptance::Reject
+                    }
+                    Err(err) => {
+                        warn!(%propagation_source, %err, "could not decode SetUpdateVote — rejecting");
+                        MessageAcceptance::Reject
+                    }
+                };
+                swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .report_message_validation_result(&message_id, &propagation_source, acceptance);
                 return;
             }
             let Some(&chain_key) = topic_to_chain_key.get(&message.topic) else {

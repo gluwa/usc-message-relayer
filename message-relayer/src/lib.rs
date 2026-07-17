@@ -47,6 +47,7 @@ pub mod prom;
 pub mod proofgen;
 pub mod receipt;
 pub mod revert;
+pub mod set_update;
 pub mod spy_client;
 
 pub use config::{
@@ -151,6 +152,8 @@ impl Server {
         // Channels.
         let (indexed_tx, indexed_rx) = mpsc::channel::<IndexedMessage>(INDEXED_CHANNEL_CAP);
         let (vote_tx, vote_rx) = mpsc::channel::<MessageVote>(VOTE_CHANNEL_CAP);
+        let (setupdate_vote_tx, setupdate_vote_rx) =
+            mpsc::channel::<write_ability::envelope::SetUpdateVote>(VOTE_CHANNEL_CAP);
         let (set_tx, set_rx) = mpsc::channel::<RouteAttestors>(SET_UPDATE_CHANNEL_CAP);
         let (reobs_tx, reobs_rx) =
             mpsc::channel::<write_ability::envelope::ReobservationRequest>(REOBS_CHANNEL_CAP);
@@ -289,6 +292,19 @@ impl Server {
         // (and stays inert when there are no on-chain routes at all).
         drop(set_tx);
 
+        // Attestor-set-update aggregator+submitter (P2-8): consumes SetUpdateVotes gossiped by
+        // attestors and submits `submitAttestorSetUpdate` on the destination validator. Idle unless
+        // a route sources its set on-chain (`AttestorSet::OnChain { Evm }`) with a signer_key.
+        spawn_worker(
+            &mut tasks,
+            "attestor-set-update aggregator",
+            set_update::run(
+                self.config.routes.clone(),
+                setupdate_vote_rx,
+                cancel.clone(),
+            ),
+        );
+
         // Vote source: a spy-node WS subscription when configured, else the embedded libp2p
         // swarm. The spy path is the target architecture (spy spec §1); the embedded swarm
         // remains for standalone deployments and local dev.
@@ -315,6 +331,7 @@ impl Server {
                     self.config.p2p.clone(),
                     route_chain_keys,
                     vote_tx,
+                    setupdate_vote_tx,
                     reobs_rx,
                     metrics.clone(),
                     health.clone(),

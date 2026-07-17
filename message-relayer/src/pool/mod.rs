@@ -778,7 +778,7 @@ const SECP256K1_HALF_ORDER_BE: [u8; 32] = [
     0x5D, 0x57, 0x6E, 0x73, 0x57, 0xA4, 0x50, 0x1D, 0xDF, 0xE9, 0x2F, 0x46, 0x68, 0x1B, 0x20, 0xA0,
 ];
 
-fn recover_signer(hash: &B256, raw: &[u8; 65]) -> Result<Address> {
+pub(crate) fn recover_signer(hash: &B256, raw: &[u8; 65]) -> Result<Address> {
     // Enforce the same canonical-encoding rules EOAValidator applies on-chain (EIP-2) *before*
     // ecrecover. Alloy's parser is more permissive than the contract (it accepts `v` of 0/1 and
     // normalizes high-`s`), so a non-canonical vote can recover to a valid attestor here yet later

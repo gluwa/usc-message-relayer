@@ -16,3 +16,7 @@ pub use write_ability::protocol::message_votes_topic;
 /// The gossipsub topic the relayer publishes reobservation requests on (attestors subscribe to it).
 /// Shared so requester and responder never disagree on the topic id.
 pub use write_ability::protocol::reobservation_topic;
+
+/// The gossipsub topic attestors gossip attestor-set-update votes on (P2-8). The relayer subscribes,
+/// aggregates a threshold, and submits `submitAttestorSetUpdate`.
+pub use write_ability::protocol::attestor_set_update_topic;

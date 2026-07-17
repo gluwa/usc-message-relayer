@@ -128,6 +128,17 @@ sol! {
         /// Quorum threshold (e.g. 2N/3 + 1). Mirrored locally so callers do not burn gas on
         /// transactions that are guaranteed to revert.
         function threshold() external view returns (uint256);
+
+        /// Monotonic nonce bound into the attestor-set-update digest (replay/rollback protection);
+        /// increments on each successful update. The relayer reads it to reconstruct the digest.
+        function attestorSetUpdateNonce() external view returns (uint256);
+
+        /// Rotate the attestor set. `signatures` is the concatenation of 65-byte `(r,s,v)` ECDSA
+        /// signatures by the *current* set over the update digest
+        /// ([`attestor_set_update_digest`](crate::hash::attestor_set_update_digest)); the contract
+        /// verifies threshold-many and swaps in `newAttestors`. Permissionless — the relayer submits
+        /// it once it has aggregated a threshold of gossiped signatures.
+        function submitAttestorSetUpdate(address[] memory newAttestors, bytes memory signatures) external;
     }
 
     #[sol(rpc)]
