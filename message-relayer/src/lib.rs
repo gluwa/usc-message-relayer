@@ -317,6 +317,7 @@ impl Server {
                     spy,
                     route_chain_keys,
                     vote_tx,
+                    setupdate_vote_tx,
                     reobs_rx,
                     metrics.clone(),
                     health.clone(),
