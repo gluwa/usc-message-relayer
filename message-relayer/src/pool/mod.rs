@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{Address, Signature, B256};
+use alloy::primitives::{Address, Signature, B256, U256};
 use anyhow::Result;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -770,7 +770,33 @@ impl RouteState {
     }
 }
 
-fn recover_signer(hash: &B256, raw: &[u8; 65]) -> Result<Address> {
+/// secp256k1 half-order (n/2), big-endian. EOAValidator enforces EIP-2 low-`s` on-chain and
+/// rejects any signature whose `s` exceeds this. A high-`s` vote recovers to a valid attestor
+/// off-chain but reverts `validateVotes`, so we must apply the same bound before counting a vote.
+const SECP256K1_HALF_ORDER_BE: [u8; 32] = [
+    0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x5D, 0x57, 0x6E, 0x73, 0x57, 0xA4, 0x50, 0x1D, 0xDF, 0xE9, 0x2F, 0x46, 0x68, 0x1B, 0x20, 0xA0,
+];
+
+pub(crate) fn recover_signer(hash: &B256, raw: &[u8; 65]) -> Result<Address> {
+    // Enforce the same canonical-encoding rules EOAValidator applies on-chain (EIP-2) *before*
+    // ecrecover. Alloy's parser is more permissive than the contract (it accepts `v` of 0/1 and
+    // normalizes high-`s`), so a non-canonical vote can recover to a valid attestor here yet later
+    // revert the whole delivery bundle at `validateVotes`. Rejecting here — before `note_vote`'s
+    // dedup insert — stops a non-canonical vote from occupying the signer's slot and blocking the
+    // canonical vote that would follow (USC-WRITE-ABILITY-004).
+    //
+    // `v` must be exactly 27 or 28.
+    let v = raw[64];
+    if v != 27 && v != 28 {
+        anyhow::bail!("non-canonical signature: v={v} (only 27/28 accepted)");
+    }
+    // `s` must be <= the secp256k1 half-order.
+    let s = U256::from_be_slice(&raw[32..64]);
+    if s > U256::from_be_slice(&SECP256K1_HALF_ORDER_BE) {
+        anyhow::bail!("non-canonical signature: high-s value rejected (EIP-2)");
+    }
+
     let sig: Signature = raw[..]
         .try_into()
         .map_err(|e| anyhow::anyhow!("malformed signature bytes: {e}"))?;
@@ -833,6 +859,83 @@ mod tests {
         };
         assert!(state.note_vote(vote, metrics.as_ref()).is_none());
         assert_eq!(state.total_pending(), 0);
+    }
+
+    // secp256k1 group order N, big-endian — used to build the malleable high-`s` equivalent
+    // (`s' = N - s`) of a canonical signature.
+    const SECP256K1_N_BE: [u8; 32] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFE, 0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36,
+        0x41, 0x41,
+    ];
+
+    fn test_signer(seed: u8) -> alloy::signers::local::PrivateKeySigner {
+        alloy::signers::local::PrivateKeySigner::from_slice(&[seed; 32]).expect("valid key")
+    }
+
+    fn canonical_sig(signer: &alloy::signers::local::PrivateKeySigner, hash: &B256) -> [u8; 65] {
+        use alloy::signers::SignerSync as _;
+        // alloy's k256 signer normalizes `s` to low and encodes `v` as 27/28 — i.e. canonical.
+        signer.sign_hash_sync(hash).expect("sign").as_bytes()
+    }
+
+    /// The malleable high-`s` equivalent of a canonical signature: `s' = N - s` with the recovery
+    /// parity flipped. Recovers to the same signer under a permissive parser, but violates EIP-2.
+    fn to_high_s(mut raw: [u8; 65]) -> [u8; 65] {
+        let high = U256::from_be_slice(&SECP256K1_N_BE) - U256::from_be_slice(&raw[32..64]);
+        raw[32..64].copy_from_slice(&high.to_be_bytes::<32>());
+        raw[64] = if raw[64] == 27 { 28 } else { 27 };
+        raw
+    }
+
+    #[test]
+    fn recover_signer_rejects_non_canonical_encodings() {
+        let signer = test_signer(0x11);
+        let hash = B256::from([0x42u8; 32]);
+        let canonical = canonical_sig(&signer, &hash);
+
+        // Sanity: the canonical signature recovers to the signer.
+        assert_eq!(recover_signer(&hash, &canonical).unwrap(), signer.address());
+
+        // High-`s` malleable equivalent — recovers to the same signer on a permissive parser but
+        // must be rejected here (EOAValidator would revert on it).
+        assert!(recover_signer(&hash, &to_high_s(canonical)).is_err());
+
+        // `v` encoded as 0/1 instead of 27/28.
+        let mut bad_v = canonical;
+        bad_v[64] -= 27;
+        assert!(recover_signer(&hash, &bad_v).is_err());
+    }
+
+    #[test]
+    fn non_canonical_vote_does_not_poison_dedup_slot() {
+        let signer = test_signer(0x22);
+        let addr = signer.address();
+        let mut state = State::new(vec![route_for(2, vec![addr])], VoteCacheConfig::default());
+        let metrics = NoopMetrics::new();
+        let hash = B256::from([0x07u8; 32]);
+        state.note_indexed(indexed_for(2, hash), metrics.as_ref());
+
+        let canonical = canonical_sig(&signer, &hash);
+        let high_s = to_high_s(canonical);
+        let mk = |sig: [u8; 65]| MessageVote {
+            chain_key: 2,
+            message_id: [7u8; 32],
+            message_hash: hash.0,
+            signer: addr.into_array(),
+            signature: sig,
+        };
+
+        // The non-canonical vote arrives first: rejected, not counted, dedup slot untouched, and
+        // the message is not driven terminal.
+        assert!(state.note_vote(mk(high_s), metrics.as_ref()).is_none());
+
+        // The canonical vote from the *same* attestor is still accepted and reaches threshold (1),
+        // proving the poison did not consume the signer's slot.
+        assert!(
+            state.note_vote(mk(canonical), metrics.as_ref()).is_some(),
+            "canonical vote must be accepted after a non-canonical one from the same signer"
+        );
     }
 
     #[test]

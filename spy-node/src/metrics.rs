@@ -107,6 +107,7 @@ impl SpyMetrics {
 pub enum EventLabelKind {
     MessageVote,
     ReobservationRequest,
+    SetUpdateVote,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]

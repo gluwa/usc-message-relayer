@@ -47,6 +47,32 @@ pub fn message_hash(
     B256::from_slice(&hasher.finalize())
 }
 
+/// Compute the attestor-set-update digest exactly as the `EOAValidator` recomputes it:
+/// `keccak256(abi.encode(newAttestors, chainId, nonce))`.
+///
+/// `new_attestors` MUST be in the exact order the relayer submits on-chain (the contract hashes that
+/// order), so every attestor and the relayer agree on a **canonical** ordering — see
+/// [`canonical_attestor_order`]. `chain_id` is the destination chain's `block.chainid`, and `nonce`
+/// is the validator's current `attestorSetUpdateNonce` (replay/rollback protection).
+#[must_use]
+pub fn attestor_set_update_digest(new_attestors: &[Address], chain_id: U256, nonce: U256) -> B256 {
+    let encoded = (new_attestors.to_vec(), chain_id, nonce).abi_encode_params();
+    let mut hasher = Keccak256::new();
+    hasher.update(&encoded);
+    B256::from_slice(&hasher.finalize())
+}
+
+/// Canonical ordering for the attestor-set-update array: ascending by 20-byte address, de-duplicated.
+/// Every attestor and the relayer must order `newAttestors` identically or their signatures cover
+/// different bytes and cannot be aggregated.
+#[must_use]
+pub fn canonical_attestor_order(addrs: &[Address]) -> Vec<Address> {
+    let mut out = addrs.to_vec();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,6 +96,34 @@ mod tests {
             b"hello",
         );
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn set_update_digest_deterministic_and_binds_nonce_chain_order() {
+        let addrs = [
+            address!("00000000000000000000000000000000000000aa"),
+            address!("00000000000000000000000000000000000000bb"),
+        ];
+        let base = attestor_set_update_digest(&addrs, U256::from(42u64), U256::from(7u64));
+        assert_eq!(
+            base,
+            attestor_set_update_digest(&addrs, U256::from(42u64), U256::from(7u64))
+        );
+        // (Cross-crate keccak equivalence with the attestor's alloy path is already locked by the
+        // `message_hash` golden vectors shared across both crates.)
+        assert_ne!(
+            base,
+            attestor_set_update_digest(&addrs, U256::from(42u64), U256::from(8u64))
+        );
+        assert_ne!(
+            base,
+            attestor_set_update_digest(&addrs, U256::from(43u64), U256::from(7u64))
+        );
+        let reversed = [addrs[1], addrs[0]];
+        assert_ne!(
+            base,
+            attestor_set_update_digest(&reversed, U256::from(42u64), U256::from(7u64))
+        );
     }
 
     /// Differing payload bytes must produce different hashes.
