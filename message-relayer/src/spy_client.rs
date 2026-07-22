@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use write_ability::envelope::ReobservationRequest;
+use write_ability::envelope::{ReobservationRequest, SetUpdateVote};
 
 use crate::health::Health;
 use crate::p2p::MessageVote;
@@ -50,10 +50,12 @@ pub struct SpyClientConfig {
 
 /// Run the spy client until cancelled: subscribe for the routes' chain keys, forward votes into
 /// `vote_tx`, publish the pool's reobservation requests through the spy.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: SpyClientConfig,
     chain_keys: Vec<u64>,
     vote_tx: mpsc::Sender<MessageVote>,
+    setupdate_vote_tx: mpsc::Sender<SetUpdateVote>,
     mut reobs_rx: mpsc::Receiver<ReobservationRequest>,
     metrics: Metrics,
     health: std::sync::Arc<Health>,
@@ -73,6 +75,7 @@ pub async fn run(
             &config,
             &chain_keys,
             &vote_tx,
+            &setupdate_vote_tx,
             &mut reobs_rx,
             &metrics,
             &health,
@@ -95,10 +98,12 @@ pub async fn run(
 
 /// One connected session: subscribe, then pump events/publishes until the socket dies (Err) or
 /// we are cancelled (Ok).
+#[allow(clippy::too_many_arguments)]
 async fn session(
     config: &SpyClientConfig,
     chain_keys: &[u64],
     vote_tx: &mpsc::Sender<MessageVote>,
+    setupdate_vote_tx: &mpsc::Sender<SetUpdateVote>,
     reobs_rx: &mut mpsc::Receiver<ReobservationRequest>,
     metrics: &Metrics,
     health: &Health,
@@ -116,7 +121,10 @@ async fn session(
     // Subscribe to message votes + peer status for our chains. (Reobservation-request events are
     // not needed — the relayer *originates* requests, it does not act on others'.)
     let subscribe = serde_json::json!({
-        "subscribe": { "chain_keys": chain_keys, "events": ["message_vote", "peer_status"] }
+        "subscribe": {
+            "chain_keys": chain_keys,
+            "events": ["message_vote", "attestor_set_update", "peer_status"]
+        }
     });
     ws.send(WsMessage::Text(subscribe.to_string().into()))
         .await
@@ -155,7 +163,7 @@ async fn session(
                 match msg {
                     WsMessage::Text(text) => {
                         health.heartbeat(HEALTH_KEY);
-                        handle_event(text.as_str(), vote_tx, metrics);
+                        handle_event(text.as_str(), vote_tx, setupdate_vote_tx, metrics);
                     }
                     WsMessage::Pong(_) => {
                         // The liveness pulse on a quiet mesh: the connection demonstrably works.
@@ -177,6 +185,8 @@ async fn session(
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SpyEvent {
     MessageVote(SpyVote),
+    #[serde(rename = "attestor_set_update")]
+    SetUpdateVote(SpySetUpdate),
     PeerStatus {
         chain_key: u64,
         subscribed_peers: usize,
@@ -195,7 +205,23 @@ struct SpyVote {
     // `signature_valid` is deliberately not read — the pool re-validates (module docs).
 }
 
-fn handle_event(text: &str, vote_tx: &mpsc::Sender<MessageVote>, metrics: &Metrics) {
+#[derive(Debug, Deserialize)]
+struct SpySetUpdate {
+    chain_key: u64,
+    new_attestors: Vec<String>,
+    nonce: String,
+    signer: String,
+    signature: String,
+    // `source_peer` / `received_at_ms` are carried by the spy but unused here; extra fields are
+    // ignored by serde. The set-update aggregator re-derives the digest and re-recovers the signer.
+}
+
+fn handle_event(
+    text: &str,
+    vote_tx: &mpsc::Sender<MessageVote>,
+    setupdate_vote_tx: &mpsc::Sender<SetUpdateVote>,
+    metrics: &Metrics,
+) {
     let event: SpyEvent = match serde_json::from_str(text) {
         Ok(event) => event,
         Err(_) => {
@@ -231,6 +257,30 @@ fn handle_event(text: &str, vote_tx: &mpsc::Sender<MessageVote>, metrics: &Metri
                 }
             }
         }
+        SpyEvent::SetUpdateVote(vote) => {
+            let chain_key = vote.chain_key;
+            match convert_set_update(vote) {
+                Ok(vote) => {
+                    // Mirror the swarm path's shed-don't-block hand-off (the proposer re-emits each
+                    // cycle, so a dropped vote is recovered on the next round).
+                    match setupdate_vote_tx.try_send(vote) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!(
+                                chain_key,
+                                "set-update aggregator saturated; dropping spy-delivered vote"
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            warn!("set-update aggregator channel closed; spy client draining");
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(%err, "malformed set-update vote event from spy — dropping");
+                }
+            }
+        }
         SpyEvent::PeerStatus {
             chain_key,
             subscribed_peers,
@@ -249,6 +299,25 @@ fn convert_vote(vote: SpyVote) -> Result<MessageVote> {
         chain_key: vote.chain_key,
         message_id: parse_hex::<32>(&vote.message_id).context("message_id")?,
         message_hash: parse_hex::<32>(&vote.message_hash).context("message_hash")?,
+        signer: parse_hex::<20>(&vote.signer).context("signer")?,
+        signature: parse_hex::<65>(&vote.signature).context("signature")?,
+    })
+}
+
+/// Reconstruct the wire [`SetUpdateVote`] envelope from a spy event. The set-update aggregator
+/// re-derives the update digest from chain state and re-recovers the signer, so nothing here
+/// trusts the spy (which cannot compute the digest and so does not annotate validity).
+fn convert_set_update(vote: SpySetUpdate) -> Result<SetUpdateVote> {
+    let new_attestors = vote
+        .new_attestors
+        .iter()
+        .enumerate()
+        .map(|(i, a)| parse_hex::<20>(a).with_context(|| format!("new_attestors[{i}]")))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(SetUpdateVote {
+        chain_key: vote.chain_key,
+        new_attestors,
+        nonce: parse_hex::<32>(&vote.nonce).context("nonce")?,
         signer: parse_hex::<20>(&vote.signer).context("signer")?,
         signature: parse_hex::<65>(&vote.signature).context("signature")?,
     })
@@ -314,6 +383,44 @@ mod tests {
         assert!(matches!(other, SpyEvent::Other));
         // Ack frames (no `type` tag) fail to parse as SpyEvent — handle_event ignores them.
         assert!(serde_json::from_str::<SpyEvent>(r#"{"ack":{"subscribe":true}}"#).is_err());
+    }
+
+    /// A spy `attestor_set_update` frame reconstructs the exact wire envelope (raw fields, no
+    /// signature annotation — the aggregator re-derives the digest and re-recovers).
+    #[test]
+    fn converts_spy_set_update_event_to_wire_envelope() {
+        let json = format!(
+            r#"{{"type":"attestor_set_update","chain_key":7,
+                "new_attestors":["0x{}","0x{}"],"nonce":"0x{}","signer":"0x{}",
+                "signature":"0x{}","source_peer":"12D3KooWExample","received_at_ms":1}}"#,
+            "0a".repeat(20),
+            "0b".repeat(20),
+            "cd".repeat(32),
+            "ee".repeat(20),
+            "03".repeat(65),
+        );
+        let event: SpyEvent = serde_json::from_str(&json).unwrap();
+        let SpyEvent::SetUpdateVote(vote) = event else {
+            panic!("expected attestor_set_update")
+        };
+        let wire = convert_set_update(vote).unwrap();
+        assert_eq!(wire.chain_key, 7);
+        assert_eq!(wire.new_attestors, vec![[0x0A; 20], [0x0B; 20]]);
+        assert_eq!(wire.nonce, [0xCD; 32]);
+        assert_eq!(wire.signer, [0xEE; 20]);
+        assert_eq!(wire.signature, [0x03; 65]);
+    }
+
+    #[test]
+    fn malformed_set_update_hex_is_rejected() {
+        let vote = SpySetUpdate {
+            chain_key: 7,
+            new_attestors: vec!["0x1234".into()], // wrong length
+            nonce: format!("0x{}", "cd".repeat(32)),
+            signer: format!("0x{}", "ee".repeat(20)),
+            signature: format!("0x{}", "03".repeat(65)),
+        };
+        assert!(convert_set_update(vote).is_err());
     }
 
     #[test]

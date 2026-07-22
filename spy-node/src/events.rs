@@ -50,6 +50,26 @@ pub enum SpyEvent {
         source_peer: String,
         received_at_ms: u64,
     },
+    /// An attestor's ECDSA vote proposing a new destination attestor set, seen on
+    /// `{chain_key}/attestor-set-update/v1`. Streamed raw: the spy has no destination-chain
+    /// connection and cannot recompute the update digest, so (unlike `MessageVote`) it does not
+    /// annotate `signature_valid` — the relayer's set-update aggregator re-derives the digest from
+    /// chain state and recovers the signer itself.
+    #[serde(rename = "attestor_set_update")]
+    SetUpdateVote {
+        chain_key: u64,
+        /// Proposed attestor set, each `0x`-prefixed 20-byte hex, in canonical (ascending) order.
+        new_attestors: Vec<String>,
+        /// `0x`-prefixed 32-byte hex — the `attestorSetUpdateNonce` this vote was signed against.
+        nonce: String,
+        /// `0x`-prefixed 20-byte hex — the envelope's advertised signer.
+        signer: String,
+        /// `0x`-prefixed 65-byte hex — carried so the relayer can recover + re-verify independently.
+        signature: String,
+        /// The gossipsub peer we received the frame from (propagation source).
+        source_peer: String,
+        received_at_ms: u64,
+    },
     /// Per-chain mesh visibility: how many peers this spy currently sees subscribed to the
     /// message-vote topic. Emitted on every change.
     PeerStatus {
@@ -98,6 +118,28 @@ impl SpyEvent {
         }
     }
 
+    pub fn set_update_vote(
+        chain_key: u64,
+        new_attestors: &[[u8; 20]],
+        nonce: [u8; 32],
+        signer: [u8; 20],
+        signature: &[u8; 65],
+        source_peer: &libp2p::PeerId,
+    ) -> Self {
+        Self::SetUpdateVote {
+            chain_key,
+            new_attestors: new_attestors
+                .iter()
+                .map(|a| format!("0x{}", hex::encode(a)))
+                .collect(),
+            nonce: format!("0x{}", hex::encode(nonce)),
+            signer: format!("0x{}", hex::encode(signer)),
+            signature: format!("0x{}", hex::encode(signature)),
+            source_peer: source_peer.to_string(),
+            received_at_ms: now_ms(),
+        }
+    }
+
     pub fn peer_status(chain_key: u64, subscribed_peers: usize) -> Self {
         Self::PeerStatus {
             chain_key,
@@ -111,6 +153,7 @@ impl SpyEvent {
         match self {
             Self::MessageVote { chain_key, .. }
             | Self::ReobservationRequest { chain_key, .. }
+            | Self::SetUpdateVote { chain_key, .. }
             | Self::PeerStatus { chain_key, .. } => *chain_key,
         }
     }
@@ -120,7 +163,7 @@ impl SpyEvent {
         match self {
             Self::MessageVote { message_id, .. }
             | Self::ReobservationRequest { message_id, .. } => Some(message_id),
-            Self::PeerStatus { .. } => None,
+            Self::SetUpdateVote { .. } | Self::PeerStatus { .. } => None,
         }
     }
 
@@ -129,6 +172,7 @@ impl SpyEvent {
         match self {
             Self::MessageVote { .. } => EventKind::MessageVote,
             Self::ReobservationRequest { .. } => EventKind::ReobservationRequest,
+            Self::SetUpdateVote { .. } => EventKind::SetUpdateVote,
             Self::PeerStatus { .. } => EventKind::PeerStatus,
         }
     }
@@ -139,6 +183,8 @@ impl SpyEvent {
 pub enum EventKind {
     MessageVote,
     ReobservationRequest,
+    #[serde(rename = "attestor_set_update")]
+    SetUpdateVote,
     PeerStatus,
 }
 
@@ -218,6 +264,30 @@ mod tests {
         assert_eq!(json["message_id"], format!("0x{}", "01".repeat(32)));
         assert_eq!(json["signature_valid"], true);
         assert!(json["signature"].as_str().unwrap().starts_with("0x000000"));
+    }
+
+    #[test]
+    fn set_update_vote_serializes_with_type_tag_and_hex_fields() {
+        let event = SpyEvent::set_update_vote(
+            7,
+            &[[0x0A; 20], [0x0B; 20]],
+            [0xCD; 32],
+            [0xEE; 20],
+            &[0x03; 65],
+            &libp2p::PeerId::random(),
+        );
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "attestor_set_update");
+        assert_eq!(json["chain_key"], 7);
+        assert_eq!(json["new_attestors"][0], format!("0x{}", "0a".repeat(20)));
+        assert_eq!(json["new_attestors"][1], format!("0x{}", "0b".repeat(20)));
+        assert_eq!(json["nonce"], format!("0x{}", "cd".repeat(32)));
+        assert_eq!(json["signer"], format!("0x{}", "ee".repeat(20)));
+        assert!(json["signature"].as_str().unwrap().starts_with("0x0303"));
+        // Not message-scoped: excluded by a message_id filter, like peer_status.
+        assert_eq!(event.kind(), EventKind::SetUpdateVote);
+        assert_eq!(event.chain_key(), 7);
+        assert!(event.message_id().is_none());
     }
 
     #[test]

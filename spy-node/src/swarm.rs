@@ -25,7 +25,7 @@ use tracing::{debug, info, trace, warn};
 use message_relayer::health::Health;
 use message_relayer::p2p::behavior::{RelayerBehavior, RelayerBehaviorEvent};
 use message_relayer::p2p::{derive_keypair, protocols};
-use write_ability::envelope::{MessageVote, ReobservationRequest};
+use write_ability::envelope::{MessageVote, ReobservationRequest, SetUpdateVote};
 
 use crate::config::P2pConfig;
 use crate::events::SpyEvent;
@@ -76,6 +76,7 @@ pub async fn run(
     // Subscribe to the message-vote and reobservation topics per configured chain.
     let mut vote_topic_to_chain: HashMap<TopicHash, u64> = HashMap::new();
     let mut reobs_topic_to_chain: HashMap<TopicHash, u64> = HashMap::new();
+    let mut setupdate_topic_to_chain: HashMap<TopicHash, u64> = HashMap::new();
     let mut chain_to_reobs_topic: HashMap<u64, IdentTopic> = HashMap::new();
     for ck in &chain_keys {
         let votes = IdentTopic::new(protocols::message_votes_topic(*ck));
@@ -95,6 +96,15 @@ pub async fn run(
             .with_context(|| format!("subscribe to {reobs} failed"))?;
         reobs_topic_to_chain.insert(reobs.hash(), *ck);
         chain_to_reobs_topic.insert(*ck, reobs);
+
+        let setupdate = IdentTopic::new(protocols::attestor_set_update_topic(*ck));
+        info!(chain_key = ck, topic = %setupdate, "📥 observing attestor-set-update votes");
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&setupdate)
+            .with_context(|| format!("subscribe to {setupdate} failed"))?;
+        setupdate_topic_to_chain.insert(setupdate.hash(), *ck);
     }
 
     for boot in &p2p.boot_nodes {
@@ -198,6 +208,7 @@ pub async fn run(
                     &mut swarm,
                     &vote_topic_to_chain,
                     &reobs_topic_to_chain,
+                    &setupdate_topic_to_chain,
                     &hub,
                     metrics.as_ref(),
                     &mut peer_counts,
@@ -207,11 +218,13 @@ pub async fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_swarm_event(
     event: libp2p::swarm::SwarmEvent<RelayerBehaviorEvent>,
     swarm: &mut libp2p::Swarm<RelayerBehavior>,
     vote_topic_to_chain: &HashMap<TopicHash, u64>,
     reobs_topic_to_chain: &HashMap<TopicHash, u64>,
+    setupdate_topic_to_chain: &HashMap<TopicHash, u64>,
     hub: &Hub,
     metrics: &SpyMetrics,
     peer_counts: &mut HashMap<u64, usize>,
@@ -247,6 +260,8 @@ fn handle_swarm_event(
                 observe_vote(chain_key, &message.data, &propagation_source, hub, metrics)
             } else if let Some(&chain_key) = reobs_topic_to_chain.get(&message.topic) {
                 observe_reobservation(chain_key, &message.data, &propagation_source, hub, metrics)
+            } else if let Some(&chain_key) = setupdate_topic_to_chain.get(&message.topic) {
+                observe_set_update(chain_key, &message.data, &propagation_source, hub, metrics)
             } else {
                 trace!(topic = %message.topic, "message on unsubscribed topic");
                 return;
@@ -383,6 +398,50 @@ fn observe_reobservation(
     }
 }
 
+/// Decode one attestor-set-update-vote frame and stream it raw. Unlike [`observe_vote`], the spy
+/// does **not** attempt signature recovery: the signature covers the update digest, which is
+/// derived from destination-chain state (`chain_id`, `attestorSetUpdateNonce`) the spy has no
+/// connection to. The relayer's set-update aggregator recomputes the digest and recovers the
+/// signer itself, so the spy just re-emits the wire fields. Any decodable vote whose envelope
+/// `chain_key` matches its topic is Accepted; malformed / mismatched frames are Rejected.
+fn observe_set_update(
+    chain_key: u64,
+    data: &[u8],
+    source: &libp2p::PeerId,
+    hub: &Hub,
+    metrics: &SpyMetrics,
+) -> MessageAcceptance {
+    match SetUpdateVote::decode_bytes(data) {
+        Ok(vote) if vote.chain_key == chain_key => {
+            hub.publish(SpyEvent::set_update_vote(
+                chain_key,
+                &vote.new_attestors,
+                vote.nonce,
+                vote.signer,
+                &vote.signature,
+                source,
+            ));
+            metrics.inc_event(EventLabelKind::SetUpdateVote, EventOutcome::Accepted);
+            MessageAcceptance::Accept
+        }
+        Ok(vote) => {
+            warn!(
+                %source,
+                envelope_chain_key = vote.chain_key,
+                topic_chain_key = chain_key,
+                "set-update vote envelope chain_key disagrees with topic — rejecting"
+            );
+            metrics.inc_event(EventLabelKind::SetUpdateVote, EventOutcome::Rejected);
+            MessageAcceptance::Reject
+        }
+        Err(err) => {
+            warn!(%source, %err, "could not decode SetUpdateVote — rejecting");
+            metrics.inc_event(EventLabelKind::SetUpdateVote, EventOutcome::Rejected);
+            MessageAcceptance::Reject
+        }
+    }
+}
+
 fn recover_signer(
     hash: &alloy::primitives::B256,
     raw: &[u8; 65],
@@ -497,6 +556,66 @@ mod tests {
         };
         assert!(matches!(
             observe_vote(
+                102,
+                &vote.encode_bytes(),
+                &libp2p::PeerId::random(),
+                &hub,
+                &metrics
+            ),
+            MessageAcceptance::Reject
+        ));
+    }
+
+    /// A decodable set-update vote streams raw (no signature recovery, no `signature_valid`) and
+    /// Accepts; the relayer's aggregator re-derives the digest and validates.
+    #[tokio::test]
+    async fn observe_set_update_streams_raw_event() {
+        let vote = SetUpdateVote {
+            chain_key: 102,
+            new_attestors: vec![[0x0A; 20], [0x0B; 20]],
+            nonce: [0xCD; 32],
+            signer: [0xEE; 20],
+            signature: [0x03; 65],
+        };
+
+        let hub = Hub::new();
+        let mut rx = hub.subscribe();
+        let metrics = SpyMetrics::new();
+        let acceptance = observe_set_update(
+            102,
+            &vote.encode_bytes(),
+            &libp2p::PeerId::random(),
+            &hub,
+            &metrics,
+        );
+        assert!(matches!(acceptance, MessageAcceptance::Accept));
+
+        let json = serde_json::to_value(&*rx.recv().await.unwrap()).unwrap();
+        assert_eq!(json["type"], "attestor_set_update");
+        assert_eq!(json["chain_key"], 102);
+        assert_eq!(json["new_attestors"][0], format!("0x{}", "0a".repeat(20)));
+        assert_eq!(json["signer"], format!("0x{}", "ee".repeat(20)));
+        assert!(json.get("signature_valid").is_none());
+    }
+
+    #[test]
+    fn set_update_garbage_and_chain_mismatch_are_rejected() {
+        let hub = Hub::new();
+        let metrics = SpyMetrics::new();
+        assert!(matches!(
+            observe_set_update(102, b"garbage", &libp2p::PeerId::random(), &hub, &metrics),
+            MessageAcceptance::Reject
+        ));
+
+        let vote = SetUpdateVote {
+            chain_key: 7, // disagrees with topic chain 102
+            new_attestors: vec![[0x0A; 20]],
+            nonce: [0xCD; 32],
+            signer: [0xEE; 20],
+            signature: [0x03; 65],
+        };
+        assert!(matches!(
+            observe_set_update(
                 102,
                 &vote.encode_bytes(),
                 &libp2p::PeerId::random(),
