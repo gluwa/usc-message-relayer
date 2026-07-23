@@ -241,9 +241,15 @@ async fn poll_once<P: Provider>(
                     continue;
                 };
                 let payload = decoded.data.payload.to_vec();
+                // `emitterAddress` is emitted as `bytes32` (cross-chain consistency); the 20-byte
+                // EVM address sits in the high bytes. Recover the plain `Address` — the signed
+                // `messageHash` and `deliverMessage` both use `address`.
+                let emitter = alloy::primitives::Address::from_slice(
+                    &decoded.data.emitterAddress.as_slice()[..20],
+                );
                 let hash = message_hash(
                     decoded.data.messageId,
-                    decoded.data.emitterAddress,
+                    emitter,
                     destination_chain_key,
                     creditcoin_chain_id,
                     &payload,
@@ -251,7 +257,7 @@ async fn poll_once<P: Provider>(
                 let indexed = IndexedMessage {
                     chain_key,
                     message_id: decoded.data.messageId,
-                    emitter: decoded.data.emitterAddress,
+                    emitter,
                     destination_chain_key,
                     creditcoin_chain_id,
                     payload,
