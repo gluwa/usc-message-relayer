@@ -196,6 +196,27 @@ sol! {
         error UnsupportedTxType(uint8 txType);
     }
 
+    #[sol(rpc)]
+    #[derive(Debug)]
+    contract IRelayerFeeVault {
+        /// Per-message fee + routing record on the *source* (Creditcoin) chain. The relayer reads
+        /// `gasLimit` so it can deliver the destination tx with exactly the funded gas: the vault
+        /// only pays `claimDelivery` when the proven delivery tx's gasLimit matches a funded tier
+        /// (`decoded.gasLimit == _initialGasLimit`), so an estimated gas would strand the fee.
+        struct MessageInfo {
+            address payer;
+            uint32  destinationChain;
+            uint256 gasLimit;
+            uint256 relayFee;
+            uint256 tip;
+            uint256 tipExpiry;
+            uint256 deliveryDeadline;
+            bool    relaySettled;
+        }
+
+        function getMessageInfo(bytes32 messageId) external view returns (MessageInfo memory);
+    }
+
     /// One sibling along the merkle inclusion path. `isLeft` says whether the sibling is the
     /// left-hand input when hashing up to the parent.
     #[derive(Debug)]

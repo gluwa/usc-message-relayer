@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::abi::IInbox;
+use crate::abi::{IInbox, IRelayerFeeVault};
 use crate::config::{ChainRoute, DeliveryConfig};
 use crate::prom::{DeliveryStatus, Metrics};
 use crate::revert::{has_selector, is_revert};
@@ -88,6 +88,7 @@ pub enum DeliveryResultKind {
 pub async fn run(
     route: ChainRoute,
     delivery_config: DeliveryConfig,
+    creditcoin_eth_rpc_url: String,
     mut job_rx: mpsc::Receiver<DeliveryJob>,
     result_tx: mpsc::Sender<DeliveryResult>,
     metrics: Metrics,
@@ -116,10 +117,28 @@ pub async fn run(
             )
         })?;
 
+    // Read-only source-chain provider, only when the fee vault is configured: used to look up each
+    // message's funded `gasLimit` so the delivery tx is pinned to it (see `funded_gas_limit`).
+    let source_provider = match route.relayer_fee_vault_address {
+        Some(_) => Some(
+            ProviderBuilder::new()
+                .connect(&creditcoin_eth_rpc_url)
+                .await
+                .with_context(|| {
+                    format!(
+                        "chain_key {chain_key}: failed to connect to source EVM RPC at {creditcoin_eth_rpc_url} \
+                         (needed to read funded gasLimit from RelayerFeeVault)"
+                    )
+                })?,
+        ),
+        None => None,
+    };
+
     info!(
         chain_key,
         signer = %signer_address,
         inbox = %route.inbox_address,
+        fee_vault = ?route.relayer_fee_vault_address,
         "🚚 delivery worker online"
     );
 
@@ -134,11 +153,25 @@ pub async fn run(
                     info!(chain_key, "delivery channel closed; worker exiting");
                     return Ok(());
                 };
+                // Pin the delivery tx to the message's funded gasLimit so the relayer can claim its
+                // fee later (the vault only pays when the proven delivery gasLimit matches a funded
+                // tier). `None` (no vault, unfunded message, or read failure) falls back to estimation.
+                let funded_gas = match (&source_provider, route.relayer_fee_vault_address) {
+                    (Some(p), Some(vault)) => {
+                        funded_gas_limit(p, vault, job.message_id).await.unwrap_or_else(|err| {
+                            warn!(chain_key, message_id = %job.message_id, %err,
+                                "could not read funded gasLimit; falling back to gas estimation (fee may be unclaimable)");
+                            None
+                        })
+                    }
+                    _ => None,
+                };
                 let outcome = match handle_job(
                     &route,
                     &delivery_config,
                     &provider,
                     &job,
+                    funded_gas,
                     metrics.as_ref(),
                 ).await {
                     Ok(outcome) => outcome,
@@ -164,26 +197,47 @@ pub async fn run(
     }
 }
 
+/// Read a message's funded `gasLimit` from the source `RelayerFeeVault`. `Ok(None)` when the
+/// message has no funded route (payer unset / gasLimit 0) so delivery falls back to estimation;
+/// `Err` only on an RPC/transport failure (the caller logs and also falls back).
+async fn funded_gas_limit<P: Provider>(
+    source_provider: &P,
+    vault: Address,
+    message_id: B256,
+) -> Result<Option<u64>> {
+    let vault = IRelayerFeeVault::new(vault, source_provider);
+    let info = vault
+        .getMessageInfo(message_id)
+        .call()
+        .await
+        .context("RelayerFeeVault.getMessageInfo failed")?;
+    if info.gasLimit.is_zero() {
+        return Ok(None);
+    }
+    Ok(Some(info.gasLimit.saturating_to::<u64>()))
+}
+
 async fn handle_job<P: Provider + Clone + 'static>(
     route: &ChainRoute,
     delivery_config: &DeliveryConfig,
     provider: &P,
     job: &DeliveryJob,
+    funded_gas: Option<u64>,
     metrics: &dyn crate::prom::MetricsTrait,
 ) -> Result<DeliveryResultKind> {
     let inbox = IInbox::new(route.inbox_address, provider);
 
     if delivery_config.simulate_before_send {
-        if let Err(err) = inbox
-            .deliverMessage(
-                job.message_id,
-                job.emitter,
-                Bytes::from(job.payload.clone()),
-                Bytes::from(job.votes_calldata.clone()),
-            )
-            .call()
-            .await
-        {
+        let mut sim = inbox.deliverMessage(
+            job.message_id,
+            job.emitter,
+            Bytes::from(job.payload.clone()),
+            Bytes::from(job.votes_calldata.clone()),
+        );
+        if let Some(gas) = funded_gas {
+            sim = sim.gas(gas);
+        }
+        if let Err(err) = sim.call().await {
             // If the inbox already accepted this message we treat it as success (idempotent —
             // PoC §6.5). Any other *revert* is deterministic, so we don't burn gas. A transport
             // failure (RPC blip, timeout) is neither — the pool retries it with backoff; treating
@@ -221,15 +275,16 @@ async fn handle_job<P: Provider + Clone + 'static>(
     let mut attempts = 0u32;
     let outcome = loop {
         attempts += 1;
-        let pending = inbox
-            .deliverMessage(
-                job.message_id,
-                job.emitter,
-                Bytes::from(job.payload.clone()),
-                Bytes::from(job.votes_calldata.clone()),
-            )
-            .send()
-            .await;
+        let mut tx = inbox.deliverMessage(
+            job.message_id,
+            job.emitter,
+            Bytes::from(job.payload.clone()),
+            Bytes::from(job.votes_calldata.clone()),
+        );
+        if let Some(gas) = funded_gas {
+            tx = tx.gas(gas);
+        }
+        let pending = tx.send().await;
 
         match pending {
             // Poll-based receipt wait — alloy's `get_receipt()` heartbeat wedges against

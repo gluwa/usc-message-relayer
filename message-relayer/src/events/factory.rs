@@ -67,6 +67,7 @@ mod tests {
             destination_rpc_url: "http://x".into(),
             inbox_address: address!("0000000000000000000000000000000000000002"),
             signer_key: None,
+            relayer_fee_vault_address: None,
             block_confirmation_depth: 0,
             start_block: None,
             attestor_set: AttestorSet::Static(vec![address!(
