@@ -562,14 +562,16 @@ async fn any_requires_ack<P: Provider>(
             .await
             .context("IOutbox.messageRequiresAck call failed")?
         {
+            // `messageRequiresAck` is false for an unknown id (mapping default), so passing this
+            // gate already implies the message exists — no separate existence check needed.
             continue;
         }
-        let m = outbox
-            .messages(*id)
+        if !outbox
+            .isAcknowledged(*id)
             .call()
             .await
-            .context("IOutbox.messages call failed")?;
-        if m.emitter != alloy::primitives::Address::ZERO && !m.acknowledged {
+            .context("IOutbox.isAcknowledged call failed")?
+        {
             return Ok(true);
         }
     }

@@ -76,6 +76,11 @@ pub struct ChainRoute {
     pub destination_rpc_url: String,
     pub inbox_address: Address,
     pub signer_key: Option<String>,
+    /// `RelayerFeeVault` on the *source* (Creditcoin) chain. When set, the delivery worker reads
+    /// the funded `gasLimit` for each message and pins the destination `deliverMessage` tx to it,
+    /// so the relayer can later claim its fee (the vault requires the proven delivery tx's gasLimit
+    /// to match a funded tier). `None` falls back to gas estimation (fee not claimable).
+    pub relayer_fee_vault_address: Option<Address>,
     pub block_confirmation_depth: u64,
     /// First block to scan on first run when no persisted checkpoint exists.
     pub start_block: Option<u64>,
@@ -339,6 +344,8 @@ pub struct ChainRouteFile {
     #[serde(default)]
     pub signer_key: Option<String>,
     #[serde(default)]
+    pub relayer_fee_vault_address: Option<String>,
+    #[serde(default)]
     pub block_confirmation_depth: u64,
     #[serde(default)]
     pub start_block: Option<u64>,
@@ -462,6 +469,17 @@ impl ChainRouteFile {
             .map(parse_address)
             .transpose()
             .with_context(|| format!("invalid outbox_address for chain_key {}", self.chain_key))?;
+        let relayer_fee_vault_address = self
+            .relayer_fee_vault_address
+            .as_deref()
+            .map(parse_address)
+            .transpose()
+            .with_context(|| {
+                format!(
+                    "invalid relayer_fee_vault_address for chain_key {}",
+                    self.chain_key
+                )
+            })?;
 
         let attestor_set = match self.attestor_set {
             AttestorSetFile::Static { addresses } => {
@@ -551,6 +569,7 @@ impl ChainRouteFile {
             destination_rpc_url: self.destination_rpc_url,
             inbox_address,
             signer_key: self.signer_key,
+            relayer_fee_vault_address,
             block_confirmation_depth: self.block_confirmation_depth,
             start_block: self.start_block,
             attestor_set,

@@ -174,6 +174,7 @@ impl Server {
                 delivery::run(
                     route.clone(),
                     self.config.delivery.clone(),
+                    self.config.creditcoin_eth_rpc_url.clone(),
                     drx,
                     delivery_result_tx.clone(),
                     metrics.clone(),
