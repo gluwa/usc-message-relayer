@@ -48,6 +48,18 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// attempt's simulate detects the duplicate ("Already validated") and resolves idempotently.
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Upper bound on the per-job funded-gas RPC reads (`RelayerFeeVault.getMessageInfo` on the
+/// source, and the under-funding `estimate_gas` on the destination). Both sit in the serial
+/// worker's critical path, so a stalled RPC must not park the route — on timeout the job degrades
+/// gracefully (estimation fallback / bounded retry) instead of wedging.
+const FUNDED_GAS_READ_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Sanity ceiling on a funded gasLimit read from the vault. Real per-tx gas is far below this; a
+/// value above it means a misconfigured `--relayer-fee-vault-address` (an unrelated contract whose
+/// `getMessageInfo` ABI-decodes to junk), so we ignore it and estimate rather than pin an
+/// unincludable `.gas()` on every delivery for the route.
+const MAX_FUNDED_GAS: u64 = 100_000_000;
+
 /// Bounded, permissionless `retryPendingMessage` schedule after a delivery lands in the
 /// `MessagePending` state (dApp callback reverted). Backoff gives the destination dApp time to
 /// recover (e.g. gas market spike); anyone else may also retry, so this is best-effort.
@@ -155,14 +167,28 @@ pub async fn run(
                 };
                 // Pin the delivery tx to the message's funded gasLimit so the relayer can claim its
                 // fee later (the vault only pays when the proven delivery gasLimit matches a funded
-                // tier). `None` (no vault, unfunded message, or read failure) falls back to estimation.
+                // tier). `None` (no vault, unfunded message, read error, or read timeout) falls back
+                // to estimation. The read is bounded by FUNDED_GAS_READ_TIMEOUT: it runs in this
+                // serial worker's critical path, so an unbounded await on a stalled source RPC would
+                // wedge the whole route (and starve the cancel branch) — the same hazard RECEIPT_TIMEOUT guards.
                 let funded_gas = match (&source_provider, route.relayer_fee_vault_address) {
                     (Some(p), Some(vault)) => {
-                        funded_gas_limit(p, vault, job.message_id).await.unwrap_or_else(|err| {
-                            warn!(chain_key, message_id = %job.message_id, %err,
-                                "could not read funded gasLimit; falling back to gas estimation (fee may be unclaimable)");
-                            None
-                        })
+                        match tokio::time::timeout(
+                            FUNDED_GAS_READ_TIMEOUT,
+                            funded_gas_limit(p, vault, job.message_id),
+                        ).await {
+                            Ok(Ok(g)) => g,
+                            Ok(Err(err)) => {
+                                warn!(chain_key, message_id = %job.message_id, %err,
+                                    "could not read funded gasLimit; falling back to gas estimation (fee may be unclaimable)");
+                                None
+                            }
+                            Err(_) => {
+                                warn!(chain_key, message_id = %job.message_id, timeout_secs = FUNDED_GAS_READ_TIMEOUT.as_secs(),
+                                    "funded gasLimit read timed out; falling back to gas estimation (fee may be unclaimable)");
+                                None
+                            }
+                        }
                     }
                     _ => None,
                 };
@@ -198,20 +224,28 @@ pub async fn run(
 }
 
 /// Read a message's funded `gasLimit` from the source `RelayerFeeVault`. `Ok(None)` when the
-/// message has no funded route (payer unset / gasLimit 0) so delivery falls back to estimation;
-/// `Err` only on an RPC/transport failure (the caller logs and also falls back).
+/// message has no funded route (payer unset / gasLimit 0) or the value is out of sane range, so
+/// delivery falls back to estimation; `Err` only on an RPC/transport failure (the caller logs and
+/// also falls back).
 async fn funded_gas_limit<P: Provider>(
     source_provider: &P,
     vault: Address,
     message_id: B256,
 ) -> Result<Option<u64>> {
-    let vault = IRelayerFeeVault::new(vault, source_provider);
-    let info = vault
+    let fv = IRelayerFeeVault::new(vault, source_provider);
+    let info = fv
         .getMessageInfo(message_id)
         .call()
         .await
         .context("RelayerFeeVault.getMessageInfo failed")?;
     if info.gasLimit.is_zero() {
+        return Ok(None);
+    }
+    // Guard against a misconfigured vault address decoding to junk: an absurd gasLimit would
+    // otherwise pin an unincludable `.gas()` on every delivery. Ignore it and estimate instead.
+    if info.gasLimit > alloy::primitives::U256::from(MAX_FUNDED_GAS) {
+        tracing::warn!(%vault, gas_limit = %info.gasLimit,
+            "RelayerFeeVault.getMessageInfo returned an implausible gasLimit; ignoring (will estimate)");
         return Ok(None);
     }
     Ok(Some(info.gasLimit.saturating_to::<u64>()))
@@ -228,16 +262,20 @@ async fn handle_job<P: Provider + Clone + 'static>(
     let inbox = IInbox::new(route.inbox_address, provider);
 
     if delivery_config.simulate_before_send {
-        let mut sim = inbox.deliverMessage(
-            job.message_id,
-            job.emitter,
-            Bytes::from(job.payload.clone()),
-            Bytes::from(job.votes_calldata.clone()),
-        );
-        if let Some(gas) = funded_gas {
-            sim = sim.gas(gas);
-        }
-        if let Err(err) = sim.call().await {
+        // Validity check only — do NOT pin `.gas()` here. The simulate exists to catch
+        // `validateVotes` logic reverts; constraining it to the funded gas would conflate an
+        // under-funded message (out-of-gas) with a genuine revert and add head-vs-mined-block
+        // boundary nondeterminism. Gas is pinned on the real send below.
+        if let Err(err) = inbox
+            .deliverMessage(
+                job.message_id,
+                job.emitter,
+                Bytes::from(job.payload.clone()),
+                Bytes::from(job.votes_calldata.clone()),
+            )
+            .call()
+            .await
+        {
             // If the inbox already accepted this message we treat it as success (idempotent —
             // PoC §6.5). Any other *revert* is deterministic, so we don't burn gas. A transport
             // failure (RPC blip, timeout) is neither — the pool retries it with backoff; treating
@@ -265,6 +303,84 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 "simulate(deliverMessage) failed at transport level; returning to pool for retry"
             );
             return Ok(DeliveryResultKind::Retryable);
+        }
+    }
+
+    // Under-funding guard. When we have a funded gasLimit, the send is pinned to it (so the proven
+    // delivery gasLimit matches the funded tier and `claimDelivery` can pay). But if the message
+    // actually needs MORE gas than was funded, pinning would guarantee an out-of-gas revert —
+    // burning the relayer's gas for no claimable delivery. Estimate first; if the funded gas can't
+    // cover it, don't submit — return non-terminally so the pool retries (leaving a window for a
+    // `topUpGasLimit`) rather than dropping a message that becomes deliverable once topped up.
+    if let Some(gas) = funded_gas {
+        // Bounded like the getMessageInfo read: this estimate sits on the same serial critical
+        // path, so an unbounded await on a stalled destination RPC would wedge the route.
+        let est = tokio::time::timeout(
+            FUNDED_GAS_READ_TIMEOUT,
+            inbox
+                .deliverMessage(
+                    job.message_id,
+                    job.emitter,
+                    Bytes::from(job.payload.clone()),
+                    Bytes::from(job.votes_calldata.clone()),
+                )
+                .estimate_gas(),
+        )
+        .await;
+        match est {
+            Ok(Ok(est)) if est > gas => {
+                warn!(
+                    chain_key = route.chain_key,
+                    message_id = %job.message_id,
+                    estimate = est,
+                    funded = gas,
+                    "delivery is under-funded — estimated gas exceeds the funded gasLimit; not \
+                     delivering (awaiting a topUpGasLimit). Retrying with backoff."
+                );
+                return Ok(DeliveryResultKind::Retryable);
+            }
+            // Funded gas covers the estimate — proceed to send pinned at the funded gas.
+            Ok(Ok(_)) => {}
+            // The estimate itself failed. Classify like the simulate does: when
+            // `simulate_before_send` is off, this is where a deterministic revert first surfaces,
+            // and blanket-retrying a permanent revert would loop forever. Only genuine transport
+            // errors are retryable (we must not send unverified: an under-funded message would
+            // OOG and be dropped as terminal — the exact failure this guard exists to prevent).
+            Ok(Err(err)) => {
+                if revert_already_validated(&err) {
+                    debug!(chain_key = route.chain_key, message_id = %job.message_id,
+                        "estimate detected already-validated; idempotent success");
+                    metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::AlreadyValidated);
+                    return Ok(DeliveryResultKind::Delivered);
+                }
+                if is_revert(&err.to_string()) {
+                    metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::Reverted);
+                    warn!(
+                        chain_key = route.chain_key,
+                        message_id = %job.message_id,
+                        %err,
+                        "estimate(deliverMessage) reverted; treating as terminal"
+                    );
+                    return Ok(DeliveryResultKind::Terminal);
+                }
+                warn!(
+                    chain_key = route.chain_key,
+                    message_id = %job.message_id,
+                    %err,
+                    "could not estimate delivery gas to verify funding (transport); retrying \
+                     rather than risking an out-of-gas send on a possibly under-funded message"
+                );
+                return Ok(DeliveryResultKind::Retryable);
+            }
+            Err(_elapsed) => {
+                warn!(
+                    chain_key = route.chain_key,
+                    message_id = %job.message_id,
+                    timeout_secs = FUNDED_GAS_READ_TIMEOUT.as_secs(),
+                    "gas estimate timed out; retrying rather than risking an out-of-gas send"
+                );
+                return Ok(DeliveryResultKind::Retryable);
+            }
         }
     }
 
