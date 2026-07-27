@@ -333,10 +333,22 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 );
                 return Ok(DeliveryResultKind::Retryable);
             }
-            // Ok(est <= gas): funded gas covers it. Err(estimate): best-effort — proceed to send
-            // pinned at the funded gas (a failed estimate is typically transient; validity already
-            // passed the simulate above).
-            _ => {}
+            // Funded gas covers the estimate — proceed to send pinned at the funded gas.
+            Ok(_) => {}
+            // Couldn't estimate, so we can't confirm the funded gas covers the tx. Do NOT send
+            // pinned anyway: an under-funded message would then OOG and be classified terminal —
+            // the exact drop this guard exists to prevent. Retry instead; a transient estimate
+            // failure clears and the guard re-checks next attempt.
+            Err(err) => {
+                warn!(
+                    chain_key = route.chain_key,
+                    message_id = %job.message_id,
+                    %err,
+                    "could not estimate delivery gas to verify funding; retrying rather than \
+                     risking an out-of-gas send on a possibly under-funded message"
+                );
+                return Ok(DeliveryResultKind::Retryable);
+            }
         }
     }
 
