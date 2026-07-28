@@ -19,6 +19,7 @@
 //! of PoC scope"). Each route runs in its own [`tokio::spawn`] so a slow destination chain
 //! does not block the others.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy::network::EthereumWallet;
@@ -47,6 +48,11 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// timeout the job returns to the pool's bounded retry; if the stuck tx mines later, the next
 /// attempt's simulate detects the duplicate ("Already validated") and resolves idempotently.
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Cadence of the delivery worker's liveness heartbeat. Must stay comfortably under the health
+/// watchdog's staleness deadline so an idle route — one with no messages to deliver — is never
+/// mistaken for a wedged one.
+const HEALTH_TICK: Duration = Duration::from_secs(15);
 
 /// Upper bound on the per-job funded-gas RPC reads (`RelayerFeeVault.getMessageInfo` on the
 /// source, and the under-funding `estimate_gas` on the destination). Both sit in the serial
@@ -97,6 +103,7 @@ pub enum DeliveryResultKind {
 }
 
 /// Spawn the delivery worker for one route. Exits on `cancel` or unrecoverable channel close.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     route: ChainRoute,
     delivery_config: DeliveryConfig,
@@ -104,9 +111,11 @@ pub async fn run(
     mut job_rx: mpsc::Receiver<DeliveryJob>,
     result_tx: mpsc::Sender<DeliveryResult>,
     metrics: Metrics,
+    health: Arc<crate::health::Health>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let chain_key = route.chain_key;
+    let health_key = format!("delivery:{chain_key}");
     let signer_key = route
         .signer_key
         .clone()
@@ -120,6 +129,12 @@ pub async fn run(
     let wallet = EthereumWallet::from(signer);
     let provider = ProviderBuilder::new()
         .wallet(wallet)
+        // Re-read the nonce from the chain on every send. The default filler caches it and only
+        // increments locally, so a single failed broadcast (RPC 502, timeout, LB failover) consumes
+        // a nonce that never reaches the mempool and leaves a permanent gap: every later tx from
+        // this signer queues behind the hole, the route stops delivering, and only a restart clears
+        // it. One extra `eth_getTransactionCount` per delivery is a trivial price for that.
+        .with_simple_nonce_management()
         .connect(&route.destination_rpc_url)
         .await
         .with_context(|| {
@@ -154,11 +169,27 @@ pub async fn run(
         "🚚 delivery worker online"
     );
 
+    // Register with the health watchdog at startup, so a worker that wedges before ever completing
+    // a job still goes stale and trips a restart. Without this the route could hang indefinitely
+    // (stuck send, black-holed RPC, nonce gap) while `/health` kept answering 200 and Kubernetes
+    // never restarted the pod — the exact failure class the watchdog exists to catch.
+    health.heartbeat(&health_key);
+
+    // Liveness tick. This worker is idle-driven: it blocks on `job_rx.recv()`, so a route with no
+    // traffic would otherwise never heartbeat and would be reported stale purely for being quiet.
+    // Beating on this interval means "the select loop is still turning", which is the property we
+    // actually want to assert; per-job progress is reported separately below.
+    let mut liveness = tokio::time::interval(HEALTH_TICK);
+    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
                 info!(chain_key, "🛑 delivery worker exiting on cancel");
                 return Ok(());
+            }
+            _ = liveness.tick() => {
+                health.heartbeat(&health_key);
             }
             maybe = job_rx.recv() => {
                 let Some(job) = maybe else {
@@ -206,6 +237,8 @@ pub async fn run(
                         DeliveryResultKind::Retryable
                     }
                 };
+                // Job finished (delivered, terminal, or retryable) — real forward progress.
+                health.heartbeat(&health_key);
                 if result_tx
                     .send(DeliveryResult {
                         chain_key: job.chain_key,

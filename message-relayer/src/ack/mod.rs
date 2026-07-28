@@ -131,6 +131,10 @@ pub async fn run(
     let submitter_address = signer.address();
     let source_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
+        // See the delivery worker: chain-read nonces, not a local cache. Doubly important here —
+        // several submitters may share one Creditcoin signer, and independent cached nonce managers
+        // on the same account collide.
+        .with_simple_nonce_management()
         .connect(&creditcoin_eth_rpc_url)
         .await
         .with_context(|| {

@@ -199,6 +199,9 @@ pub async fn run(
     let submitter_address = signer.address();
     let cc_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
+        // Chain-read nonces (see the delivery worker) — a cached nonce gap wedges this submitter,
+        // and it may share a signer with the ack submitter.
+        .with_simple_nonce_management()
         .connect(&creditcoin_eth_rpc_url)
         .await
         .with_context(|| {

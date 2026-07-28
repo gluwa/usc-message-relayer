@@ -134,6 +134,8 @@ async fn submit(
         .context("invalid signer_key for set-update submission")?;
     let provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
+        // Chain-read nonces (see the delivery worker).
+        .with_simple_nonce_management()
         .connect(&state.dest_rpc_url)
         .await
         .with_context(|| format!("connect destination RPC {}", state.dest_rpc_url))?;

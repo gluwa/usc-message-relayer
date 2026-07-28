@@ -31,11 +31,26 @@ pub struct CheckpointStore {
 }
 
 impl CheckpointStore {
-    /// Load the store from `path`, treating a missing file as an empty store.
+    /// Load the store from `path`.
+    ///
+    /// A **missing** file is a legitimately empty store — first boot, nothing recorded yet.
+    /// A **present but empty** file is not: it means a write was interrupted before its contents
+    /// reached disk. Those two cases used to be conflated, and treating truncation as "no
+    /// checkpoint" is the worst possible response — every watcher silently resumes at the chain
+    /// head and every message published while the relayer was down is skipped, with no error.
+    /// So an empty file fails the load, exactly like unparseable JSON already did: an operator can
+    /// recover deliberately (restore, or delete the file to accept a head start), which is far
+    /// better than losing messages quietly.
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let inner: HashMap<String, u64> = match std::fs::read_to_string(&path) {
-            Ok(text) if text.trim().is_empty() => HashMap::new(),
+            Ok(text) if text.trim().is_empty() => anyhow::bail!(
+                "checkpoint file {} exists but is empty — this indicates an interrupted write, not \
+                 a fresh start. Resuming would skip every block since the last durable cursor. \
+                 Restore the file from backup, or delete it to deliberately accept restarting from \
+                 the chain head (or from `start_block`).",
+                path.display()
+            ),
             Ok(text) => serde_json::from_str(&text)
                 .with_context(|| format!("parsing checkpoint file {}", path.display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
@@ -115,7 +130,7 @@ impl CursorHoldback {
     }
 }
 
-/// Write `bytes` to `path` atomically via a sibling temp file + rename.
+/// Write `bytes` to `path` durably: sibling temp file, fsync, rename, fsync the directory.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -124,10 +139,41 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         }
     }
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)
-        .with_context(|| format!("writing checkpoint temp file {}", tmp.display()))?;
+    // Write, then **fsync the data before renaming**. `rename` orders the directory entry, not the
+    // file contents, so without this a hard crash (power loss, SIGKILL at the end of a k8s grace
+    // period) can leave the new name pointing at a zero-length or partially-written file. That
+    // matters more here than it looks: a truncated checkpoint used to be read as "no checkpoint",
+    // which restarts every watcher at the chain head and silently skips every message published
+    // while the relayer was down.
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("creating checkpoint temp file {}", tmp.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("writing checkpoint temp file {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync checkpoint temp file {}", tmp.display()))?;
+    }
     std::fs::rename(&tmp, path)
         .with_context(|| format!("renaming checkpoint temp file into {}", path.display()))?;
+
+    // Also fsync the directory so the rename itself is durable. Best-effort: the contents are
+    // already synced, so a failure here can at worst lose the rename and leave the *previous*
+    // cursor in place — which is safe, we simply re-scan — whereas failing the whole save would
+    // turn a durability nicety into a liveness problem.
+    if let Some(parent) = path.parent() {
+        let dir = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+            tracing::warn!(
+                dir = %dir.display(), error = %e,
+                "could not fsync checkpoint directory; the rename may not survive a hard crash"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -179,5 +225,49 @@ mod tests {
         // First write creates the nested dir.
         store.set("ack:7", 42).unwrap();
         assert_eq!(CheckpointStore::load(&path).unwrap().get("ack:7"), Some(42));
+    }
+
+    /// A present-but-empty file means an interrupted write, not a fresh start. Loading it must
+    /// fail loudly: silently treating it as "no checkpoint" restarts every watcher at the chain
+    /// head and skips every block since the last durable cursor.
+    #[test]
+    fn empty_file_is_rejected_rather_than_treated_as_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        std::fs::write(&path, "").unwrap();
+
+        let err = CheckpointStore::load(&path).expect_err("empty checkpoint must not load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("exists but is empty"),
+            "error should explain the truncation, got: {msg}"
+        );
+
+        // Whitespace-only is the same case.
+        std::fs::write(&path, "   \n").unwrap();
+        assert!(CheckpointStore::load(&path).is_err());
+
+        // ...and deleting it is the documented way to deliberately accept a fresh start.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(CheckpointStore::load(&path).unwrap().get("ack:7"), None);
+    }
+
+    /// The temp file must not survive a successful save, and the persisted value must be readable
+    /// immediately (i.e. the fsync + rename sequence leaves a complete file behind).
+    #[test]
+    fn save_leaves_no_temp_file_and_is_immediately_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        let store = CheckpointStore::load(&path).unwrap();
+        store.set("outbox:2", 1234).unwrap();
+
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "temp file should be renamed away"
+        );
+        assert_eq!(
+            CheckpointStore::load(&path).unwrap().get("outbox:2"),
+            Some(1234)
+        );
     }
 }

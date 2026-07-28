@@ -178,6 +178,7 @@ impl Server {
                     drx,
                     delivery_result_tx.clone(),
                     metrics.clone(),
+                    health.clone(),
                     cancel.clone(),
                 ),
             );
