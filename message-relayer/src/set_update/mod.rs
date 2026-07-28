@@ -93,6 +93,13 @@ fn verify_vote(vote: &SetUpdateVote, current: &OnChain) -> Option<(Vec<Address>,
     Some((canonical, digest, signer))
 }
 
+/// Health component key for one route's aggregator progress. Keyed per route — matching
+/// `delivery:{chain_key}` and `attestor-set:{chain_key}` — so a healthy route's beat cannot mask a
+/// route whose refresh always fails.
+fn health_key(chain_key: u64) -> String {
+    format!("attestor-set-update:{chain_key}")
+}
+
 /// Refresh a route's on-chain view. Best-effort; a failure leaves the previous view in place.
 async fn refresh(state: &mut RouteState) -> Result<()> {
     let provider = ProviderBuilder::new()
@@ -254,14 +261,15 @@ pub async fn run(
         "🗳️ attestor-set-update aggregator online"
     );
 
-    // Register with the health watchdog. This worker previously registered nothing at all, and
-    // `Health::status` only inspects components that have registered — so a wedged aggregator (the
-    // RPC awaits in `refresh`/`submit` are unbounded) was invisible and `/health` reported 200 while
-    // on-chain attestor-set rotations silently stopped applying. Registered *after* the
-    // `states.is_empty()` return above, since that path deliberately parks forever with no work to
+    // Register with the health watchdog, one component per route. This worker previously registered
+    // nothing at all, and `Health::status` only inspects components that have registered — so a wedged
+    // aggregator (the RPC awaits in `refresh`/`submit` are unbounded) was invisible and `/health`
+    // reported 200 while on-chain attestor-set rotations silently stopped applying. Registered *after*
+    // the `states.is_empty()` return above, since that path deliberately parks forever with no work to
     // report on. `REFRESH_SECS` (60s) is the beat cadence and is well inside `PROGRESS_DEADLINE`.
-    let health_key = "attestor-set-update";
-    health.heartbeat(health_key);
+    for chain_key in states.keys() {
+        health.heartbeat(&health_key(*chain_key));
+    }
 
     let mut refresh_tick = tokio::time::interval(Duration::from_secs(REFRESH_SECS));
     refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -273,21 +281,21 @@ pub async fn run(
                 return Ok(());
             }
             _ = refresh_tick.tick() => {
-                let mut any_ok = false;
                 for (chain_key, state) in states.iter_mut() {
                     match refresh(state).await {
-                        Ok(()) => any_ok = true,
+                        // Beat per route on a *successful* refresh, matching the outbox/ack/claim
+                        // convention of reporting progress on a successful poll rather than on a loop
+                        // turn. Deliberately not also beating on a successful `submit`: `verify_vote`
+                        // requires a vote's nonce to equal the last-seen on-chain nonce, so a route
+                        // whose refresh is dead holds a frozen view and rejects every vote as soon as
+                        // one update mines. Submissions can only keep succeeding in the window before
+                        // that, so treating them as liveness would report a wedged route healthy —
+                        // the exact failure class this watchdog exists to catch.
+                        Ok(()) => health.heartbeat(&health_key(*chain_key)),
                         Err(err) => {
                             warn!(%chain_key, %err, "attestor-set-update: on-chain refresh failed; keeping last-known view");
                         }
                     }
-                }
-                // Beat only on a *successful* refresh, matching the outbox/ack/claim convention of
-                // reporting progress on a successful poll rather than on a loop turn. An aggregator
-                // whose every refresh fails cannot validate votes or submit, so it must go stale
-                // instead of looking healthy while silently dropping every vote it receives.
-                if any_ok {
-                    health.heartbeat(health_key);
                 }
             }
             maybe = vote_rx.recv() => {
