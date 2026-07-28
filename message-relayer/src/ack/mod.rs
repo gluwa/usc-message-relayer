@@ -111,6 +111,15 @@ pub async fn run(
         return Ok(());
     };
 
+    // Register with the health watchdog BEFORE any fallible or blocking setup: `Health::status`
+    // only inspects components that have registered, so a worker that never called `heartbeat` is
+    // invisible to it and counts as healthy. Both connects below, and the `get_block_number` start
+    // lookup on first boot, are unbounded RPC awaits — registering after them means a black-holed
+    // endpoint leaves acks permanently unsubmitted while `/health` keeps answering 200. Must stay
+    // *after* the `route.ack` guard above, though: a route with acks disabled has no worker to
+    // report on, and registering one would make it go stale forever.
+    health.heartbeat(&health_key);
+
     // Read-only provider on the destination chain (where MessageDelivered is emitted).
     let dest_provider = ProviderBuilder::new()
         .connect(&route.destination_rpc_url)
@@ -129,10 +138,11 @@ pub async fn run(
         .parse()
         .with_context(|| format!("chain_key {chain_key}: invalid ack.signer_key"))?;
     let submitter_address = signer.address();
-    // Chain-read nonces (see `crate::provider::chain_nonce_builder`). Doubly important here:
-    // several submitters may share one Creditcoin signer, and independent local counters on the
-    // same account collide with each other.
-    let source_provider = crate::provider::chain_nonce_builder()
+    // Keep `ProviderBuilder::new()`'s default `CachedNonceManager`: the submit loop below fans out
+    // `MAX_ACK_CONCURRENCY` sends over this one provider, and the cached manager holds its mutex
+    // across fetch-and-increment, so each concurrent send gets a distinct nonce. A stateless
+    // chain-read manager would have all of them read the same pending count and collide.
+    let source_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
         .connect(&creditcoin_eth_rpc_url)
         .await
@@ -194,9 +204,6 @@ pub async fn run(
 
     let mut tick = tokio::time::interval(Duration::from_secs(ACK_POLL_INTERVAL_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    // Register at startup so a worker that wedges before its first successful scan still goes stale.
-    health.heartbeat(&health_key);
 
     loop {
         tokio::select! {

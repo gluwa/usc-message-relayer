@@ -60,6 +60,19 @@ const HEALTH_TICK: Duration = Duration::from_secs(15);
 /// gracefully (estimation fallback / bounded retry) instead of wedging.
 const FUNDED_GAS_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Upper bound on a single `send()` — the gas/fee/nonce reads plus `eth_sendRawTransaction`. Alloy's
+/// HTTP transport has no timeout of its own, so without this a black-holed RPC parks the route (and
+/// starves the cancel branch, so SIGTERM is ignored) forever. Generous enough that a merely slow
+/// endpoint still succeeds.
+///
+/// Caveat, stated because it is not obvious: `CachedNonceManager` advances its counter during
+/// `prepare`, i.e. *before* the broadcast, so abandoning a send here can leave the local nonce ahead
+/// of the chain if the tx never reached the node. That gap is a pre-existing hazard of the cached
+/// manager (any transport failure mid-broadcast does the same) and is what the follow-up
+/// broadcast-lock work addresses; this timeout widens the trigger slightly in exchange for bounded
+/// shutdown. A gapped route goes stale rather than looping silently — see `handle_job`'s docs.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Sanity ceiling on a funded gasLimit read from the vault. Real per-tx gas is far below this; a
 /// value above it means a misconfigured `--relayer-fee-vault-address` (an unrelated contract whose
 /// `getMessageInfo` ABI-decodes to junk), so we ignore it and estimate rather than pin an
@@ -116,6 +129,16 @@ pub async fn run(
 ) -> Result<()> {
     let chain_key = route.chain_key;
     let health_key = format!("delivery:{chain_key}");
+
+    // Register with the health watchdog BEFORE any fallible or blocking setup, because
+    // `Health::status` only inspects components that have registered: a worker that never called
+    // `heartbeat` is invisible to it and therefore counts as healthy. Registering after the RPC
+    // connects would mean a connect that hangs (black-holed endpoint, TCP with no RST) leaves this
+    // route permanently dead while `/health` keeps answering 200 and Kubernetes never restarts the
+    // pod — the exact failure class the watchdog exists to catch. The outbox watcher orders it the
+    // same way; keep them consistent.
+    health.heartbeat(&health_key);
+
     let signer_key = route
         .signer_key
         .clone()
@@ -127,9 +150,14 @@ pub async fn run(
 
     let signer_address = signer.address();
     let wallet = EthereumWallet::from(signer);
-    // Chain-read nonces, not a local counter — see `crate::provider::chain_nonce_builder` for why
-    // `ProviderBuilder::new().with_simple_nonce_management()` is silently a no-op.
-    let provider = crate::provider::chain_nonce_builder()
+    // `ProviderBuilder::new()`'s recommended fillers include a `CachedNonceManager`, whose counter
+    // is an `Arc<DashMap<Address, Arc<Mutex<u64>>>>` — shared across clones of this provider, with
+    // the mutex held across fetch-and-increment. That is what keeps the detached
+    // `spawn_pending_retry` tasks (which hold clones) from colliding with this worker's sends.
+    // Its known weakness is that a failed broadcast permanently consumes a nonce until restart;
+    // fixing that needs a broadcast lock shared across every worker on the signer, not a swap to
+    // chain-read nonces, which would remove the coordination above. Tracked separately.
+    let provider = ProviderBuilder::new()
         .wallet(wallet)
         .connect(&route.destination_rpc_url)
         .await
@@ -164,12 +192,6 @@ pub async fn run(
         fee_vault = ?route.relayer_fee_vault_address,
         "🚚 delivery worker online"
     );
-
-    // Register with the health watchdog at startup, so a worker that wedges before ever completing
-    // a job still goes stale and trips a restart. Without this the route could hang indefinitely
-    // (stuck send, black-holed RPC, nonce gap) while `/health` kept answering 200 and Kubernetes
-    // never restarted the pod — the exact failure class the watchdog exists to catch.
-    health.heartbeat(&health_key);
 
     // Liveness tick. This worker is idle-driven: it blocks on `job_rx.recv()`, so a route with no
     // traffic would otherwise never heartbeat and would be reported stale purely for being quiet.
@@ -280,6 +302,16 @@ async fn funded_gas_limit<P: Provider>(
     Ok(Some(info.gasLimit.saturating_to::<u64>()))
 }
 
+/// Note on liveness: this function deliberately does **not** heartbeat. The caller's tick cannot
+/// fire while this future is awaited from inside its `select!` branch, so a job that retries for
+/// longer than [`crate::health::PROGRESS_DEADLINE`] does report the route stale. That is the lesser
+/// evil: no signal available in here distinguishes "slow but working" from "permanently wedged" —
+/// a tx sent against a stale local nonce is *accepted* into the mempool and simply never mines, so
+/// beating per attempt (or per accepted send) would report a dead route as healthy forever, which
+/// is the exact failure class the watchdog exists to catch. Going stale instead makes the wedge
+/// self-healing once a restart is wired up. See the PR notes: the worst-case job wall time vs.
+/// `PROGRESS_DEADLINE` needs settling before a `livenessProbe` is added to the chart, or a slow
+/// destination chain will restart pods that are merely waiting.
 async fn handle_job<P: Provider + Clone + 'static>(
     route: &ChainRoute,
     delivery_config: &DeliveryConfig,
@@ -429,7 +461,31 @@ async fn handle_job<P: Provider + Clone + 'static>(
         if let Some(gas) = funded_gas {
             tx = tx.gas(gas);
         }
-        let pending = tx.send().await;
+        // `send()` is several RPC round trips (gas, fee, nonce, `eth_sendRawTransaction`) and alloy's
+        // HTTP transport sets no timeout, so on a black-holed endpoint this await never returns and
+        // parks the route — the same hazard FUNDED_GAS_READ_TIMEOUT and RECEIPT_TIMEOUT guard, and
+        // this was the last unbounded RPC in the worker. A timeout here is safe: if the broadcast
+        // actually landed, the next attempt's simulate resolves it as already-validated.
+        let pending = match tokio::time::timeout(SEND_TIMEOUT, tx.send()).await {
+            Ok(res) => res,
+            Err(_elapsed) => {
+                if attempts <= delivery_config.max_retries {
+                    warn!(
+                        chain_key = route.chain_key,
+                        message_id = %job.message_id,
+                        attempts,
+                        timeout_secs = SEND_TIMEOUT.as_secs(),
+                        "send timed out; retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    continue;
+                }
+                break SendOutcome::Failed(format!(
+                    "send did not complete within {SEND_TIMEOUT:?}"
+                ));
+            }
+        };
 
         match pending {
             // Poll-based receipt wait — alloy's `get_receipt()` heartbeat wedges against
@@ -622,7 +678,22 @@ fn spawn_pending_retry<P: Provider + 'static>(
                     warn!(chain_key, %message_id, %err, "isPending check failed; attempting retry anyway");
                 }
             }
-            match inbox.retryPendingMessage(message_id).send().await {
+            // Bounded for the same reason as the delivery send: alloy's transport has no timeout,
+            // and this task shares the delivery worker's provider — an unbounded await here would
+            // pin a connection and a `CachedNonceManager` entry indefinitely.
+            let sent = match tokio::time::timeout(
+                SEND_TIMEOUT,
+                inbox.retryPendingMessage(message_id).send(),
+            )
+            .await
+            {
+                Ok(res) => res,
+                Err(_elapsed) => {
+                    warn!(chain_key, %message_id, attempt, "retryPendingMessage send timed out");
+                    continue;
+                }
+            };
+            match sent {
                 Ok(builder) => {
                     match tokio::time::timeout(
                         RECEIPT_TIMEOUT,

@@ -17,6 +17,7 @@
 //! that have a `signer_key` (to pay gas — submission is permissionless, authority is in the sigs).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::network::EthereumWallet;
@@ -132,8 +133,9 @@ async fn submit(
         .trim()
         .parse()
         .context("invalid signer_key for set-update submission")?;
-    // Chain-read nonces (see `crate::provider::chain_nonce_builder`).
-    let provider = crate::provider::chain_nonce_builder()
+    // A fresh provider per submission, so the default `CachedNonceManager` starts empty and reads
+    // the nonce from the chain anyway — no local counter survives to go stale.
+    let provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
         .connect(&state.dest_rpc_url)
         .await
@@ -210,6 +212,7 @@ async fn handle_vote(states: &mut HashMap<u64, RouteState>, vote: SetUpdateVote)
 pub async fn run(
     routes: Vec<ChainRoute>,
     mut vote_rx: mpsc::Receiver<SetUpdateVote>,
+    health: Arc<crate::health::Health>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let mut states: HashMap<u64, RouteState> = HashMap::new();
@@ -251,6 +254,15 @@ pub async fn run(
         "🗳️ attestor-set-update aggregator online"
     );
 
+    // Register with the health watchdog. This worker previously registered nothing at all, and
+    // `Health::status` only inspects components that have registered — so a wedged aggregator (the
+    // RPC awaits in `refresh`/`submit` are unbounded) was invisible and `/health` reported 200 while
+    // on-chain attestor-set rotations silently stopped applying. Registered *after* the
+    // `states.is_empty()` return above, since that path deliberately parks forever with no work to
+    // report on. `REFRESH_SECS` (60s) is the beat cadence and is well inside `PROGRESS_DEADLINE`.
+    let health_key = "attestor-set-update";
+    health.heartbeat(health_key);
+
     let mut refresh_tick = tokio::time::interval(Duration::from_secs(REFRESH_SECS));
     refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -261,10 +273,21 @@ pub async fn run(
                 return Ok(());
             }
             _ = refresh_tick.tick() => {
+                let mut any_ok = false;
                 for (chain_key, state) in states.iter_mut() {
-                    if let Err(err) = refresh(state).await {
-                        warn!(%chain_key, %err, "attestor-set-update: on-chain refresh failed; keeping last-known view");
+                    match refresh(state).await {
+                        Ok(()) => any_ok = true,
+                        Err(err) => {
+                            warn!(%chain_key, %err, "attestor-set-update: on-chain refresh failed; keeping last-known view");
+                        }
                     }
+                }
+                // Beat only on a *successful* refresh, matching the outbox/ack/claim convention of
+                // reporting progress on a successful poll rather than on a loop turn. An aggregator
+                // whose every refresh fails cannot validate votes or submit, so it must go stale
+                // instead of looking healthy while silently dropping every vote it receives.
+                if any_ok {
+                    health.heartbeat(health_key);
                 }
             }
             maybe = vote_rx.recv() => {

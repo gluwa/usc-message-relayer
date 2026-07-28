@@ -45,7 +45,6 @@ pub mod pending;
 pub mod pool;
 pub mod prom;
 pub mod proofgen;
-pub mod provider;
 pub mod receipt;
 pub mod revert;
 pub mod set_update;
@@ -304,6 +303,7 @@ impl Server {
             set_update::run(
                 self.config.routes.clone(),
                 setupdate_vote_rx,
+                health.clone(),
                 cancel.clone(),
             ),
         );
