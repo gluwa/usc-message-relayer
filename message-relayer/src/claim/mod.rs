@@ -557,13 +557,14 @@ async fn claim_tx<P: Provider>(
         .broadcast(
             submitter_address,
             SEND_TIMEOUT,
-            target.claim(
-                height,
-                encoded_tx,
-                merkle_proof.into(),
-                continuity_proof.into(),
-            )
-            .send(),
+            target
+                .claim(
+                    height,
+                    encoded_tx,
+                    merkle_proof.into(),
+                    continuity_proof.into(),
+                )
+                .send(),
         )
         .await
     {
