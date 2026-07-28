@@ -197,11 +197,10 @@ pub async fn run(
         .parse()
         .with_context(|| format!("chain_key {chain_key}: invalid claim.signer_key"))?;
     let submitter_address = signer.address();
-    let cc_provider = ProviderBuilder::new()
+    // Chain-read nonces (see `crate::provider::chain_nonce_builder`) — a nonce gap wedges this
+    // submitter, and it may share a signer with the ack submitter.
+    let cc_provider = crate::provider::chain_nonce_builder()
         .wallet(EthereumWallet::from(signer))
-        // Chain-read nonces (see the delivery worker) — a cached nonce gap wedges this submitter,
-        // and it may share a signer with the ack submitter.
-        .with_simple_nonce_management()
         .connect(&creditcoin_eth_rpc_url)
         .await
         .with_context(|| {

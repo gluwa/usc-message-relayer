@@ -127,14 +127,10 @@ pub async fn run(
 
     let signer_address = signer.address();
     let wallet = EthereumWallet::from(signer);
-    let provider = ProviderBuilder::new()
+    // Chain-read nonces, not a local counter — see `crate::provider::chain_nonce_builder` for why
+    // `ProviderBuilder::new().with_simple_nonce_management()` is silently a no-op.
+    let provider = crate::provider::chain_nonce_builder()
         .wallet(wallet)
-        // Re-read the nonce from the chain on every send. The default filler caches it and only
-        // increments locally, so a single failed broadcast (RPC 502, timeout, LB failover) consumes
-        // a nonce that never reaches the mempool and leaves a permanent gap: every later tx from
-        // this signer queues behind the hole, the route stops delivering, and only a restart clears
-        // it. One extra `eth_getTransactionCount` per delivery is a trivial price for that.
-        .with_simple_nonce_management()
         .connect(&route.destination_rpc_url)
         .await
         .with_context(|| {
