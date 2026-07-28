@@ -19,6 +19,7 @@
 //! of PoC scope"). Each route runs in its own [`tokio::spawn`] so a slow destination chain
 //! does not block the others.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy::network::EthereumWallet;
@@ -48,11 +49,29 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// attempt's simulate detects the duplicate ("Already validated") and resolves idempotently.
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Cadence of the delivery worker's liveness heartbeat. Must stay comfortably under the health
+/// watchdog's staleness deadline so an idle route — one with no messages to deliver — is never
+/// mistaken for a wedged one.
+const HEALTH_TICK: Duration = Duration::from_secs(15);
+
 /// Upper bound on the per-job funded-gas RPC reads (`RelayerFeeVault.getMessageInfo` on the
 /// source, and the under-funding `estimate_gas` on the destination). Both sit in the serial
 /// worker's critical path, so a stalled RPC must not park the route — on timeout the job degrades
 /// gracefully (estimation fallback / bounded retry) instead of wedging.
 const FUNDED_GAS_READ_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Upper bound on a single `send()` — the gas/fee/nonce reads plus `eth_sendRawTransaction`. Alloy's
+/// HTTP transport has no timeout of its own, so without this a black-holed RPC parks the route (and
+/// starves the cancel branch, so SIGTERM is ignored) forever. Generous enough that a merely slow
+/// endpoint still succeeds.
+///
+/// Caveat, stated because it is not obvious: `CachedNonceManager` advances its counter during
+/// `prepare`, i.e. *before* the broadcast, so abandoning a send here can leave the local nonce ahead
+/// of the chain if the tx never reached the node. That gap is a pre-existing hazard of the cached
+/// manager (any transport failure mid-broadcast does the same) and is what the follow-up
+/// broadcast-lock work addresses; this timeout widens the trigger slightly in exchange for bounded
+/// shutdown. A gapped route goes stale rather than looping silently — see `handle_job`'s docs.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Sanity ceiling on a funded gasLimit read from the vault. Real per-tx gas is far below this; a
 /// value above it means a misconfigured `--relayer-fee-vault-address` (an unrelated contract whose
@@ -97,6 +116,7 @@ pub enum DeliveryResultKind {
 }
 
 /// Spawn the delivery worker for one route. Exits on `cancel` or unrecoverable channel close.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     route: ChainRoute,
     delivery_config: DeliveryConfig,
@@ -104,9 +124,21 @@ pub async fn run(
     mut job_rx: mpsc::Receiver<DeliveryJob>,
     result_tx: mpsc::Sender<DeliveryResult>,
     metrics: Metrics,
+    health: Arc<crate::health::Health>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let chain_key = route.chain_key;
+    let health_key = format!("delivery:{chain_key}");
+
+    // Register with the health watchdog BEFORE any fallible or blocking setup, because
+    // `Health::status` only inspects components that have registered: a worker that never called
+    // `heartbeat` is invisible to it and therefore counts as healthy. Registering after the RPC
+    // connects would mean a connect that hangs (black-holed endpoint, TCP with no RST) leaves this
+    // route permanently dead while `/health` keeps answering 200 and Kubernetes never restarts the
+    // pod — the exact failure class the watchdog exists to catch. The outbox watcher orders it the
+    // same way; keep them consistent.
+    health.heartbeat(&health_key);
+
     let signer_key = route
         .signer_key
         .clone()
@@ -118,6 +150,13 @@ pub async fn run(
 
     let signer_address = signer.address();
     let wallet = EthereumWallet::from(signer);
+    // `ProviderBuilder::new()`'s recommended fillers include a `CachedNonceManager`, whose counter
+    // is an `Arc<DashMap<Address, Arc<Mutex<u64>>>>` — shared across clones of this provider, with
+    // the mutex held across fetch-and-increment. That is what keeps the detached
+    // `spawn_pending_retry` tasks (which hold clones) from colliding with this worker's sends.
+    // Its known weakness is that a failed broadcast permanently consumes a nonce until restart;
+    // fixing that needs a broadcast lock shared across every worker on the signer, not a swap to
+    // chain-read nonces, which would remove the coordination above. Tracked separately.
     let provider = ProviderBuilder::new()
         .wallet(wallet)
         .connect(&route.destination_rpc_url)
@@ -154,11 +193,21 @@ pub async fn run(
         "🚚 delivery worker online"
     );
 
+    // Liveness tick. This worker is idle-driven: it blocks on `job_rx.recv()`, so a route with no
+    // traffic would otherwise never heartbeat and would be reported stale purely for being quiet.
+    // Beating on this interval means "the select loop is still turning", which is the property we
+    // actually want to assert; per-job progress is reported separately below.
+    let mut liveness = tokio::time::interval(HEALTH_TICK);
+    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
                 info!(chain_key, "🛑 delivery worker exiting on cancel");
                 return Ok(());
+            }
+            _ = liveness.tick() => {
+                health.heartbeat(&health_key);
             }
             maybe = job_rx.recv() => {
                 let Some(job) = maybe else {
@@ -206,6 +255,8 @@ pub async fn run(
                         DeliveryResultKind::Retryable
                     }
                 };
+                // Job finished (delivered, terminal, or retryable) — real forward progress.
+                health.heartbeat(&health_key);
                 if result_tx
                     .send(DeliveryResult {
                         chain_key: job.chain_key,
@@ -251,6 +302,16 @@ async fn funded_gas_limit<P: Provider>(
     Ok(Some(info.gasLimit.saturating_to::<u64>()))
 }
 
+/// Note on liveness: this function deliberately does **not** heartbeat. The caller's tick cannot
+/// fire while this future is awaited from inside its `select!` branch, so a job that retries for
+/// longer than [`crate::health::PROGRESS_DEADLINE`] does report the route stale. That is the lesser
+/// evil: no signal available in here distinguishes "slow but working" from "permanently wedged" —
+/// a tx sent against a stale local nonce is *accepted* into the mempool and simply never mines, so
+/// beating per attempt (or per accepted send) would report a dead route as healthy forever, which
+/// is the exact failure class the watchdog exists to catch. Going stale instead makes the wedge
+/// self-healing once a restart is wired up. See the PR notes: the worst-case job wall time vs.
+/// `PROGRESS_DEADLINE` needs settling before a `livenessProbe` is added to the chart, or a slow
+/// destination chain will restart pods that are merely waiting.
 async fn handle_job<P: Provider + Clone + 'static>(
     route: &ChainRoute,
     delivery_config: &DeliveryConfig,
@@ -400,7 +461,31 @@ async fn handle_job<P: Provider + Clone + 'static>(
         if let Some(gas) = funded_gas {
             tx = tx.gas(gas);
         }
-        let pending = tx.send().await;
+        // `send()` is several RPC round trips (gas, fee, nonce, `eth_sendRawTransaction`) and alloy's
+        // HTTP transport sets no timeout, so on a black-holed endpoint this await never returns and
+        // parks the route — the same hazard FUNDED_GAS_READ_TIMEOUT and RECEIPT_TIMEOUT guard, and
+        // this was the last unbounded RPC in the worker. A timeout here is safe: if the broadcast
+        // actually landed, the next attempt's simulate resolves it as already-validated.
+        let pending = match tokio::time::timeout(SEND_TIMEOUT, tx.send()).await {
+            Ok(res) => res,
+            Err(_elapsed) => {
+                if attempts <= delivery_config.max_retries {
+                    warn!(
+                        chain_key = route.chain_key,
+                        message_id = %job.message_id,
+                        attempts,
+                        timeout_secs = SEND_TIMEOUT.as_secs(),
+                        "send timed out; retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    continue;
+                }
+                break SendOutcome::Failed(format!(
+                    "send did not complete within {SEND_TIMEOUT:?}"
+                ));
+            }
+        };
 
         match pending {
             // Poll-based receipt wait — alloy's `get_receipt()` heartbeat wedges against
@@ -593,7 +678,22 @@ fn spawn_pending_retry<P: Provider + 'static>(
                     warn!(chain_key, %message_id, %err, "isPending check failed; attempting retry anyway");
                 }
             }
-            match inbox.retryPendingMessage(message_id).send().await {
+            // Bounded for the same reason as the delivery send: alloy's transport has no timeout,
+            // and this task shares the delivery worker's provider — an unbounded await here would
+            // pin a connection and a `CachedNonceManager` entry indefinitely.
+            let sent = match tokio::time::timeout(
+                SEND_TIMEOUT,
+                inbox.retryPendingMessage(message_id).send(),
+            )
+            .await
+            {
+                Ok(res) => res,
+                Err(_elapsed) => {
+                    warn!(chain_key, %message_id, attempt, "retryPendingMessage send timed out");
+                    continue;
+                }
+            };
+            match sent {
                 Ok(builder) => {
                     match tokio::time::timeout(
                         RECEIPT_TIMEOUT,

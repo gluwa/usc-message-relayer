@@ -17,6 +17,7 @@
 //! that have a `signer_key` (to pay gas — submission is permissionless, authority is in the sigs).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::network::EthereumWallet;
@@ -92,6 +93,13 @@ fn verify_vote(vote: &SetUpdateVote, current: &OnChain) -> Option<(Vec<Address>,
     Some((canonical, digest, signer))
 }
 
+/// Health component key for one route's aggregator progress. Keyed per route — matching
+/// `delivery:{chain_key}` and `attestor-set:{chain_key}` — so a healthy route's beat cannot mask a
+/// route whose refresh always fails.
+fn health_key(chain_key: u64) -> String {
+    format!("attestor-set-update:{chain_key}")
+}
+
 /// Refresh a route's on-chain view. Best-effort; a failure leaves the previous view in place.
 async fn refresh(state: &mut RouteState) -> Result<()> {
     let provider = ProviderBuilder::new()
@@ -132,6 +140,8 @@ async fn submit(
         .trim()
         .parse()
         .context("invalid signer_key for set-update submission")?;
+    // A fresh provider per submission, so the default `CachedNonceManager` starts empty and reads
+    // the nonce from the chain anyway — no local counter survives to go stale.
     let provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
         .connect(&state.dest_rpc_url)
@@ -209,6 +219,7 @@ async fn handle_vote(states: &mut HashMap<u64, RouteState>, vote: SetUpdateVote)
 pub async fn run(
     routes: Vec<ChainRoute>,
     mut vote_rx: mpsc::Receiver<SetUpdateVote>,
+    health: Arc<crate::health::Health>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let mut states: HashMap<u64, RouteState> = HashMap::new();
@@ -250,6 +261,16 @@ pub async fn run(
         "🗳️ attestor-set-update aggregator online"
     );
 
+    // Register with the health watchdog, one component per route. This worker previously registered
+    // nothing at all, and `Health::status` only inspects components that have registered — so a wedged
+    // aggregator (the RPC awaits in `refresh`/`submit` are unbounded) was invisible and `/health`
+    // reported 200 while on-chain attestor-set rotations silently stopped applying. Registered *after*
+    // the `states.is_empty()` return above, since that path deliberately parks forever with no work to
+    // report on. `REFRESH_SECS` (60s) is the beat cadence and is well inside `PROGRESS_DEADLINE`.
+    for chain_key in states.keys() {
+        health.heartbeat(&health_key(*chain_key));
+    }
+
     let mut refresh_tick = tokio::time::interval(Duration::from_secs(REFRESH_SECS));
     refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -261,8 +282,19 @@ pub async fn run(
             }
             _ = refresh_tick.tick() => {
                 for (chain_key, state) in states.iter_mut() {
-                    if let Err(err) = refresh(state).await {
-                        warn!(%chain_key, %err, "attestor-set-update: on-chain refresh failed; keeping last-known view");
+                    match refresh(state).await {
+                        // Beat per route on a *successful* refresh, matching the outbox/ack/claim
+                        // convention of reporting progress on a successful poll rather than on a loop
+                        // turn. Deliberately not also beating on a successful `submit`: `verify_vote`
+                        // requires a vote's nonce to equal the last-seen on-chain nonce, so a route
+                        // whose refresh is dead holds a frozen view and rejects every vote as soon as
+                        // one update mines. Submissions can only keep succeeding in the window before
+                        // that, so treating them as liveness would report a wedged route healthy —
+                        // the exact failure class this watchdog exists to catch.
+                        Ok(()) => health.heartbeat(&health_key(*chain_key)),
+                        Err(err) => {
+                            warn!(%chain_key, %err, "attestor-set-update: on-chain refresh failed; keeping last-known view");
+                        }
                     }
                 }
             }

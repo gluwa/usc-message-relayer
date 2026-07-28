@@ -178,6 +178,7 @@ impl Server {
                     drx,
                     delivery_result_tx.clone(),
                     metrics.clone(),
+                    health.clone(),
                     cancel.clone(),
                 ),
             );
@@ -302,6 +303,7 @@ impl Server {
             set_update::run(
                 self.config.routes.clone(),
                 setupdate_vote_rx,
+                health.clone(),
                 cancel.clone(),
             ),
         );

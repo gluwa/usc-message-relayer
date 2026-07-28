@@ -178,6 +178,12 @@ pub async fn run(
         return Ok(());
     };
 
+    // Register with the health watchdog BEFORE any fallible or blocking setup — see the identical
+    // comment in `crate::ack::run` for why (`Health::status` cannot see a component that never
+    // registered, and every connect plus the first-boot `get_block_number` below is an unbounded
+    // RPC await). Must stay *after* the `route.claim` guard above.
+    health.heartbeat(&health_key);
+
     // Read-only provider on the client chain (where the intent events are emitted).
     let client_provider = ProviderBuilder::new()
         .connect(&route.destination_rpc_url)
@@ -197,6 +203,9 @@ pub async fn run(
         .parse()
         .with_context(|| format!("chain_key {chain_key}: invalid claim.signer_key"))?;
     let submitter_address = signer.address();
+    // Keep `ProviderBuilder::new()`'s default `CachedNonceManager` — the submit loop fans out
+    // `MAX_CLAIM_CONCURRENCY` sends over this one provider and relies on the manager's
+    // fetch-and-increment mutex to hand each of them a distinct nonce. See `crate::ack::run`.
     let cc_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
         .connect(&creditcoin_eth_rpc_url)
@@ -253,9 +262,6 @@ pub async fn run(
 
     let mut tick = tokio::time::interval(Duration::from_secs(CLAIM_POLL_INTERVAL_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    // Register at startup so a worker that wedges before its first successful scan still goes stale.
-    health.heartbeat(&health_key);
 
     loop {
         tokio::select! {
