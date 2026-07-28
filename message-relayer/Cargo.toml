@@ -90,3 +90,7 @@ alloy-node-bindings = "2.1"
 async-trait = { workspace = true }
 parameterized = "2.1.0"
 tempfile = { workspace = true }
+# `test-util` only: lets the broadcast-lock tests assert their timeout bounds under
+# `#[tokio::test(start_paused = true)]` instead of sleeping for the real duration. Features are
+# additive with the `[dependencies]` entry above, and this one applies to test builds only.
+tokio = { workspace = true, features = ["test-util"] }
