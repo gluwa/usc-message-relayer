@@ -87,12 +87,19 @@ routes:
     # threshold_override: 9
 
     # Optional trust-minimized acknowledgment submitter (proof-based, permissionless).
+    #
+    # Claim mode: when `relayer_fee_vault_address` (above) is set, this same worker runs in claim
+    # mode — it calls RelayerFeeVault.claimDelivery instead of submitAcknowledgment. claimDelivery
+    # settles the relay fee to the proven relayer AND bundles the acknowledgment in one tx, so the
+    # `ack` block is still required (for proof_gen_url + signer_key + confirmation_depth) while
+    # `validator_address` is then unused. A route with a fee vault therefore needs this `ack` block,
+    # or the relay fee is never claimed.
     ack:
       # proof-gen API serving native USC proofs: GET /api/v1/proof-by-tx/{chain_key}/{tx_hash}.
       proof_gen_url: "http://proof-gen-api:3100"
-      # AcknowledgmentValidator on Creditcoin (the submit target).
+      # AcknowledgmentValidator on Creditcoin (the submit target). Unused in claim mode.
       validator_address: "0x98f31a518964479d07b280BA156477682A66a8D6"
-      # Creditcoin key paying gas for submitAcknowledgment (needs funds, not authority).
+      # Creditcoin key paying gas for submitAcknowledgment / claimDelivery (needs funds, not authority).
       signer_key: "${ROUTE_0_ACK_SIGNER_KEY}"
       # Destination blocks to lag the MessageDelivered scan (reorg safety on the unsafe head).
       confirmation_depth: 32

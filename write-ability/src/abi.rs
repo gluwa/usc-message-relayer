@@ -215,6 +215,32 @@ sol! {
         }
 
         function getMessageInfo(bytes32 messageId) external view returns (MessageInfo memory);
+
+        /// Trust-minimized relay-fee settlement on the *source* (Creditcoin) chain, mirroring
+        /// [`IAcknowledgmentValidator::submitAcknowledgment`] but on the fee vault. The relayer proves
+        /// — via the block-prover precompile (merkle inclusion + continuity) — that a
+        /// `MessageDelivered` event for `messageId` was emitted in a finalized block on the
+        /// destination chain. The vault verifies the proof, decodes the proven relayer from the
+        /// event, and pays it the relay fee; on a successful delivery it also *bundles the
+        /// acknowledgment* (settling the ack fee and acknowledging on the Outbox in the same tx).
+        ///
+        /// Permissionless: the payee is always the proven relayer, never `msg.sender`, so a
+        /// front-runner can only settle the claim on the relayer's behalf, not steal it. `chainKey`
+        /// is `bytes32(uint256(destinationChain))`; `inclusionProof` is the self-describing
+        /// `BlockProverTypes.InclusionProof` the `USCProofVerifier` consumes.
+        function claimDelivery(
+            bytes32 messageId,
+            bytes32 chainKey,
+            uint64 blockHeight,
+            InclusionProof inclusionProof,
+            ContinuityProof continuityProof
+        ) external;
+
+        /// `messageId` was not funded through the relayer fee vault (e.g. bridge traffic, or a
+        /// message published without a relay fee). Permanent for a given messageId.
+        error UnknownOperation(bytes32 messageId);
+        /// The relay fee for `messageId` was already claimed. Permanent — a duplicate claim.
+        error RelayAlreadySettled(bytes32 messageId);
     }
 
     /// One sibling along the merkle inclusion path. `isLeft` says whether the sibling is the
@@ -238,5 +264,18 @@ sol! {
     struct ContinuityProof {
         bytes32 lowerEndpointDigest;
         bytes32[] roots;
+    }
+
+    /// PR #23 self-describing transaction-inclusion proof (`BlockProverTypes.InclusionProof`),
+    /// consumed by [`IRelayerFeeVault::claimDelivery`] via the `USCProofVerifier`. `kind` is the
+    /// `ProofKind` discriminator (`0` = `BinaryMerkle`, the only supported kind); `root` is the
+    /// transaction-trie root; `data` is `abi.encode(bytes txBytes, MerkleProofEntry[] siblings)` —
+    /// the same `txBytes`/`siblings` the flat [`MerkleProof`] carries, re-wrapped for the verifier.
+    /// Build it via the relayer's `proofgen` helper, not by hand, so the `data` encoding cannot drift.
+    #[derive(Debug)]
+    struct InclusionProof {
+        uint8 kind;
+        bytes32 root;
+        bytes data;
     }
 }
