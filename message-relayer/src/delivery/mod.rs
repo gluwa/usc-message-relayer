@@ -65,12 +65,11 @@ const FUNDED_GAS_READ_TIMEOUT: Duration = Duration::from_secs(20);
 /// starves the cancel branch, so SIGTERM is ignored) forever. Generous enough that a merely slow
 /// endpoint still succeeds.
 ///
-/// Caveat, stated because it is not obvious: `CachedNonceManager` advances its counter during
-/// `prepare`, i.e. *before* the broadcast, so abandoning a send here can leave the local nonce ahead
-/// of the chain if the tx never reached the node. That gap is a pre-existing hazard of the cached
-/// manager (any transport failure mid-broadcast does the same) and is what the follow-up
-/// broadcast-lock work addresses; this timeout widens the trigger slightly in exchange for bounded
-/// shutdown. A gapped route goes stale rather than looping silently — see `handle_job`'s docs.
+/// Abandoning a send here no longer costs a nonce: sends go through
+/// [`crate::broadcast::BroadcastLocks`] against a chain-read nonce, so a broadcast that never reached
+/// the node leaves the pending count untouched and the next attempt re-reads the same nonce. What a
+/// timeout here *does* leave is genuine ambiguity about whether the tx landed — resolved
+/// idempotently, since the next attempt's simulate detects an already-validated message.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Sanity ceiling on a funded gasLimit read from the vault. Real per-tx gas is far below this; a
@@ -125,6 +124,7 @@ pub async fn run(
     result_tx: mpsc::Sender<DeliveryResult>,
     metrics: Metrics,
     health: Arc<crate::health::Health>,
+    broadcast_locks: Arc<crate::broadcast::BroadcastLocks>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let chain_key = route.chain_key;
@@ -150,14 +150,13 @@ pub async fn run(
 
     let signer_address = signer.address();
     let wallet = EthereumWallet::from(signer);
-    // `ProviderBuilder::new()`'s recommended fillers include a `CachedNonceManager`, whose counter
-    // is an `Arc<DashMap<Address, Arc<Mutex<u64>>>>` — shared across clones of this provider, with
-    // the mutex held across fetch-and-increment. That is what keeps the detached
-    // `spawn_pending_retry` tasks (which hold clones) from colliding with this worker's sends.
-    // Its known weakness is that a failed broadcast permanently consumes a nonce until restart;
-    // fixing that needs a broadcast lock shared across every worker on the signer, not a swap to
-    // chain-read nonces, which would remove the coordination above. Tracked separately.
-    let provider = ProviderBuilder::new()
+    // Chain-read nonces, so a broadcast that fails after `prepare` (RPC 502, SEND_TIMEOUT
+    // abandonment, LB failover) does not consume a nonce the chain never saw and wedge the route
+    // until restart. Every send from this signer — this worker's, the detached
+    // `spawn_pending_retry` tasks holding provider clones, and the set-update submitter, which
+    // shares `route.signer_key` — serializes through `broadcast_locks` instead of through a
+    // per-provider local counter. The two halves are only correct together; see `crate::broadcast`.
+    let provider = crate::broadcast::chain_nonce_builder()
         .wallet(wallet)
         .connect(&route.destination_rpc_url)
         .await
@@ -245,6 +244,8 @@ pub async fn run(
                     &route,
                     &delivery_config,
                     &provider,
+                    signer_address,
+                    &broadcast_locks,
                     &job,
                     funded_gas,
                     metrics.as_ref(),
@@ -305,17 +306,20 @@ async fn funded_gas_limit<P: Provider>(
 /// Note on liveness: this function deliberately does **not** heartbeat. The caller's tick cannot
 /// fire while this future is awaited from inside its `select!` branch, so a job that retries for
 /// longer than [`crate::health::PROGRESS_DEADLINE`] does report the route stale. That is the lesser
-/// evil: no signal available in here distinguishes "slow but working" from "permanently wedged" —
-/// a tx sent against a stale local nonce is *accepted* into the mempool and simply never mines, so
-/// beating per attempt (or per accepted send) would report a dead route as healthy forever, which
-/// is the exact failure class the watchdog exists to catch. Going stale instead makes the wedge
-/// self-healing once a restart is wired up. See the PR notes: the worst-case job wall time vs.
-/// `PROGRESS_DEADLINE` needs settling before a `livenessProbe` is added to the chart, or a slow
-/// destination chain will restart pods that are merely waiting.
+/// evil: no signal available in here distinguishes "slow but working" from "permanently wedged", so
+/// beating per attempt (or per accepted send) could report a dead route as healthy forever, which is
+/// the exact failure class the watchdog exists to catch. The stale-local-nonce instance of that is
+/// now fixed at the source (see [`crate::broadcast`]), but an underpriced tx still gets *accepted*
+/// into the mempool and never mines, so the reasoning stands. See the PR notes: the worst-case job
+/// wall time vs. `PROGRESS_DEADLINE` needs settling before a `livenessProbe` is added to the chart,
+/// or a slow destination chain will restart pods that are merely waiting.
+#[allow(clippy::too_many_arguments)]
 async fn handle_job<P: Provider + Clone + 'static>(
     route: &ChainRoute,
     delivery_config: &DeliveryConfig,
     provider: &P,
+    signer_address: Address,
+    broadcast_locks: &Arc<crate::broadcast::BroadcastLocks>,
     job: &DeliveryJob,
     funded_gas: Option<u64>,
     metrics: &dyn crate::prom::MetricsTrait,
@@ -463,27 +467,32 @@ async fn handle_job<P: Provider + Clone + 'static>(
         }
         // `send()` is several RPC round trips (gas, fee, nonce, `eth_sendRawTransaction`) and alloy's
         // HTTP transport sets no timeout, so on a black-holed endpoint this await never returns and
-        // parks the route — the same hazard FUNDED_GAS_READ_TIMEOUT and RECEIPT_TIMEOUT guard, and
-        // this was the last unbounded RPC in the worker. A timeout here is safe: if the broadcast
-        // actually landed, the next attempt's simulate resolves it as already-validated.
-        let pending = match tokio::time::timeout(SEND_TIMEOUT, tx.send()).await {
+        // parks the route — the same hazard FUNDED_GAS_READ_TIMEOUT and RECEIPT_TIMEOUT guard.
+        //
+        // Serialized on the signer so the chain-read nonce this send is about to fetch already
+        // reflects every earlier broadcast from the same key — including the detached
+        // `retryPendingMessage` tasks and the set-update submitter. The guard covers only the
+        // broadcast; the receipt is awaited below, outside it, or a single confirmation would block
+        // every other sender on the key. Either stall is retryable and consumes no nonce.
+        let pending = match broadcast_locks
+            .broadcast(signer_address, SEND_TIMEOUT, tx.send())
+            .await
+        {
             Ok(res) => res,
-            Err(_elapsed) => {
+            Err(stalled) => {
                 if attempts <= delivery_config.max_retries {
                     warn!(
                         chain_key = route.chain_key,
                         message_id = %job.message_id,
                         attempts,
-                        timeout_secs = SEND_TIMEOUT.as_secs(),
-                        "send timed out; retrying"
+                        %stalled,
+                        "send did not complete; retrying"
                     );
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                     continue;
                 }
-                break SendOutcome::Failed(format!(
-                    "send did not complete within {SEND_TIMEOUT:?}"
-                ));
+                break SendOutcome::Failed(stalled.to_string());
             }
         };
 
@@ -597,6 +606,8 @@ async fn handle_job<P: Provider + Clone + 'static>(
             // The remaining `retryPendingMessage` work is permissionless best-effort.
             spawn_pending_retry(
                 (*provider).clone(),
+                signer_address,
+                broadcast_locks.clone(),
                 *inbox.address(),
                 job.message_id,
                 route.chain_key,
@@ -659,6 +670,8 @@ fn revert_already_validated(err: &impl std::fmt::Display) -> bool {
 /// still pending, so giving up here strands nothing.
 fn spawn_pending_retry<P: Provider + 'static>(
     provider: P,
+    signer_address: Address,
+    broadcast_locks: Arc<crate::broadcast::BroadcastLocks>,
     inbox_address: Address,
     message_id: B256,
     chain_key: u64,
@@ -678,18 +691,20 @@ fn spawn_pending_retry<P: Provider + 'static>(
                     warn!(chain_key, %message_id, %err, "isPending check failed; attempting retry anyway");
                 }
             }
-            // Bounded for the same reason as the delivery send: alloy's transport has no timeout,
-            // and this task shares the delivery worker's provider — an unbounded await here would
-            // pin a connection and a `CachedNonceManager` entry indefinitely.
-            let sent = match tokio::time::timeout(
-                SEND_TIMEOUT,
-                inbox.retryPendingMessage(message_id).send(),
-            )
-            .await
+            // Serialized and bounded like the delivery send: this task runs detached but signs with
+            // the same key as the worker that spawned it, so an unserialized broadcast here would
+            // race the worker for the same chain-read nonce.
+            let sent = match broadcast_locks
+                .broadcast(
+                    signer_address,
+                    SEND_TIMEOUT,
+                    inbox.retryPendingMessage(message_id).send(),
+                )
+                .await
             {
                 Ok(res) => res,
-                Err(_elapsed) => {
-                    warn!(chain_key, %message_id, attempt, "retryPendingMessage send timed out");
+                Err(stalled) => {
+                    warn!(chain_key, %message_id, attempt, %stalled, "retryPendingMessage send did not complete");
                     continue;
                 }
             };

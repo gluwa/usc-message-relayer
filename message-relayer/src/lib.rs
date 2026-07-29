@@ -33,6 +33,7 @@ use tracing::{error, info, warn};
 pub mod abi;
 pub mod ack;
 pub mod attestor_set;
+pub mod broadcast;
 pub mod checkpoint;
 pub mod claim;
 pub mod config;
@@ -118,6 +119,13 @@ impl Server {
         // relayer (dead provider, stalled pool) instead of leaving it live behind a green check.
         let health = health::Health::new(health::PROGRESS_DEADLINE);
 
+        // Broadcast serialization, keyed by signer address and shared by every sending worker.
+        // Delivery, ack, claim and set-update read their nonce from the chain per send (so a failed
+        // broadcast leaves no permanent gap) and coordinate here instead of through a per-provider
+        // local counter — which is what lets workers that share one signer key across routes and
+        // roles stop colliding. The two halves are only correct together; see `crate::broadcast`.
+        let broadcast_locks = broadcast::BroadcastLocks::new();
+
         // Outbox-cursor holdback: the pool reports its oldest unfinished message per route; the
         // outbox watchers clamp their persisted checkpoints to it so restart-recovery always
         // re-indexes undelivered messages (never lost to the lookback window).
@@ -179,6 +187,7 @@ impl Server {
                     delivery_result_tx.clone(),
                     metrics.clone(),
                     health.clone(),
+                    broadcast_locks.clone(),
                     cancel.clone(),
                 ),
             );
@@ -245,6 +254,7 @@ impl Server {
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
                     health.clone(),
+                    broadcast_locks.clone(),
                     cancel.clone(),
                 ),
             );
@@ -264,6 +274,7 @@ impl Server {
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
                     health.clone(),
+                    broadcast_locks.clone(),
                     cancel.clone(),
                 ),
             );
@@ -304,6 +315,7 @@ impl Server {
                 self.config.routes.clone(),
                 setupdate_vote_rx,
                 health.clone(),
+                broadcast_locks.clone(),
                 cancel.clone(),
             ),
         );

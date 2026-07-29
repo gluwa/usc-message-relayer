@@ -41,6 +41,12 @@ use crate::pool::recover_signer;
 /// chain id). Set changes are rare, so a slow poll keeps RPC load negligible.
 const REFRESH_SECS: u64 = 60;
 
+/// Upper bound on a single `submitAttestorSetUpdate` broadcast. Alloy's HTTP transport sets no
+/// timeout, so a black-holed destination RPC would otherwise park this task's vote branch — and with
+/// it the aggregator's refresh tick and cancel branch — indefinitely. Also bounds how long one
+/// submission can hold the signer's broadcast slot, which the route's delivery worker shares.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The validator's current state a set-update vote is validated against.
 #[derive(Clone)]
 struct OnChain {
@@ -132,6 +138,7 @@ async fn refresh(state: &mut RouteState) -> Result<()> {
 /// `encode_votes` calldata format (identical `abi.encode(bytes[])`).
 async fn submit(
     state: &RouteState,
+    broadcast_locks: &Arc<crate::broadcast::BroadcastLocks>,
     new_attestors: &[Address],
     signatures: &[[u8; 65]],
 ) -> Result<()> {
@@ -140,9 +147,14 @@ async fn submit(
         .trim()
         .parse()
         .context("invalid signer_key for set-update submission")?;
-    // A fresh provider per submission, so the default `CachedNonceManager` starts empty and reads
-    // the nonce from the chain anyway — no local counter survives to go stale.
-    let provider = ProviderBuilder::new()
+    let submitter_address = signer.address();
+    // A fresh provider per submission would read the nonce from the chain anyway (an empty cached
+    // counter has nothing to go stale), but that is incidental — build it explicitly chain-read so
+    // this does not silently depend on staying short-lived. What actually matters here is the
+    // broadcast lock: this signer is `route.signer_key`, the *same* key the route's delivery worker
+    // signs with, and the two providers have no shared nonce state at all. Without serializing on the
+    // address, a submission and a delivery can read the same pending nonce and one of them is lost.
+    let provider = crate::broadcast::chain_nonce_builder()
         .wallet(EthereumWallet::from(signer))
         .connect(&state.dest_rpc_url)
         .await
@@ -157,17 +169,27 @@ async fn submit(
         .await
         .context("simulate(submitAttestorSetUpdate) reverted")?;
 
-    let pending = contract
-        .submitAttestorSetUpdate(new_attestors.to_vec(), calldata)
-        .send()
+    let pending = broadcast_locks
+        .broadcast(
+            submitter_address,
+            SEND_TIMEOUT,
+            contract
+                .submitAttestorSetUpdate(new_attestors.to_vec(), calldata)
+                .send(),
+        )
         .await
+        .map_err(|stalled| anyhow::anyhow!("submit(submitAttestorSetUpdate) {stalled}"))?
         .context("submit(submitAttestorSetUpdate) failed")?;
     info!(tx = %pending.tx_hash(), attestors = new_attestors.len(), "🗳️ submitted attestor-set update");
     Ok(())
 }
 
 /// Handle one incoming vote: validate, dedup, and submit on threshold.
-async fn handle_vote(states: &mut HashMap<u64, RouteState>, vote: SetUpdateVote) {
+async fn handle_vote(
+    states: &mut HashMap<u64, RouteState>,
+    broadcast_locks: &Arc<crate::broadcast::BroadcastLocks>,
+    vote: SetUpdateVote,
+) {
     let Some(state) = states.get_mut(&vote.chain_key) else {
         return;
     };
@@ -206,7 +228,7 @@ async fn handle_vote(states: &mut HashMap<u64, RouteState>, vote: SetUpdateVote)
     let signatures: Vec<[u8; 65]> = slot.values().copied().collect();
     state.votes.remove(&digest);
     state.in_flight.insert(digest);
-    match submit(state, &canonical, &signatures).await {
+    match submit(state, broadcast_locks, &canonical, &signatures).await {
         Ok(()) => {}
         Err(err) => {
             state.in_flight.remove(&digest);
@@ -220,6 +242,7 @@ pub async fn run(
     routes: Vec<ChainRoute>,
     mut vote_rx: mpsc::Receiver<SetUpdateVote>,
     health: Arc<crate::health::Health>,
+    broadcast_locks: Arc<crate::broadcast::BroadcastLocks>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let mut states: HashMap<u64, RouteState> = HashMap::new();
@@ -300,7 +323,7 @@ pub async fn run(
             }
             maybe = vote_rx.recv() => {
                 match maybe {
-                    Some(vote) => handle_vote(&mut states, vote).await,
+                    Some(vote) => handle_vote(&mut states, &broadcast_locks, vote).await,
                     None => {
                         // All senders dropped — the p2p/spy source is gone.
                         error!("attestor-set-update vote channel closed — exiting");

@@ -77,6 +77,13 @@ const MAX_BLOCKS_PER_SCAN: u64 = 5_000;
 /// a duplicate lands as `MessageAlreadyAcknowledged`, a terminal revert).
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Upper bound on a single `submitAcknowledgment` broadcast — the gas/fee/nonce reads plus
+/// `eth_sendRawTransaction`. Alloy's HTTP transport sets no timeout of its own, so a black-holed
+/// Creditcoin RPC would otherwise park this attempt forever, and with it the tick's whole
+/// `buffer_unordered` batch and the worker's cancel branch. Bounding it also bounds how long one
+/// attempt can hold the signer's broadcast slot.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Retry cadence while the proof block is simply not attested yet (`BlockNotReady`). This is the
 /// normal early state of every ack — destination finality plus attestation takes minutes — so it
 /// does not count against the transient-failure budget.
@@ -101,6 +108,7 @@ pub async fn run(
     checkpoint: Option<Arc<CheckpointStore>>,
     scan_lookback_blocks: u64,
     health: Arc<crate::health::Health>,
+    broadcast_locks: Arc<crate::broadcast::BroadcastLocks>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let chain_key = route.chain_key;
@@ -138,11 +146,13 @@ pub async fn run(
         .parse()
         .with_context(|| format!("chain_key {chain_key}: invalid ack.signer_key"))?;
     let submitter_address = signer.address();
-    // Keep `ProviderBuilder::new()`'s default `CachedNonceManager`: the submit loop below fans out
-    // `MAX_ACK_CONCURRENCY` sends over this one provider, and the cached manager holds its mutex
-    // across fetch-and-increment, so each concurrent send gets a distinct nonce. A stateless
-    // chain-read manager would have all of them read the same pending count and collide.
-    let source_provider = ProviderBuilder::new()
+    // Chain-read nonces: a failed broadcast must not consume a nonce the chain never saw, which with
+    // a local counter wedges every later ack until restart. The submit loop below fans out
+    // `MAX_ACK_CONCURRENCY` sends over this one provider, so they would otherwise all read the same
+    // pending count and all but one fail as `nonce too low`; `broadcast_locks` serializes them on the
+    // submitter address instead — and, unlike the per-provider counter it replaces, also against any
+    // other route configured with this same Creditcoin key. See `crate::broadcast`.
+    let source_provider = crate::broadcast::chain_nonce_builder()
         .wallet(EthereumWallet::from(signer))
         .connect(&creditcoin_eth_rpc_url)
         .await
@@ -248,6 +258,8 @@ pub async fn run(
                     route.outbox_address,
                     &client,
                     &source_provider,
+                    submitter_address,
+                    &broadcast_locks,
                     &mut pending,
                     &mut done,
                 ).await;
@@ -345,6 +357,8 @@ async fn process_pending<P: Provider>(
     outbox: Option<alloy::primitives::Address>,
     client: &ProofGenClient,
     source_provider: &P,
+    submitter_address: alloy::primitives::Address,
+    broadcast_locks: &Arc<crate::broadcast::BroadcastLocks>,
     pending: &mut PendingTxs,
     done: &mut BoundedSeen,
 ) {
@@ -368,6 +382,8 @@ async fn process_pending<P: Provider>(
                 &message_ids,
                 client,
                 source_provider,
+                submitter_address,
+                broadcast_locks,
                 tx_hash,
             )
             .await;
@@ -465,6 +481,8 @@ async fn acknowledge_tx<P: Provider>(
     message_ids: &[B256],
     client: &ProofGenClient,
     source_provider: &P,
+    submitter_address: alloy::primitives::Address,
+    broadcast_locks: &Arc<crate::broadcast::BroadcastLocks>,
     tx_hash: B256,
 ) -> Result<AckOutcome> {
     // Fail open: if the view calls error we fall through to the proof path — the validator
@@ -511,10 +529,24 @@ async fn acknowledge_tx<P: Provider>(
     let validator =
         crate::abi::IAcknowledgmentValidator::new(ack.validator_address, source_provider);
 
-    let pending_tx = validator
-        .submitAcknowledgment(height, encoded_tx, merkle_proof, continuity_proof)
-        .send()
-        .await;
+    // Serialized on the submitter address so this tick's concurrent sends (and any other worker
+    // sharing this Creditcoin key) cannot read the same chain nonce. The guard covers the broadcast
+    // only — the receipt is awaited below, outside it, so one confirmation does not stall the batch.
+    // A stall consumes no nonce, so it is reported as transient and retried (idempotently: a
+    // duplicate lands as `MessageAlreadyAcknowledged`).
+    let pending_tx = match broadcast_locks
+        .broadcast(
+            submitter_address,
+            SEND_TIMEOUT,
+            validator
+                .submitAcknowledgment(height, encoded_tx, merkle_proof, continuity_proof)
+                .send(),
+        )
+        .await
+    {
+        Ok(res) => res,
+        Err(stalled) => return Err(anyhow!("submitAcknowledgment {stalled}")),
+    };
 
     match pending_tx {
         // `crate::receipt::await_receipt` instead of `builder.get_receipt()`: the latter runs on

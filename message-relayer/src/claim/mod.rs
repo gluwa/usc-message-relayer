@@ -66,6 +66,11 @@ const MAX_CLAIM_CONCURRENCY: usize = 8;
 const MAX_BLOCKS_PER_SCAN: u64 = 5_000;
 /// Upper bound on waiting for the claim receipt so one stuck tx cannot wedge the pipeline.
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Upper bound on a single `claim` broadcast (gas/fee/nonce reads plus `eth_sendRawTransaction`).
+/// Alloy's HTTP transport sets no timeout, so a black-holed Creditcoin RPC would otherwise park the
+/// attempt, the tick's whole batch, and the worker's cancel branch. Also bounds how long one attempt
+/// can hold the signer's broadcast slot. See `crate::ack::SEND_TIMEOUT`.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Retry cadence while the proof block is not attested yet (`BlockNotReady`). This is the normal
 /// early state — client-chain finality plus attestation takes minutes on real chains.
 const NOT_READY_RETRY: Duration = Duration::from_secs(15);
@@ -168,6 +173,7 @@ pub async fn run(
     checkpoint: Option<Arc<CheckpointStore>>,
     scan_lookback_blocks: u64,
     health: Arc<crate::health::Health>,
+    broadcast_locks: Arc<crate::broadcast::BroadcastLocks>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let chain_key = route.chain_key;
@@ -203,10 +209,11 @@ pub async fn run(
         .parse()
         .with_context(|| format!("chain_key {chain_key}: invalid claim.signer_key"))?;
     let submitter_address = signer.address();
-    // Keep `ProviderBuilder::new()`'s default `CachedNonceManager` — the submit loop fans out
-    // `MAX_CLAIM_CONCURRENCY` sends over this one provider and relies on the manager's
-    // fetch-and-increment mutex to hand each of them a distinct nonce. See `crate::ack::run`.
-    let cc_provider = ProviderBuilder::new()
+    // Chain-read nonces, with the submit loop's `MAX_CLAIM_CONCURRENCY` fan-out serialized on the
+    // submitter address through `broadcast_locks` rather than through a per-provider local counter —
+    // so a failed broadcast leaves no nonce gap, and routes sharing this Creditcoin key coordinate
+    // too. See `crate::ack::run` and `crate::broadcast`.
+    let cc_provider = crate::broadcast::chain_nonce_builder()
         .wallet(EthereumWallet::from(signer))
         .connect(&creditcoin_eth_rpc_url)
         .await
@@ -304,6 +311,8 @@ pub async fn run(
                     &claim,
                     &client,
                     &cc_provider,
+                    submitter_address,
+                    &broadcast_locks,
                     &mut pending,
                     &mut done,
                 ).await;
@@ -387,11 +396,14 @@ async fn discover_locks<P: Provider>(
 }
 
 /// Try to fetch a proof and submit a claim for every pending client-chain tx that is due.
+#[allow(clippy::too_many_arguments)]
 async fn process_pending<P: Provider>(
     chain_key: u64,
     claim: &ClaimConfig,
     client: &ProofGenClient,
     cc_provider: &P,
+    submitter_address: alloy::primitives::Address,
+    broadcast_locks: &Arc<crate::broadcast::BroadcastLocks>,
     pending: &mut PendingTxs,
     done: &mut BoundedSeen,
 ) {
@@ -403,7 +415,17 @@ async fn process_pending<P: Provider>(
 
     let results: Vec<(B256, Result<ClaimOutcome>)> = futures::stream::iter(batch)
         .map(|(tx_hash, keys)| async move {
-            let outcome = claim_tx(chain_key, claim, &keys, client, cc_provider, tx_hash).await;
+            let outcome = claim_tx(
+                chain_key,
+                claim,
+                &keys,
+                client,
+                cc_provider,
+                submitter_address,
+                broadcast_locks,
+                tx_hash,
+            )
+            .await;
             (tx_hash, outcome)
         })
         .buffer_unordered(MAX_CLAIM_CONCURRENCY)
@@ -483,12 +505,15 @@ enum ClaimOutcome {
 /// Before any proof is fetched, the per-lock replay keys are checked against the target's
 /// `claimed()` mapping: when every lock in the tx is already claimed (user claimed manually, or
 /// another relayer won the race), the tx is terminal without costing a proof-gen round-trip.
+#[allow(clippy::too_many_arguments)]
 async fn claim_tx<P: Provider>(
     chain_key: u64,
     claim: &ClaimConfig,
     keys: &[B256],
     client: &ProofGenClient,
     cc_provider: &P,
+    submitter_address: alloy::primitives::Address,
+    broadcast_locks: &Arc<crate::broadcast::BroadcastLocks>,
     tx_hash: B256,
 ) -> Result<ClaimOutcome> {
     // Fail open: if the view calls error we fall through to the proof path — the target enforces
@@ -525,15 +550,27 @@ async fn claim_tx<P: Provider>(
     let height = proof.header_number;
 
     let target = IClaimTarget::new(claim.target_address, cc_provider);
-    let pending_tx = target
-        .claim(
-            height,
-            encoded_tx,
-            merkle_proof.into(),
-            continuity_proof.into(),
+    // Serialized on the submitter address (broadcast only — the receipt is awaited below, outside the
+    // guard) so this tick's concurrent sends cannot read the same chain nonce. A stall consumes no
+    // nonce and is retried; re-submission is idempotent (the target rejects an already-claimed key).
+    let pending_tx = match broadcast_locks
+        .broadcast(
+            submitter_address,
+            SEND_TIMEOUT,
+            target
+                .claim(
+                    height,
+                    encoded_tx,
+                    merkle_proof.into(),
+                    continuity_proof.into(),
+                )
+                .send(),
         )
-        .send()
-        .await;
+        .await
+    {
+        Ok(res) => res,
+        Err(stalled) => return Err(anyhow!("claim {stalled}")),
+    };
 
     match pending_tx {
         // `crate::receipt::await_receipt` instead of `builder.get_receipt()`: the latter runs on
