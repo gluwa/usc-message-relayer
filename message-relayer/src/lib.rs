@@ -243,19 +243,20 @@ impl Server {
 
         // Acknowledgment submitters (per route, opt-in). Each watches the destination Inbox for
         // `MessageDelivered`, fetches a native USC delivery proof, and submits it to the
-        // source-chain `AcknowledgmentValidator` — or, when the route funds a RelayerFeeVault, calls
-        // `RelayerFeeVault.claimDelivery` (claim mode: relay fee + bundled ack) instead. Routes
-        // without `ack` config are skipped, so a vault configured without an `ack` block would
-        // silently never claim — warn on that misconfiguration.
+        // source-chain `AcknowledgmentValidator` — and, when the route has a RelayerContract
+        // configured, additionally submits `RelayerContract.claimDelivery` for the relay fee (the
+        // two settlements are independent since usc-contracts #23; the claim no longer acks).
+        // Routes without `ack` config are skipped, so a relayer contract configured without an
+        // `ack` block would silently never claim — warn on that misconfiguration.
         for route in self
             .config
             .routes
             .iter()
-            .filter(|r| r.relayer_fee_vault_address.is_some() && r.ack.is_none())
+            .filter(|r| r.relayer_contract_address.is_some() && r.ack.is_none())
         {
             tracing::warn!(
                 chain_key = route.chain_key,
-                "route funds a RelayerFeeVault but has no `ack` config; relay-fee claiming \
+                "route has a relayer_contract_address but no `ack` config; relay-fee claiming \
                  (claimDelivery) will NOT run — add an `ack` block to enable it"
             );
         }

@@ -172,37 +172,47 @@ sol! {
         /// proves — via the chain's native USC proving (block-prover precompile: merkle inclusion +
         /// continuity) — that a `MessageDelivered` event was emitted in a finalized block on the
         /// destination chain. This contract verifies the proof, decodes the delivered messageId(s),
-        /// and calls `Outbox.acknowledgeMessage`. Permissionless: the proof is self-validating.
+        /// and calls `Outbox.acknowledgeMessage` per log under try/catch (one already-acked or
+        /// no-ack log cannot wedge the others). Permissionless AND fee-bearing: each message's
+        /// user-set ackFee (held by this validator) pays `msg.sender` of the first successful
+        /// submission — an open, front-runnable bounty by design (Jul 28 decision), so the relayer
+        /// should submit promptly.
         ///
-        /// `height` is the destination block height; `encodedTransaction` is the prover `txBytes`
-        /// (encoded tx + receipt); the two proof structs mirror the block-prover precompile inputs.
+        /// `height` is the destination block height. The prover `txBytes` travel INSIDE
+        /// `inclusionProof.data` (`abi.encode(bytes txBytes, MerkleProofEntry[] siblings)`) — the
+        /// PR #23 envelope, same shape `claimDelivery` takes; there is no separate
+        /// `encodedTransaction` parameter any more.
         function submitAcknowledgment(
             uint64 height,
-            bytes calldata encodedTransaction,
-            MerkleProof calldata merkleProof,
-            ContinuityProof calldata continuityProof
+            InclusionProof inclusionProof,
+            ContinuityProof continuityProof
         ) external;
 
         event Acknowledged(bytes32 indexed messageId);
+        event AckFeeClaimed(bytes32 indexed messageId, address indexed claimant, uint256 amount);
 
-        /// Validator-local reverts (proof rejected before reaching the Outbox). Permanent for a
-        /// given proof, so the ack submitter treats them as terminal. Message-state errors
-        /// (`MessageDoesNotRequireAck` / `MessageNotFound` / `MessageAlreadyAcknowledged`) bubble
-        /// up from the Outbox — see [`IOutbox`].
-        error ProofVerificationFailed();
+        /// Reverts the ack submitter treats as terminal for a given proof. Outbox message-state
+        /// errors (`MessageDoesNotRequireAck` / `MessageNotFound` / `MessageAlreadyAcknowledged`)
+        /// no longer bubble up — the validator catches them per log — so a submission only reverts
+        /// when NOTHING was acknowledged (`NoMessageDeliveredLogs`) or the proof itself is bad.
+        /// `ProofInvalid` is raised by the `USCProofVerifier` the validator delegates to.
+        error ProofInvalid(bytes32 chainKey, uint64 blockHeight);
         error NoMessageDeliveredLogs();
         error MalformedMessageDeliveredLog();
         error EncodedTransactionTooLarge(uint256 size, uint256 maxSize);
         error UnsupportedTxType(uint8 txType);
+        error OutboxNotSet();
     }
 
     #[sol(rpc)]
     #[derive(Debug)]
-    contract IRelayerFeeVault {
-        /// Per-message fee + routing record on the *source* (Creditcoin) chain. The relayer reads
-        /// `gasLimit` so it can deliver the destination tx with exactly the funded gas: the vault
-        /// only pays `claimDelivery` when the proven delivery tx's gasLimit matches a funded tier
-        /// (`decoded.gasLimit == _initialGasLimit`), so an estimated gas would strand the fee.
+    contract IRelayerContract {
+        /// Per-message fee + routing record on the *source* (Creditcoin) chain. Since PR #23's
+        /// `RelayerFeeLedger` refactor this ledger lives on the RelayerContract(Lite) itself — the
+        /// RelayerFeeVault holds tokens only and serves no reads — so this binding targets the
+        /// route's `relayer_contract_address`. The relayer reads `gasLimit` so it can deliver the
+        /// destination tx with exactly the funded gas: `claimDelivery` only pays when the proven
+        /// delivery tx's gasLimit matches a funded tier, so an estimated gas would strand the fee.
         struct MessageInfo {
             address payer;
             uint32  destinationChain;
@@ -212,17 +222,23 @@ sol! {
             uint256 tipExpiry;
             uint256 deliveryDeadline;
             bool    relaySettled;
+            /// Fee currency of the route (from the signed quote): native-coin wei when true,
+            /// ATTEST wei when false. Informational for the relayer — payout currency is bound
+            /// on-chain to the deposit currency.
+            bool    feesInNative;
         }
 
         function getMessageInfo(bytes32 messageId) external view returns (MessageInfo memory);
 
-        /// Trust-minimized relay-fee settlement on the *source* (Creditcoin) chain, mirroring
-        /// [`IAcknowledgmentValidator::submitAcknowledgment`] but on the fee vault. The relayer proves
-        /// — via the block-prover precompile (merkle inclusion + continuity) — that a
+        /// Trust-minimized relay-fee settlement on the *source* (Creditcoin) chain. The relayer
+        /// proves — via the block-prover precompile (merkle inclusion + continuity) — that a
         /// `MessageDelivered` event for `messageId` was emitted in a finalized block on the
-        /// destination chain. The vault verifies the proof, decodes the proven relayer from the
-        /// event, and pays it the relay fee; on a successful delivery it also *bundles the
-        /// acknowledgment* (settling the ack fee and acknowledging on the Outbox in the same tx).
+        /// destination chain. The contract verifies the proof, decodes the proven relayer from the
+        /// event, and pays it the relay fee (+ any unexpired tip).
+        ///
+        /// NOTE: unlike the pre-#23 vault version, this does NOT acknowledge the message — ack
+        /// settlement lives solely on [`IAcknowledgmentValidator::submitAcknowledgment`], so the
+        /// two submissions are independent and must BOTH run on a fee-funded route.
         ///
         /// Permissionless: the payee is always the proven relayer, never `msg.sender`, so a
         /// front-runner can only settle the claim on the relayer's behalf, not steal it. `chainKey`
@@ -236,11 +252,15 @@ sol! {
             ContinuityProof continuityProof
         ) external;
 
-        /// `messageId` was not funded through the relayer fee vault (e.g. bridge traffic, or a
+        /// `messageId` was not funded through the relayer contract (e.g. bridge traffic, or a
         /// message published without a relay fee). Permanent for a given messageId.
         error UnknownOperation(bytes32 messageId);
         /// The relay fee for `messageId` was already claimed. Permanent — a duplicate claim.
         error RelayAlreadySettled(bytes32 messageId);
+        /// A native payout leg failed (recipient rejected the transfer). Deliberately NOT in the
+        /// relayer's terminal set: it can clear if the recipient starts accepting, and the
+        /// pull-payment fix pending on usc-contracts #23 (review B1/B2) removes it entirely.
+        error NativeTransferFailed(address to, uint256 amount);
     }
 
     /// One sibling along the merkle inclusion path. `isLeft` says whether the sibling is the
@@ -267,7 +287,8 @@ sol! {
     }
 
     /// PR #23 self-describing transaction-inclusion proof (`BlockProverTypes.InclusionProof`),
-    /// consumed by [`IRelayerFeeVault::claimDelivery`] via the `USCProofVerifier`. `kind` is the
+    /// consumed by [`IRelayerContract::claimDelivery`] and
+    /// [`IAcknowledgmentValidator::submitAcknowledgment`] via the `USCProofVerifier`. `kind` is the
     /// `ProofKind` discriminator (`0` = `BinaryMerkle`, the only supported kind); `root` is the
     /// transaction-trie root; `data` is `abi.encode(bytes txBytes, MerkleProofEntry[] siblings)` —
     /// the same `txBytes`/`siblings` the flat [`MerkleProof`] carries, re-wrapped for the verifier.

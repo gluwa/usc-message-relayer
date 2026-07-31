@@ -73,6 +73,13 @@ routes:
     # First Creditcoin block to scan on the very first run (no checkpoint yet). Omit = start at head.
     # start_block: 12345
 
+    # RelayerContract(Lite) on Creditcoin — the per-message fee ledger (usc-contracts #23). When
+    # set, the delivery worker pins each deliverMessage tx to the funded gasLimit, and the ack
+    # worker additionally claims the relay fee via claimDelivery (see the ack block below). Omit on
+    # routes without the fee flow. The pre-#23 key `relayer_fee_vault_address` is accepted as an
+    # alias for existing configs.
+    # relayer_contract_address: "0x2222222222222222222222222222222222222222"
+
     # Attestor allowlist + quorum. Threshold is ⌊2N/3⌋+1 unless threshold_override is set.
     attestor_set:
       # On-chain source (recommended): read attestors()/threshold() from the EOAValidator on the
@@ -88,16 +95,17 @@ routes:
 
     # Optional trust-minimized acknowledgment submitter (proof-based, permissionless).
     #
-    # Claim mode: when `relayer_fee_vault_address` (above) is set, this same worker runs in claim
-    # mode — it calls RelayerFeeVault.claimDelivery instead of submitAcknowledgment. claimDelivery
-    # settles the relay fee to the proven relayer AND bundles the acknowledgment in one tx, so the
-    # `ack` block is still required (for proof_gen_url + signer_key + confirmation_depth) while
-    # `validator_address` is then unused. A route with a fee vault therefore needs this `ack` block,
-    # or the relay fee is never claimed.
+    # Relay-fee claiming: when `relayer_contract_address` (above) is set, this same worker ALSO
+    # submits RelayerContract.claimDelivery per delivered message from the same proof — the two
+    # settlements are independent since usc-contracts #23 (the claim no longer acknowledges).
+    # submitAcknowledgment runs first: the message's user-set ackFee is an open bounty paid to the
+    # first successful submitter (front-runnable by design), while claimDelivery always pays the
+    # proven relayer. A route with a relayer contract therefore needs this `ack` block, or the
+    # relay fee is never claimed.
     ack:
       # proof-gen API serving native USC proofs: GET /api/v1/proof-by-tx/{chain_key}/{tx_hash}.
       proof_gen_url: "http://proof-gen-api:3100"
-      # AcknowledgmentValidator on Creditcoin (the submit target). Unused in claim mode.
+      # AcknowledgmentValidator on Creditcoin (the submit target).
       validator_address: "0x98f31a518964479d07b280BA156477682A66a8D6"
       # Creditcoin key paying gas for submitAcknowledgment / claimDelivery (needs funds, not authority).
       signer_key: "${ROUTE_0_ACK_SIGNER_KEY}"

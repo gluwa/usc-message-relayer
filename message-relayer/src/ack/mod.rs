@@ -13,17 +13,20 @@
 //!     `MessageDelivered` logs, and calls `Outbox.acknowledgeMessage` for each — so the relayer
 //!     never needs acknowledge authority; the proof is self-validating.
 //!
-//! ## Claim mode (relay-fee settlement)
+//! ## Relay-fee claiming (`AckAndClaim` mode)
 //!
-//! When the route funds a `RelayerFeeVault` (`route.relayer_fee_vault_address = Some(..)`), this same
-//! watcher runs in **claim mode**: instead of `submitAcknowledgment`, it calls
-//! `RelayerFeeVault.claimDelivery(messageId, ..)` for each delivered message. `claimDelivery` settles
-//! the relay fee to the relayer proven in the destination `MessageDelivered` event *and* bundles the
-//! acknowledgment (settling the ack fee and acking on the Outbox) in the same tx — so it replaces the
-//! ack call rather than running alongside it (running both would double-ack, one reverting). The `ack`
-//! config block still supplies the proof-gen URL, the source signer, and the scan cadence;
-//! `ack.validator_address` is unused in claim mode. Everything else — the destination watcher,
-//! proof-gen fetch, checkpointing, dedup, and backoff — is shared verbatim.
+//! When the route has a `RelayerContract` configured (`route.relayer_contract_address = Some(..)`),
+//! this same watcher ALSO settles the relay fee: from the same delivery proof it calls
+//! `RelayerContract.claimDelivery(messageId, ..)` per delivered message, which pays the relay fee
+//! (+ any unexpired tip) to the relayer proven in the destination `MessageDelivered` event.
+//!
+//! Since usc-contracts #23 the claim does NOT acknowledge — ack settlement lives solely on the
+//! `AcknowledgmentValidator` — so the two submissions are independent and BOTH run here, ack first:
+//! the message's user-set ackFee is an open bounty paid to the first successful `submitAcknowledgment`
+//! sender (front-runnable by design, Jul 28 decision), while `claimDelivery` pays the proven relayer
+//! no matter who or when submits. Losing the ack race is therefore terminal-but-harmless for the
+//! bounty and never blocks the fee claim. Everything else — the destination watcher, proof-gen
+//! fetch, checkpointing, dedup, and backoff — is shared verbatim between the two settlements.
 //!
 //! Submission is keyed (and deduped) by destination **transaction hash**: one transaction may
 //! contain several `MessageDelivered` logs and the validator acknowledges all of them in a single
@@ -131,12 +134,14 @@ pub async fn run(
         return Ok(());
     };
 
-    // A route that funds a RelayerFeeVault settles via `claimDelivery` (relay fee + bundled ack)
-    // instead of the standalone `submitAcknowledgment`; see the module docs. The chain key is passed
-    // to `claimDelivery` as `bytes32(uint256(chainKey))`, matching the vault's route check.
-    let mode = match route.relayer_fee_vault_address {
-        Some(vault) => SettlementMode::Claim {
-            vault,
+    // A route with a RelayerContract configured settles the relay fee via `claimDelivery` IN
+    // ADDITION to the standalone `submitAcknowledgment` — since usc-contracts #23 the claim no
+    // longer bundles the ack, so the two submissions are independent and both must run; see the
+    // module docs. The chain key is passed to `claimDelivery` as `bytes32(uint256(chainKey))`,
+    // matching the ledger's route check.
+    let mode = match route.relayer_contract_address {
+        Some(relayer_contract) => SettlementMode::AckAndClaim {
+            relayer_contract,
             chain_key: B256::from(U256::from(chain_key)),
         },
         None => SettlementMode::Ack,
@@ -197,13 +202,16 @@ pub async fn run(
             proof_gen_url = %ack.proof_gen_url,
             "🧾 acknowledgment submitter online (ack mode)"
         ),
-        SettlementMode::Claim { vault, .. } => info!(
+        SettlementMode::AckAndClaim {
+            relayer_contract, ..
+        } => info!(
             chain_key,
             inbox = %route.inbox_address,
-            relayer_fee_vault = %vault,
+            validator = %ack.validator_address,
+            relayer_contract = %relayer_contract,
             submitter = %submitter_address,
             proof_gen_url = %ack.proof_gen_url,
-            "💰 delivery-claim submitter online (claim mode: relay fee + bundled ack)"
+            "💰 settlement submitter online (ack + relay-fee claim; independent since usc-contracts #23)"
         ),
     }
 
@@ -497,14 +505,20 @@ async fn process_pending<P: Provider>(
 /// What this worker submits once a delivery proof is ready — chosen per route in [`run`].
 #[derive(Clone, Copy, Debug)]
 enum SettlementMode {
-    /// No relayer-fee vault on the route: prove delivery to the `AcknowledgmentValidator`
-    /// (`submitAcknowledgment`, one call per tx — the validator acks every `MessageDelivered` log).
-    /// The validator address comes from `ack.validator_address`.
+    /// No RelayerContract on the route: prove delivery to the `AcknowledgmentValidator` only
+    /// (`submitAcknowledgment`, one call per tx — the validator acks every `MessageDelivered` log
+    /// under try/catch). The validator address comes from `ack.validator_address`.
     Ack,
-    /// The route funds a `RelayerFeeVault`: call `claimDelivery` per messageId, settling the relay
-    /// fee to the proven relayer and bundling the acknowledgment. `chain_key` is passed to the vault
-    /// as `bytes32(uint256(chainKey))`.
-    Claim { vault: Address, chain_key: B256 },
+    /// The route has a `RelayerContract` (fee ledger): submit BOTH settlements from one proof —
+    /// `submitAcknowledgment` (which also earns the message's user-set ackFee, an open bounty paid
+    /// to the first submitter) and `claimDelivery` per messageId (relay fee + tip, always paid to
+    /// the proven relayer). Since usc-contracts #23 the claim does NOT acknowledge, so skipping
+    /// either call would leave messages unacknowledged or fees unclaimed. `chain_key` is passed to
+    /// `claimDelivery` as `bytes32(uint256(chainKey))`.
+    AckAndClaim {
+        relayer_contract: Address,
+        chain_key: B256,
+    },
 }
 
 enum AckOutcome {
@@ -568,23 +582,22 @@ async fn classify_submit(
     }
 }
 
-/// MessageIds in `ids` whose relay fee is still claimable: funded through the relayer fee vault
-/// (`payer != 0`) and not yet settled. Empty means nothing to claim for this tx — the caller treats
-/// that as terminal without fetching a proof. Traffic funded outside the relayer (e.g. bridge
-/// messages) reports `payer == 0` and is skipped.
+/// MessageIds in `ids` whose relay fee is still claimable: funded through the RelayerContract
+/// ledger (`payer != 0`) and not yet settled. Empty means nothing to claim for this tx. Traffic
+/// funded outside the relayer (e.g. bridge messages) reports `payer == 0` and is skipped.
 async fn relay_claimable_ids<P: Provider>(
     provider: &P,
-    vault: Address,
+    relayer_contract: Address,
     ids: &[B256],
 ) -> Result<Vec<B256>> {
-    let vault = crate::abi::IRelayerFeeVault::new(vault, provider);
+    let ledger = crate::abi::IRelayerContract::new(relayer_contract, provider);
     let mut claimable = Vec::new();
     for id in ids {
-        let info = vault
+        let info = ledger
             .getMessageInfo(*id)
             .call()
             .await
-            .context("IRelayerFeeVault.getMessageInfo call failed")?;
+            .context("IRelayerContract.getMessageInfo call failed")?;
         if info.payer != Address::ZERO && !info.relaySettled {
             claimable.push(*id);
         }
@@ -611,48 +624,45 @@ async fn acknowledge_tx<P: Provider>(
     broadcast_locks: &Arc<crate::broadcast::BroadcastLocks>,
     tx_hash: B256,
 ) -> Result<AckOutcome> {
-    // Mode-specific pre-check: skip the proof fetch entirely when nothing is left to do. Both checks
-    // fail open — a view-call error falls through to the proof path, where the contract enforces the
-    // same rules on-chain; this is purely a cost-saving shortcut. In claim mode it also yields the
-    // exact set of still-claimable messageIds so already-settled ones are not re-attempted.
-    let claim_ids: Vec<B256> = match mode {
-        SettlementMode::Ack => {
-            if let Some(outbox_addr) = outbox {
-                if !message_ids.is_empty() {
-                    match any_requires_ack(source_provider, outbox_addr, message_ids).await {
-                        Ok(false) => {
-                            return Ok(AckOutcome::Terminal(
-                                "no delivered message requires acknowledgment (requiresAck=false \
-                                 or already acknowledged)"
-                                    .into(),
-                            ));
-                        }
-                        Ok(true) => {}
-                        Err(err) => {
-                            warn!(chain_key, %tx_hash, %err, "requiresAck pre-check failed; proceeding with proof");
-                        }
-                    }
-                }
-            }
-            Vec::new()
-        }
-        SettlementMode::Claim { vault, .. } => {
-            match relay_claimable_ids(source_provider, *vault, message_ids).await {
-                Ok(ids) if ids.is_empty() => {
-                    return Ok(AckOutcome::Terminal(
-                        "no delivered message has an unsettled relay fee (unfunded or already \
-                         settled)"
-                            .into(),
-                    ));
-                }
-                Ok(ids) => ids,
+    // Pre-checks: skip the proof fetch entirely when nothing is left to do. Both checks fail
+    // open — a view-call error falls through to the proof path, where the contracts enforce the
+    // same rules on-chain; this is purely a cost-saving shortcut. The two settlements are
+    // independent (usc-contracts #23: `claimDelivery` no longer acknowledges), so the tx is only
+    // terminal when NEITHER an ack nor a claim remains outstanding.
+    let needs_ack: bool = if let Some(outbox_addr) = outbox {
+        if message_ids.is_empty() {
+            true // discovery always records ids; treat the impossible case fail-open
+        } else {
+            match any_requires_ack(source_provider, outbox_addr, message_ids).await {
+                Ok(needed) => needed,
                 Err(err) => {
-                    warn!(chain_key, %tx_hash, %err, "relay-claimable pre-check failed; proceeding with proof");
-                    message_ids.to_vec()
+                    warn!(chain_key, %tx_hash, %err, "requiresAck pre-check failed; assuming ack needed");
+                    true
                 }
             }
         }
+    } else {
+        true // no Outbox view configured — let the validator decide on-chain
     };
+
+    let claim_ids: Vec<B256> = match mode {
+        SettlementMode::Ack => Vec::new(),
+        SettlementMode::AckAndClaim {
+            relayer_contract, ..
+        } => match relay_claimable_ids(source_provider, *relayer_contract, message_ids).await {
+            Ok(ids) => ids,
+            Err(err) => {
+                warn!(chain_key, %tx_hash, %err, "relay-claimable pre-check failed; attempting all ids");
+                message_ids.to_vec()
+            }
+        },
+    };
+
+    if !needs_ack && claim_ids.is_empty() {
+        return Ok(AckOutcome::Terminal(
+            "nothing left to settle (no message requires an ack, no unsettled relay fee)".into(),
+        ));
+    }
 
     let proof = match client.proof_by_tx(chain_key, tx_hash).await? {
         ProofFetch::Ready(p) => p,
@@ -661,9 +671,10 @@ async fn acknowledge_tx<P: Provider>(
 
     let encoded_tx = proof.encoded_transaction()?;
 
-    // Mirror the on-chain cap: an oversized encodedTransaction is rejected by submitAcknowledgment
-    // (EncodedTransactionTooLarge), so skip it before spending gas on a guaranteed revert. This is a
-    // permanent condition for this proof, hence Terminal (no retry).
+    // Mirror the on-chain cap: an oversized prover txBytes payload is rejected on-chain
+    // (EncodedTransactionTooLarge) — the bytes now travel inside `inclusionProof.data`, but the cap
+    // is enforced on the same decoded length — so skip it before spending gas on a guaranteed
+    // revert. Permanent for this proof, hence Terminal (no retry).
     if encoded_tx.len() > MAX_ENCODED_TRANSACTION_BYTES {
         return Ok(AckOutcome::Terminal(format!(
             "encodedTransaction {} bytes exceeds on-chain max {} bytes",
@@ -680,98 +691,107 @@ async fn acknowledge_tx<P: Provider>(
     // confirmation does not stall the batch. A stall consumes no nonce, so it is reported as
     // transient and retried (idempotently: a duplicate lands as `MessageAlreadyAcknowledged` /
     // `RelayAlreadySettled`).
-    match mode {
-        SettlementMode::Ack => {
-            let (merkle_proof, continuity_proof) = proof.to_proofs()?;
-            let validator =
-                crate::abi::IAcknowledgmentValidator::new(ack.validator_address, source_provider);
+    //
+    // Ack FIRST, claim second: the ack fee is an open bounty paid to the first successful
+    // submitter (front-runnable by design), while the relay-fee claim always pays the proven
+    // relayer no matter who or when submits — so the time-sensitive settlement goes first.
+    // A transient failure anywhere aborts the whole tx for retry; both settlements are idempotent
+    // on-chain, and the pre-checks drop already-settled work on the retry, so retries converge.
+    if needs_ack {
+        let (inclusion, continuity) = proof.to_inclusion_and_continuity()?;
+        let validator =
+            crate::abi::IAcknowledgmentValidator::new(ack.validator_address, source_provider);
+        let pending_tx = match broadcast_locks
+            .broadcast(
+                submitter_address,
+                SEND_TIMEOUT,
+                validator
+                    .submitAcknowledgment(height, inclusion, continuity)
+                    .send(),
+            )
+            .await
+        {
+            Ok(res) => res,
+            Err(stalled) => return Err(anyhow!("submitAcknowledgment {stalled}")),
+        };
+        match classify_submit(pending_tx, "submitAcknowledgment").await? {
+            SubmitOutcome::Confirmed {
+                gas_used,
+                effective_gas_price,
+                gas_cost_wei,
+                tx_hash: settle_tx,
+            } => {
+                info!(
+                    chain_key,
+                    %tx_hash,
+                    ack_tx_hash = %settle_tx,
+                    gas_used = %gas_used,
+                    effective_gas_price_wei = %effective_gas_price,
+                    gas_cost_wei = %gas_cost_wei,
+                    "submitAcknowledgment confirmed (ack fee, if any, paid to this submitter)",
+                );
+            }
+            // Terminal here (e.g. NoMessageDeliveredLogs because another submitter front-ran the
+            // bounty and every log is now already-acked) must not block the relay-fee claim below —
+            // the claim pays the proven relayer regardless of who acknowledged.
+            SubmitOutcome::Terminal(reason) => {
+                info!(chain_key, %tx_hash, %reason, "submitAcknowledgment terminal; continuing to claim");
+            }
+        }
+    }
+
+    // One claimDelivery per messageId (the ledger settles a single message per call, unlike the
+    // validator which acks every log in one tx). A tx usually carries one delivery, so the proof
+    // structs are rebuilt per id rather than cloned.
+    if let SettlementMode::AckAndClaim {
+        relayer_contract,
+        chain_key: ck,
+    } = mode
+    {
+        let ledger = crate::abi::IRelayerContract::new(*relayer_contract, source_provider);
+        for id in &claim_ids {
+            let (inclusion, continuity) = proof.to_inclusion_and_continuity()?;
             let pending_tx = match broadcast_locks
                 .broadcast(
                     submitter_address,
                     SEND_TIMEOUT,
-                    validator
-                        .submitAcknowledgment(height, encoded_tx, merkle_proof, continuity_proof)
+                    ledger
+                        .claimDelivery(*id, *ck, height, inclusion, continuity)
                         .send(),
                 )
                 .await
             {
                 Ok(res) => res,
-                Err(stalled) => return Err(anyhow!("submitAcknowledgment {stalled}")),
+                Err(stalled) => return Err(anyhow!("claimDelivery {stalled}")),
             };
-            match classify_submit(pending_tx, "submitAcknowledgment").await? {
+            match classify_submit(pending_tx, "claimDelivery").await? {
                 SubmitOutcome::Confirmed {
                     gas_used,
                     effective_gas_price,
                     gas_cost_wei,
                     tx_hash: settle_tx,
-                } => {
-                    info!(
-                        chain_key,
-                        %tx_hash,
-                        ack_tx_hash = %settle_tx,
-                        gas_used = %gas_used,
-                        effective_gas_price_wei = %effective_gas_price,
-                        gas_cost_wei = %gas_cost_wei,
-                        "submitAcknowledgment confirmed",
-                    );
-                    Ok(AckOutcome::Acknowledged)
-                }
-                SubmitOutcome::Terminal(reason) => Ok(AckOutcome::Terminal(reason)),
+                } => info!(
+                    chain_key,
+                    %tx_hash,
+                    message_id = %id,
+                    claim_tx_hash = %settle_tx,
+                    gas_used = %gas_used,
+                    effective_gas_price_wei = %effective_gas_price,
+                    gas_cost_wei = %gas_cost_wei,
+                    "claimDelivery confirmed (relay fee settled to proven relayer)",
+                ),
+                SubmitOutcome::Terminal(reason) => info!(
+                    chain_key,
+                    %tx_hash,
+                    message_id = %id,
+                    %reason,
+                    "claimDelivery skipped for message (terminal)",
+                ),
             }
-        }
-        SettlementMode::Claim {
-            vault,
-            chain_key: ck,
-        } => {
-            // One claimDelivery per messageId (the vault settles a single message per call, unlike
-            // the validator which acks every log in one tx). A tx usually carries one delivery, so
-            // the proof structs are rebuilt per id rather than cloned. A transient failure on any id
-            // aborts the whole tx for retry; on retry the already-settled ids return terminally
-            // (`RelayAlreadySettled`) and are dropped by the pre-check, so retries converge.
-            let vault_c = crate::abi::IRelayerFeeVault::new(*vault, source_provider);
-            for id in &claim_ids {
-                let (inclusion, continuity) = proof.to_inclusion_and_continuity()?;
-                let pending_tx = match broadcast_locks
-                    .broadcast(
-                        submitter_address,
-                        SEND_TIMEOUT,
-                        vault_c
-                            .claimDelivery(*id, *ck, height, inclusion, continuity)
-                            .send(),
-                    )
-                    .await
-                {
-                    Ok(res) => res,
-                    Err(stalled) => return Err(anyhow!("claimDelivery {stalled}")),
-                };
-                match classify_submit(pending_tx, "claimDelivery").await? {
-                    SubmitOutcome::Confirmed {
-                        gas_used,
-                        effective_gas_price,
-                        gas_cost_wei,
-                        tx_hash: settle_tx,
-                    } => info!(
-                        chain_key,
-                        %tx_hash,
-                        message_id = %id,
-                        claim_tx_hash = %settle_tx,
-                        gas_used = %gas_used,
-                        effective_gas_price_wei = %effective_gas_price,
-                        gas_cost_wei = %gas_cost_wei,
-                        "claimDelivery confirmed (relay fee + ack settled to proven relayer)",
-                    ),
-                    SubmitOutcome::Terminal(reason) => info!(
-                        chain_key,
-                        %tx_hash,
-                        message_id = %id,
-                        %reason,
-                        "claimDelivery skipped for message (terminal)",
-                    ),
-                }
-            }
-            Ok(AckOutcome::Acknowledged)
         }
     }
+
+    Ok(AckOutcome::Acknowledged)
 }
 
 /// Whether any of `ids` still needs an acknowledgment on the source Outbox: published with
@@ -809,15 +829,15 @@ async fn any_requires_ack<P: Provider>(
 /// (Creditcoin's EVM RPC returns raw selector data with no decoded name). Selectors come from the
 /// shared [`write_ability::abi`] `sol!` declarations, so they cannot drift from the contracts.
 fn ack_revert_name(sel: [u8; 4]) -> Option<&'static str> {
-    use crate::abi::{IAcknowledgmentValidator as V, IOutbox as O, IRelayerFeeVault as FV};
+    use crate::abi::{IAcknowledgmentValidator as V, IOutbox as O, IRelayerContract as RC};
     Some(match sel {
         s if s == O::MessageDoesNotRequireAck::SELECTOR => "MessageDoesNotRequireAck",
         s if s == O::MessageAlreadyAcknowledged::SELECTOR => "MessageAlreadyAcknowledged",
         s if s == O::MessageNotFound::SELECTOR => "MessageNotFound",
-        s if s == V::ProofVerificationFailed::SELECTOR => "ProofVerificationFailed",
+        s if s == V::ProofInvalid::SELECTOR => "ProofInvalid",
         s if s == V::NoMessageDeliveredLogs::SELECTOR => "NoMessageDeliveredLogs",
-        s if s == FV::RelayAlreadySettled::SELECTOR => "RelayAlreadySettled",
-        s if s == FV::UnknownOperation::SELECTOR => "UnknownOperation",
+        s if s == RC::RelayAlreadySettled::SELECTOR => "RelayAlreadySettled",
+        s if s == RC::UnknownOperation::SELECTOR => "UnknownOperation",
         _ => return None,
     })
 }
@@ -837,7 +857,7 @@ fn is_terminal_revert(err: &impl std::fmt::Display) -> bool {
     s.contains("AlreadyAcknowledged")
         || s.contains("DoesNotRequireAck")
         || s.contains("MessageNotFound")
-        || s.contains("ProofVerificationFailed")
+        || s.contains("ProofInvalid")
         || s.contains("NoMessageDeliveredLogs")
         || s.contains("RelayAlreadySettled")
         || s.contains("UnknownOperation")

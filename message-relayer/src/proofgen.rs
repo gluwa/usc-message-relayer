@@ -151,7 +151,7 @@ impl SingleContinuityResponse {
     }
 
     /// Build the PR #23 `(InclusionProof, ContinuityProof)` pair consumed by
-    /// `RelayerFeeVault.claimDelivery`. The inclusion proof is the self-describing
+    /// `RelayerContract.claimDelivery` and `AcknowledgmentValidator.submitAcknowledgment`. The inclusion proof is the self-describing
     /// `BlockProverTypes.InclusionProof`: `kind = BinaryMerkle` (0), `root` = the transaction-trie
     /// root, and `data = abi.encode(bytes txBytes, MerkleProofEntry[] siblings)` — exactly what
     /// `QueryProofVerificationLib.decodeBinaryMerklePayload` decodes on-chain. The continuity proof
