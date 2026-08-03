@@ -31,7 +31,7 @@ pub const DEFAULT_BLOCK_CONFIRMATION_DEPTH: u64 = 0;
 /// so a message indexed-but-not-finished before a crash would otherwise be skipped forever (the
 /// cursor is already past it and stray votes are dropped by the chain-first allowlist). Re-scanning
 /// a recent window is idempotent: already-delivered messages resolve as "Already validated" at
-/// simulate, already-acknowledged ones are skipped by the requiresAck pre-check.
+/// simulate, already-acknowledged ones are skipped by the canAck pre-check.
 pub const DEFAULT_SCAN_LOOKBACK_BLOCKS: u64 = 600;
 
 // ---------------------------------------------------------------------------

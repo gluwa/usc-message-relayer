@@ -219,7 +219,7 @@ pub async fn run(
     // not skipped; fall back to the current head on first run / when persistence is disabled.
     // The cursor is rewound by `scan_lookback_blocks`: the pending-ack queue is memory-only, so a
     // delivery discovered-but-not-acknowledged before a crash would otherwise be skipped forever.
-    // Re-processing is cheap — already-acked / no-ack-needed txs are skipped by the requiresAck
+    // Re-processing is cheap — already-acked / no-ack-needed txs are skipped by the canAck
     // pre-check before any proof is fetched.
     let mut last_seen = match checkpoint.as_ref().and_then(|c| c.get(&checkpoint_key)) {
         Some(block) => {
@@ -281,7 +281,7 @@ pub async fn run(
                             // from before the oldest unfinished tx and re-discovers it, no matter
                             // how long it was pending. The in-memory cursor keeps advancing, so the
                             // live scan never re-reads; re-discovery on restart is idempotent
-                            // (requiresAck / AlreadyAcknowledged pre-checks).
+                            // (canAck / AlreadyAcknowledged pre-checks).
                             let persist = pending
                                 .oldest_pending_block()
                                 .map_or(last_seen, |b| last_seen.min(b.saturating_sub(1)));
@@ -358,7 +358,7 @@ async fn discover_delivered<P: Provider>(
             );
             continue;
         };
-        // The delivered messageId feeds the requiresAck pre-check on the source Outbox, so bridge
+        // The delivered messageId feeds the canAck pre-check on the source Outbox, so bridge
         // traffic never costs a proof fetch. A tx may carry several MessageDelivered logs.
         let message_id = match IInbox::MessageDelivered::decode_log(&log.inner) {
             Ok(decoded) => decoded.data.messageId,
@@ -608,7 +608,7 @@ async fn relay_claimable_ids<P: Provider>(
 /// Fetch the delivery proof for `tx_hash` and submit it to the source `AcknowledgmentValidator`.
 ///
 /// Before any proof is fetched, the delivered messageIds are checked against the source Outbox:
-/// when none requires an acknowledgment (bridge traffic publishes `requiresAck = false`) or all
+/// when none requires an acknowledgment (bridge traffic publishes `canAck = false`) or all
 /// are already acknowledged, the tx is terminal without costing a proof-gen round-trip or a
 /// guaranteed-revert gas estimate.
 #[allow(clippy::too_many_arguments)]
@@ -636,7 +636,7 @@ async fn acknowledge_tx<P: Provider>(
             match any_requires_ack(source_provider, outbox_addr, message_ids).await {
                 Ok(needed) => needed,
                 Err(err) => {
-                    warn!(chain_key, %tx_hash, %err, "requiresAck pre-check failed; assuming ack needed");
+                    warn!(chain_key, %tx_hash, %err, "canAck pre-check failed; assuming ack needed");
                     true
                 }
             }
@@ -795,7 +795,7 @@ async fn acknowledge_tx<P: Provider>(
 }
 
 /// Whether any of `ids` still needs an acknowledgment on the source Outbox: published with
-/// `requiresAck = true`, known to the outbox (`emitter != 0`), and not yet acknowledged.
+/// `canAck = true`, known to the outbox (`emitter != 0`), and not yet acknowledged.
 async fn any_requires_ack<P: Provider>(
     provider: &P,
     outbox: alloy::primitives::Address,
@@ -804,10 +804,10 @@ async fn any_requires_ack<P: Provider>(
     let outbox = IOutbox::new(outbox, provider);
     for id in ids {
         if !outbox
-            .messageRequiresAck(*id)
+            .messageCanAck(*id)
             .call()
             .await
-            .context("IOutbox.messageRequiresAck call failed")?
+            .context("IOutbox.messageCanAck call failed")?
         {
             // `messageRequiresAck` is false for an unknown id (mapping default), so passing this
             // gate already implies the message exists — no separate existence check needed.
