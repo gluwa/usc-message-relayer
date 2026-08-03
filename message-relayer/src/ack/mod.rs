@@ -849,6 +849,23 @@ fn ack_revert_name(sel: [u8; 4]) -> Option<&'static str> {
 /// plus decoded error names as a fallback.
 fn is_terminal_revert(err: &impl std::fmt::Display) -> bool {
     let s = err.to_string();
+    // NativeTransferFailed is the one revert that is NOT deterministic for a given message: it
+    // means a native send to a recipient failed, which clears when the recipient starts accepting
+    // (or is drained via withdrawNative). The ABI docs promise it stays retryable, and the generic
+    // is_revert() catch-all below would otherwise flip it terminal. Post-#23 contracts defer
+    // failed pushes instead of reverting, so this is a belt-and-braces carve-out for older
+    // deployments and the withdraw path rather than a live code path.
+    if crate::revert::revert_selector(&s)
+        .is_some_and(|sel| sel == crate::abi::IRelayerContract::NativeTransferFailed::SELECTOR)
+        || s.contains("NativeTransferFailed")
+    {
+        return false;
+    }
+    // Any other revert observed at send/estimation time is deterministic for the proof + message
+    // state at hand, so it must be terminal — otherwise e.g. every bridge Release delivery
+    // (MessageDoesNotRequireAck) retries forever. A mined-but-reverted settlement is terminal for
+    // the same reason: the state that made it revert (already settled / already acked) does not
+    // un-happen, and the pre-checks drop that id on the next pass anyway.
     if crate::revert::is_revert(&s) {
         return true;
     }
@@ -882,6 +899,19 @@ mod tests {
         // Decoded-name form (nodes that surface the custom-error name).
         assert!(is_terminal_revert(&"reverted: MessageAlreadyAcknowledged"));
         assert!(is_terminal_revert(&"execution reverted"));
+
+        // NativeTransferFailed is the documented retryable exception: it clears when the recipient
+        // starts accepting native, so it must NOT be terminal — in either the decoded-name form or
+        // the raw-selector form the Creditcoin RPC emits.
+        assert!(!is_terminal_revert(&"reverted: NativeTransferFailed"));
+        let selector_hex = crate::abi::IRelayerContract::NativeTransferFailed::SELECTOR
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        assert!(!is_terminal_revert(&format!(
+            "claimDelivery send failed: VM Exception while processing transaction: revert, data: \
+             \"0x{selector_hex}0000000000000000000000000000000000000000000000000000000000000000\""
+        )));
 
         // Creditcoin EVM RPC form: raw selector data, no decoded name — this is what was slipping
         // through and retrying forever on every bridge Release delivery (MessageDoesNotRequireAck).

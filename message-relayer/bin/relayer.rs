@@ -316,12 +316,27 @@ fn single_route_config(cli: Cli) -> Result<Config> {
         ),
     };
 
-    let relayer_contract_address = cli
-        .relayer_contract_address
+    // Clap's `alias` only covers the long FLAG, not the env var, so the pre-#23
+    // RELAYER_RELAYER_FEE_VAULT_ADDRESS env spelling would otherwise be silently ignored —
+    // existing single-route deployments that still export it would lose funded-gas pinning and
+    // fee claiming with no error. Fall back to it by hand, loudly.
+    let raw_relayer_contract = cli.relayer_contract_address.clone().or_else(|| {
+        std::env::var("RELAYER_RELAYER_FEE_VAULT_ADDRESS")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .inspect(|_| {
+                tracing::warn!(
+                    "RELAYER_RELAYER_FEE_VAULT_ADDRESS is deprecated; rename it to \
+                     RELAYER_RELAYER_CONTRACT_ADDRESS (usc-contracts #23 moved the fee ledger to \
+                     the RelayerContract)"
+                );
+            })
+    });
+    let relayer_contract_address = raw_relayer_contract
         .as_deref()
         .map(|raw| {
             Address::from_str(raw.trim())
-                .with_context(|| format!("invalid --relayer-fee-vault-address: {raw}"))
+                .with_context(|| format!("invalid --relayer-contract-address: {raw}"))
         })
         .transpose()?;
 
