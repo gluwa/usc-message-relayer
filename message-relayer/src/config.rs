@@ -31,7 +31,7 @@ pub const DEFAULT_BLOCK_CONFIRMATION_DEPTH: u64 = 0;
 /// so a message indexed-but-not-finished before a crash would otherwise be skipped forever (the
 /// cursor is already past it and stray votes are dropped by the chain-first allowlist). Re-scanning
 /// a recent window is idempotent: already-delivered messages resolve as "Already validated" at
-/// simulate, already-acknowledged ones are skipped by the requiresAck pre-check.
+/// simulate, already-acknowledged ones are skipped by the canAck pre-check.
 pub const DEFAULT_SCAN_LOOKBACK_BLOCKS: u64 = 600;
 
 // ---------------------------------------------------------------------------
@@ -76,11 +76,15 @@ pub struct ChainRoute {
     pub destination_rpc_url: String,
     pub inbox_address: Address,
     pub signer_key: Option<String>,
-    /// `RelayerFeeVault` on the *source* (Creditcoin) chain. When set, the delivery worker reads
-    /// the funded `gasLimit` for each message and pins the destination `deliverMessage` tx to it,
-    /// so the relayer can later claim its fee (the vault requires the proven delivery tx's gasLimit
-    /// to match a funded tier). `None` falls back to gas estimation (fee not claimable).
-    pub relayer_fee_vault_address: Option<Address>,
+    /// `RelayerContract(Lite)` on the *source* (Creditcoin) chain — the contract holding the
+    /// per-message fee ledger (`getMessageInfo`) and `claimDelivery` since usc-contracts #23 moved
+    /// both off the RelayerFeeVault (the vault holds tokens only now). When set, the delivery
+    /// worker reads the funded `gasLimit` for each message and pins the destination
+    /// `deliverMessage` tx to it, so the relayer can later claim its fee (`claimDelivery` requires
+    /// the proven delivery tx's gasLimit to match a funded tier), and the ack worker additionally
+    /// submits `claimDelivery` for each delivered message. `None` falls back to gas estimation
+    /// (fee not claimable).
+    pub relayer_contract_address: Option<Address>,
     pub block_confirmation_depth: u64,
     /// First block to scan on first run when no persisted checkpoint exists.
     pub start_block: Option<u64>,
@@ -343,8 +347,10 @@ pub struct ChainRouteFile {
     pub inbox_address: String,
     #[serde(default)]
     pub signer_key: Option<String>,
-    #[serde(default)]
-    pub relayer_fee_vault_address: Option<String>,
+    /// Accepts the pre-#23 key `relayer_fee_vault_address` as an alias so existing configs keep
+    /// working; the ledger the relayer talks to is the RelayerContract now.
+    #[serde(default, alias = "relayer_fee_vault_address")]
+    pub relayer_contract_address: Option<String>,
     #[serde(default)]
     pub block_confirmation_depth: u64,
     #[serde(default)]
@@ -469,14 +475,14 @@ impl ChainRouteFile {
             .map(parse_address)
             .transpose()
             .with_context(|| format!("invalid outbox_address for chain_key {}", self.chain_key))?;
-        let relayer_fee_vault_address = self
-            .relayer_fee_vault_address
+        let relayer_contract_address = self
+            .relayer_contract_address
             .as_deref()
             .map(parse_address)
             .transpose()
             .with_context(|| {
                 format!(
-                    "invalid relayer_fee_vault_address for chain_key {}",
+                    "invalid relayer_contract_address for chain_key {}",
                     self.chain_key
                 )
             })?;
@@ -569,7 +575,7 @@ impl ChainRouteFile {
             destination_rpc_url: self.destination_rpc_url,
             inbox_address,
             signer_key: self.signer_key,
-            relayer_fee_vault_address,
+            relayer_contract_address,
             block_confirmation_depth: self.block_confirmation_depth,
             start_block: self.start_block,
             attestor_set,

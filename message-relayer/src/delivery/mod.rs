@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::abi::{IInbox, IRelayerFeeVault};
+use crate::abi::{IInbox, IRelayerContract};
 use crate::config::{ChainRoute, DeliveryConfig};
 use crate::prom::{DeliveryStatus, Metrics};
 use crate::revert::{has_selector, is_revert};
@@ -54,7 +54,7 @@ const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 /// mistaken for a wedged one.
 const HEALTH_TICK: Duration = Duration::from_secs(15);
 
-/// Upper bound on the per-job funded-gas RPC reads (`RelayerFeeVault.getMessageInfo` on the
+/// Upper bound on the per-job funded-gas RPC reads (`RelayerContract.getMessageInfo` on the
 /// source, and the under-funding `estimate_gas` on the destination). Both sit in the serial
 /// worker's critical path, so a stalled RPC must not park the route — on timeout the job degrades
 /// gracefully (estimation fallback / bounded retry) instead of wedging.
@@ -167,9 +167,9 @@ pub async fn run(
             )
         })?;
 
-    // Read-only source-chain provider, only when the fee vault is configured: used to look up each
-    // message's funded `gasLimit` so the delivery tx is pinned to it (see `funded_gas_limit`).
-    let source_provider = match route.relayer_fee_vault_address {
+    // Read-only source-chain provider, only when the relayer contract is configured: used to look
+    // up each message's funded `gasLimit` so the delivery tx is pinned to it (see `funded_gas_limit`).
+    let source_provider = match route.relayer_contract_address {
         Some(_) => Some(
             ProviderBuilder::new()
                 .connect(&creditcoin_eth_rpc_url)
@@ -177,7 +177,7 @@ pub async fn run(
                 .with_context(|| {
                     format!(
                         "chain_key {chain_key}: failed to connect to source EVM RPC at {creditcoin_eth_rpc_url} \
-                         (needed to read funded gasLimit from RelayerFeeVault)"
+                         (needed to read funded gasLimit from the RelayerContract ledger)"
                     )
                 })?,
         ),
@@ -188,7 +188,7 @@ pub async fn run(
         chain_key,
         signer = %signer_address,
         inbox = %route.inbox_address,
-        fee_vault = ?route.relayer_fee_vault_address,
+        relayer_contract = ?route.relayer_contract_address,
         "🚚 delivery worker online"
     );
 
@@ -219,11 +219,11 @@ pub async fn run(
                 // to estimation. The read is bounded by FUNDED_GAS_READ_TIMEOUT: it runs in this
                 // serial worker's critical path, so an unbounded await on a stalled source RPC would
                 // wedge the whole route (and starve the cancel branch) — the same hazard RECEIPT_TIMEOUT guards.
-                let funded_gas = match (&source_provider, route.relayer_fee_vault_address) {
-                    (Some(p), Some(vault)) => {
+                let funded_gas = match (&source_provider, route.relayer_contract_address) {
+                    (Some(p), Some(relayer_contract)) => {
                         match tokio::time::timeout(
                             FUNDED_GAS_READ_TIMEOUT,
-                            funded_gas_limit(p, vault, job.message_id),
+                            funded_gas_limit(p, relayer_contract, job.message_id),
                         ).await {
                             Ok(Ok(g)) => g,
                             Ok(Err(err)) => {
@@ -275,29 +275,29 @@ pub async fn run(
     }
 }
 
-/// Read a message's funded `gasLimit` from the source `RelayerFeeVault`. `Ok(None)` when the
+/// Read a message's funded `gasLimit` from the source `RelayerContract` ledger. `Ok(None)` when the
 /// message has no funded route (payer unset / gasLimit 0) or the value is out of sane range, so
 /// delivery falls back to estimation; `Err` only on an RPC/transport failure (the caller logs and
 /// also falls back).
 async fn funded_gas_limit<P: Provider>(
     source_provider: &P,
-    vault: Address,
+    relayer_contract: Address,
     message_id: B256,
 ) -> Result<Option<u64>> {
-    let fv = IRelayerFeeVault::new(vault, source_provider);
-    let info = fv
+    let ledger = IRelayerContract::new(relayer_contract, source_provider);
+    let info = ledger
         .getMessageInfo(message_id)
         .call()
         .await
-        .context("RelayerFeeVault.getMessageInfo failed")?;
+        .context("RelayerContract.getMessageInfo failed")?;
     if info.gasLimit.is_zero() {
         return Ok(None);
     }
-    // Guard against a misconfigured vault address decoding to junk: an absurd gasLimit would
+    // Guard against a misconfigured contract address decoding to junk: an absurd gasLimit would
     // otherwise pin an unincludable `.gas()` on every delivery. Ignore it and estimate instead.
     if info.gasLimit > alloy::primitives::U256::from(MAX_FUNDED_GAS) {
-        tracing::warn!(%vault, gas_limit = %info.gasLimit,
-            "RelayerFeeVault.getMessageInfo returned an implausible gasLimit; ignoring (will estimate)");
+        tracing::warn!(%relayer_contract, gas_limit = %info.gasLimit,
+            "RelayerContract.getMessageInfo returned an implausible gasLimit; ignoring (will estimate)");
         return Ok(None);
     }
     Ok(Some(info.gasLimit.saturating_to::<u64>()))

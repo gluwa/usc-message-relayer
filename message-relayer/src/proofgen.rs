@@ -13,7 +13,9 @@ use alloy::primitives::{Bytes, B256};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::abi::{ContinuityProof, MerkleProof, MerkleProofEntry};
+use alloy::sol_types::SolValue;
+
+use crate::abi::{ContinuityProof, InclusionProof, MerkleProof, MerkleProofEntry};
 
 /// Minimal HTTP client for the proof-gen API server's `proof-by-tx` endpoint.
 pub struct ProofGenClient {
@@ -147,6 +149,27 @@ impl SingleContinuityResponse {
 
         Ok((merkle, continuity))
     }
+
+    /// Build the PR #23 `(InclusionProof, ContinuityProof)` pair consumed by
+    /// `RelayerContract.claimDelivery` and `AcknowledgmentValidator.submitAcknowledgment`. The inclusion proof is the self-describing
+    /// `BlockProverTypes.InclusionProof`: `kind = BinaryMerkle` (0), `root` = the transaction-trie
+    /// root, and `data = abi.encode(bytes txBytes, MerkleProofEntry[] siblings)` — exactly what
+    /// `QueryProofVerificationLib.decodeBinaryMerklePayload` decodes on-chain. The continuity proof
+    /// is identical to the flat-`MerkleProof` path's ([`to_proofs`](Self::to_proofs)).
+    pub fn to_inclusion_and_continuity(&self) -> Result<(InclusionProof, ContinuityProof)> {
+        let tx_bytes = self.encoded_transaction()?;
+        let (merkle, continuity) = self.to_proofs()?;
+        // `abi.encode(bytes, MerkleProofEntry[])` == `abi_encode_params` of the 2-tuple. The
+        // MerkleProofEntry wire layout (bytes32 + bool) matches BlockProverTypes.MerkleProofEntry, so
+        // the same siblings re-encode without a distinct type.
+        let data = (tx_bytes, merkle.siblings).abi_encode_params();
+        let inclusion = InclusionProof {
+            kind: 0, // BlockProverTypes.ProofKind.BinaryMerkle
+            root: merkle.root,
+            data: data.into(),
+        };
+        Ok((inclusion, continuity))
+    }
 }
 
 fn parse_b256(s: &str) -> Result<B256> {
@@ -191,5 +214,27 @@ mod tests {
         let json = SAMPLE.replace("\"txBytes\": \"0xdeadbeef\",", "");
         let parsed: SingleContinuityResponse = serde_json::from_str(&json).unwrap();
         assert!(parsed.encoded_transaction().is_err());
+    }
+
+    #[test]
+    fn builds_inclusion_proof_and_data_round_trips() {
+        use alloy::primitives::Bytes;
+
+        let parsed: SingleContinuityResponse = serde_json::from_str(SAMPLE).unwrap();
+        let (inclusion, continuity) = parsed.to_inclusion_and_continuity().unwrap();
+
+        // kind = BinaryMerkle (0); root and continuity match the flat-MerkleProof path.
+        assert_eq!(inclusion.kind, 0);
+        let (merkle, _) = parsed.to_proofs().unwrap();
+        assert_eq!(inclusion.root, merkle.root);
+        assert_eq!(continuity.roots.len(), 1);
+
+        // `data` must decode exactly as the on-chain QueryProofVerificationLib expects:
+        // abi.decode(data, (bytes txBytes, MerkleProofEntry[] siblings)).
+        let (tx_bytes, siblings) =
+            <(Bytes, Vec<MerkleProofEntry>)>::abi_decode_params(&inclusion.data).unwrap();
+        assert_eq!(tx_bytes.as_ref(), [0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(siblings.len(), 1);
+        assert!(siblings[0].isLeft);
     }
 }

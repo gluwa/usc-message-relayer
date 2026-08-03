@@ -13,6 +13,21 @@
 //!     `MessageDelivered` logs, and calls `Outbox.acknowledgeMessage` for each — so the relayer
 //!     never needs acknowledge authority; the proof is self-validating.
 //!
+//! ## Relay-fee claiming (`AckAndClaim` mode)
+//!
+//! When the route has a `RelayerContract` configured (`route.relayer_contract_address = Some(..)`),
+//! this same watcher ALSO settles the relay fee: from the same delivery proof it calls
+//! `RelayerContract.claimDelivery(messageId, ..)` per delivered message, which pays the relay fee
+//! (+ any unexpired tip) to the relayer proven in the destination `MessageDelivered` event.
+//!
+//! Since usc-contracts #23 the claim does NOT acknowledge — ack settlement lives solely on the
+//! `AcknowledgmentValidator` — so the two submissions are independent and BOTH run here, ack first:
+//! the message's user-set ackFee is an open bounty paid to the first successful `submitAcknowledgment`
+//! sender (front-runnable by design, Jul 28 decision), while `claimDelivery` pays the proven relayer
+//! no matter who or when submits. Losing the ack race is therefore terminal-but-harmless for the
+//! bounty and never blocks the fee claim. Everything else — the destination watcher, proof-gen
+//! fetch, checkpointing, dedup, and backoff — is shared verbatim between the two settlements.
+//!
 //! Submission is keyed (and deduped) by destination **transaction hash**: one transaction may
 //! contain several `MessageDelivered` logs and the validator acknowledges all of them in a single
 //! call. A transaction whose block is not yet attested returns HTTP 422 (`BlockNotReady`) from the
@@ -21,9 +36,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use alloy::network::EthereumWallet;
-use alloy::primitives::B256;
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::network::{Ethereum, EthereumWallet};
+use alloy::primitives::{Address, B256, U256};
+use alloy::providers::{PendingTransactionBuilder, Provider, ProviderBuilder};
 use alloy::rpc::types::Filter;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::{SolError, SolEvent};
@@ -119,6 +134,19 @@ pub async fn run(
         return Ok(());
     };
 
+    // A route with a RelayerContract configured settles the relay fee via `claimDelivery` IN
+    // ADDITION to the standalone `submitAcknowledgment` — since usc-contracts #23 the claim no
+    // longer bundles the ack, so the two submissions are independent and both must run; see the
+    // module docs. The chain key is passed to `claimDelivery` as `bytes32(uint256(chainKey))`,
+    // matching the ledger's route check.
+    let mode = match route.relayer_contract_address {
+        Some(relayer_contract) => SettlementMode::AckAndClaim {
+            relayer_contract,
+            chain_key: B256::from(U256::from(chain_key)),
+        },
+        None => SettlementMode::Ack,
+    };
+
     // Register with the health watchdog BEFORE any fallible or blocking setup: `Health::status`
     // only inspects components that have registered, so a worker that never called `heartbeat` is
     // invisible to it and counts as healthy. Both connects below, and the `get_block_number` start
@@ -165,20 +193,33 @@ pub async fn run(
 
     let client = ProofGenClient::new(&ack.proof_gen_url)?;
 
-    info!(
-        chain_key,
-        inbox = %route.inbox_address,
-        validator = %ack.validator_address,
-        submitter = %submitter_address,
-        proof_gen_url = %ack.proof_gen_url,
-        "🧾 acknowledgment submitter online"
-    );
+    match &mode {
+        SettlementMode::Ack => info!(
+            chain_key,
+            inbox = %route.inbox_address,
+            validator = %ack.validator_address,
+            submitter = %submitter_address,
+            proof_gen_url = %ack.proof_gen_url,
+            "🧾 acknowledgment submitter online (ack mode)"
+        ),
+        SettlementMode::AckAndClaim {
+            relayer_contract, ..
+        } => info!(
+            chain_key,
+            inbox = %route.inbox_address,
+            validator = %ack.validator_address,
+            relayer_contract = %relayer_contract,
+            submitter = %submitter_address,
+            proof_gen_url = %ack.proof_gen_url,
+            "💰 settlement submitter online (ack + relay-fee claim; independent since usc-contracts #23)"
+        ),
+    }
 
     // Resume from the persisted cursor so MessageDelivered events emitted while we were down are
     // not skipped; fall back to the current head on first run / when persistence is disabled.
     // The cursor is rewound by `scan_lookback_blocks`: the pending-ack queue is memory-only, so a
     // delivery discovered-but-not-acknowledged before a crash would otherwise be skipped forever.
-    // Re-processing is cheap — already-acked / no-ack-needed txs are skipped by the requiresAck
+    // Re-processing is cheap — already-acked / no-ack-needed txs are skipped by the canAck
     // pre-check before any proof is fetched.
     let mut last_seen = match checkpoint.as_ref().and_then(|c| c.get(&checkpoint_key)) {
         Some(block) => {
@@ -240,7 +281,7 @@ pub async fn run(
                             // from before the oldest unfinished tx and re-discovers it, no matter
                             // how long it was pending. The in-memory cursor keeps advancing, so the
                             // live scan never re-reads; re-discovery on restart is idempotent
-                            // (requiresAck / AlreadyAcknowledged pre-checks).
+                            // (canAck / AlreadyAcknowledged pre-checks).
                             let persist = pending
                                 .oldest_pending_block()
                                 .map_or(last_seen, |b| last_seen.min(b.saturating_sub(1)));
@@ -255,6 +296,7 @@ pub async fn run(
                 process_pending(
                     chain_key,
                     &ack,
+                    &mode,
                     route.outbox_address,
                     &client,
                     &source_provider,
@@ -316,7 +358,7 @@ async fn discover_delivered<P: Provider>(
             );
             continue;
         };
-        // The delivered messageId feeds the requiresAck pre-check on the source Outbox, so bridge
+        // The delivered messageId feeds the canAck pre-check on the source Outbox, so bridge
         // traffic never costs a proof fetch. A tx may carry several MessageDelivered logs.
         let message_id = match IInbox::MessageDelivered::decode_log(&log.inner) {
             Ok(decoded) => decoded.data.messageId,
@@ -354,6 +396,7 @@ async fn discover_delivered<P: Provider>(
 async fn process_pending<P: Provider>(
     chain_key: u64,
     ack: &AckConfig,
+    mode: &SettlementMode,
     outbox: Option<alloy::primitives::Address>,
     client: &ProofGenClient,
     source_provider: &P,
@@ -378,6 +421,7 @@ async fn process_pending<P: Provider>(
             let outcome = acknowledge_tx(
                 chain_key,
                 ack,
+                mode,
                 outbox,
                 &message_ids,
                 client,
@@ -397,7 +441,7 @@ async fn process_pending<P: Provider>(
     for (tx_hash, outcome) in results {
         match outcome {
             Ok(AckOutcome::Acknowledged) => {
-                info!(chain_key, %tx_hash, "✅ delivery acknowledged on source Outbox");
+                info!(chain_key, %tx_hash, "✅ delivery settled on source chain");
                 pending.remove(&tx_hash);
                 done.insert(tx_hash);
             }
@@ -458,8 +502,28 @@ async fn process_pending<P: Provider>(
     }
 }
 
+/// What this worker submits once a delivery proof is ready — chosen per route in [`run`].
+#[derive(Clone, Copy, Debug)]
+enum SettlementMode {
+    /// No RelayerContract on the route: prove delivery to the `AcknowledgmentValidator` only
+    /// (`submitAcknowledgment`, one call per tx — the validator acks every `MessageDelivered` log
+    /// under try/catch). The validator address comes from `ack.validator_address`.
+    Ack,
+    /// The route has a `RelayerContract` (fee ledger): submit BOTH settlements from one proof —
+    /// `submitAcknowledgment` (which also earns the message's user-set ackFee, an open bounty paid
+    /// to the first submitter) and `claimDelivery` per messageId (relay fee + tip, always paid to
+    /// the proven relayer). Since usc-contracts #23 the claim does NOT acknowledge, so skipping
+    /// either call would leave messages unacknowledged or fees unclaimed. `chain_key` is passed to
+    /// `claimDelivery` as `bytes32(uint256(chainKey))`.
+    AckAndClaim {
+        relayer_contract: Address,
+        chain_key: B256,
+    },
+}
+
 enum AckOutcome {
-    /// Proof verified and `acknowledgeMessage` succeeded.
+    /// Proof verified and the settlement call (`submitAcknowledgment` / `claimDelivery`) succeeded
+    /// or was already terminal for every message — either way the tx is resolved.
     Acknowledged,
     /// The proof block is not yet attested (`BlockNotReady`); retry later.
     NotReady,
@@ -467,87 +531,27 @@ enum AckOutcome {
     Terminal(String),
 }
 
-/// Fetch the delivery proof for `tx_hash` and submit it to the source `AcknowledgmentValidator`.
-///
-/// Before any proof is fetched, the delivered messageIds are checked against the source Outbox:
-/// when none requires an acknowledgment (bridge traffic publishes `requiresAck = false`) or all
-/// are already acknowledged, the tx is terminal without costing a proof-gen round-trip or a
-/// guaranteed-revert gas estimate.
-#[allow(clippy::too_many_arguments)]
-async fn acknowledge_tx<P: Provider>(
-    chain_key: u64,
-    ack: &AckConfig,
-    outbox: Option<alloy::primitives::Address>,
-    message_ids: &[B256],
-    client: &ProofGenClient,
-    source_provider: &P,
-    submitter_address: alloy::primitives::Address,
-    broadcast_locks: &Arc<crate::broadcast::BroadcastLocks>,
-    tx_hash: B256,
-) -> Result<AckOutcome> {
-    // Fail open: if the view calls error we fall through to the proof path — the validator
-    // enforces the same rules on-chain, this is purely a cost-saving shortcut.
-    if let Some(outbox_addr) = outbox {
-        if !message_ids.is_empty() {
-            match any_requires_ack(source_provider, outbox_addr, message_ids).await {
-                Ok(false) => {
-                    return Ok(AckOutcome::Terminal(
-                        "no delivered message requires acknowledgment (requiresAck=false or \
-                         already acknowledged)"
-                            .into(),
-                    ));
-                }
-                Ok(true) => {}
-                Err(err) => {
-                    warn!(chain_key, %tx_hash, %err, "requiresAck pre-check failed; proceeding with proof");
-                }
-            }
-        }
-    }
+/// Result of one confirmed-or-terminal on-chain submission; transient failures are `Err` (retryable).
+enum SubmitOutcome {
+    /// Mined successfully. Fields are the on-chain gas cost, recorded via Display (`%`) because
+    /// `tracing` has no native u128 value impl.
+    Confirmed {
+        gas_used: u128,
+        effective_gas_price: u128,
+        gas_cost_wei: u128,
+        tx_hash: B256,
+    },
+    /// A permanent on-chain condition (revert: already settled / does not require ack / reverted).
+    Terminal(String),
+}
 
-    let proof = match client.proof_by_tx(chain_key, tx_hash).await? {
-        ProofFetch::Ready(p) => p,
-        ProofFetch::NotReady => return Ok(AckOutcome::NotReady),
-    };
-
-    let encoded_tx = proof.encoded_transaction()?;
-
-    // Mirror the on-chain cap: an oversized encodedTransaction is rejected by submitAcknowledgment
-    // (EncodedTransactionTooLarge), so skip it before spending gas on a guaranteed revert. This is a
-    // permanent condition for this proof, hence Terminal (no retry).
-    if encoded_tx.len() > MAX_ENCODED_TRANSACTION_BYTES {
-        return Ok(AckOutcome::Terminal(format!(
-            "encodedTransaction {} bytes exceeds on-chain max {} bytes",
-            encoded_tx.len(),
-            MAX_ENCODED_TRANSACTION_BYTES
-        )));
-    }
-
-    let (merkle_proof, continuity_proof) = proof.to_proofs()?;
-    let height = proof.header_number;
-
-    let validator =
-        crate::abi::IAcknowledgmentValidator::new(ack.validator_address, source_provider);
-
-    // Serialized on the submitter address so this tick's concurrent sends (and any other worker
-    // sharing this Creditcoin key) cannot read the same chain nonce. The guard covers the broadcast
-    // only — the receipt is awaited below, outside it, so one confirmation does not stall the batch.
-    // A stall consumes no nonce, so it is reported as transient and retried (idempotently: a
-    // duplicate lands as `MessageAlreadyAcknowledged`).
-    let pending_tx = match broadcast_locks
-        .broadcast(
-            submitter_address,
-            SEND_TIMEOUT,
-            validator
-                .submitAcknowledgment(height, encoded_tx, merkle_proof, continuity_proof)
-                .send(),
-        )
-        .await
-    {
-        Ok(res) => res,
-        Err(stalled) => return Err(anyhow!("submitAcknowledgment {stalled}")),
-    };
-
+/// Await a broadcast result and classify it, shared by both submit paths so the receipt-wait, revert
+/// classification, and gas accounting cannot drift between ack and claim. `Err` is a transient
+/// failure the caller should retry; `Ok(Terminal)` is permanent. `call` names the call for logs.
+async fn classify_submit(
+    pending_tx: Result<PendingTransactionBuilder<Ethereum>, alloy::contract::Error>,
+    call: &str,
+) -> Result<SubmitOutcome> {
     match pending_tx {
         // `crate::receipt::await_receipt` instead of `builder.get_receipt()`: the latter runs on
         // alloy's block-decoding heartbeat, which wedges against Frontier's mixHash-less blocks
@@ -557,40 +561,241 @@ async fn acknowledge_tx<P: Provider>(
                 .await
             {
                 Err(_elapsed) => Err(anyhow!(
-                    "no receipt within {RECEIPT_TIMEOUT:?} (ack tx possibly stuck)"
+                    "no receipt within {RECEIPT_TIMEOUT:?} ({call} tx possibly stuck)"
                 )),
-                Ok(receipt_result) => match receipt_result {
-                    Ok(receipt) if receipt.status() => {
-                        // Report the on-chain gas cost of the submitAcknowledgment call.
-                        // gas_used is cast to u128 so the arithmetic is valid regardless of
-                        // the receipt's integer width; the wide-integer fields are recorded
-                        // via Display (`%`) because `tracing` has no native u128 Value impl.
-                        let gas_used = u128::from(receipt.gas_used);
-                        let effective_gas_price = receipt.effective_gas_price;
-                        let gas_cost_wei = gas_used.saturating_mul(effective_gas_price);
-                        info!(
-                            chain_key,
-                            %tx_hash,
-                            ack_tx_hash = %receipt.transaction_hash,
-                            gas_used = %gas_used,
-                            effective_gas_price_wei = %effective_gas_price,
-                            gas_cost_wei = %gas_cost_wei,
-                            "submitAcknowledgment confirmed",
-                        );
-                        Ok(AckOutcome::Acknowledged)
-                    }
-                    Ok(_) => Ok(AckOutcome::Terminal("tx mined but reverted".into())),
-                    Err(err) => Err(anyhow!("receipt fetch failed: {err}")),
-                },
+                Ok(Ok(receipt)) if receipt.status() => {
+                    let gas_used = u128::from(receipt.gas_used);
+                    let effective_gas_price = receipt.effective_gas_price;
+                    Ok(SubmitOutcome::Confirmed {
+                        gas_used,
+                        effective_gas_price,
+                        gas_cost_wei: gas_used.saturating_mul(effective_gas_price),
+                        tx_hash: receipt.transaction_hash,
+                    })
+                }
+                Ok(Ok(_)) => Ok(SubmitOutcome::Terminal("tx mined but reverted".into())),
+                Ok(Err(err)) => Err(anyhow!("receipt fetch failed: {err}")),
             }
         }
-        Err(err) if is_terminal_revert(&err) => Ok(AckOutcome::Terminal(describe_revert(&err))),
-        Err(err) => Err(anyhow!("submitAcknowledgment send failed: {err}")),
+        Err(err) if is_terminal_revert(&err) => Ok(SubmitOutcome::Terminal(describe_revert(&err))),
+        Err(err) => Err(anyhow!("{call} send failed: {err}")),
     }
 }
 
+/// MessageIds in `ids` whose relay fee is still claimable: funded through the RelayerContract
+/// ledger (`payer != 0`) and not yet settled. Empty means nothing to claim for this tx. Traffic
+/// funded outside the relayer (e.g. bridge messages) reports `payer == 0` and is skipped.
+async fn relay_claimable_ids<P: Provider>(
+    provider: &P,
+    relayer_contract: Address,
+    ids: &[B256],
+) -> Result<Vec<B256>> {
+    let ledger = crate::abi::IRelayerContract::new(relayer_contract, provider);
+    let mut claimable = Vec::new();
+    for id in ids {
+        let info = ledger
+            .getMessageInfo(*id)
+            .call()
+            .await
+            .context("IRelayerContract.getMessageInfo call failed")?;
+        if info.payer != Address::ZERO && !info.relaySettled {
+            claimable.push(*id);
+        }
+    }
+    Ok(claimable)
+}
+
+/// Fetch the delivery proof for `tx_hash` and submit it to the source `AcknowledgmentValidator`.
+///
+/// Before any proof is fetched, the delivered messageIds are checked against the source Outbox:
+/// when none requires an acknowledgment (bridge traffic publishes `canAck = false`) or all
+/// are already acknowledged, the tx is terminal without costing a proof-gen round-trip or a
+/// guaranteed-revert gas estimate.
+#[allow(clippy::too_many_arguments)]
+async fn acknowledge_tx<P: Provider>(
+    chain_key: u64,
+    ack: &AckConfig,
+    mode: &SettlementMode,
+    outbox: Option<alloy::primitives::Address>,
+    message_ids: &[B256],
+    client: &ProofGenClient,
+    source_provider: &P,
+    submitter_address: alloy::primitives::Address,
+    broadcast_locks: &Arc<crate::broadcast::BroadcastLocks>,
+    tx_hash: B256,
+) -> Result<AckOutcome> {
+    // Pre-checks: skip the proof fetch entirely when nothing is left to do. Both checks fail
+    // open — a view-call error falls through to the proof path, where the contracts enforce the
+    // same rules on-chain; this is purely a cost-saving shortcut. The two settlements are
+    // independent (usc-contracts #23: `claimDelivery` no longer acknowledges), so the tx is only
+    // terminal when NEITHER an ack nor a claim remains outstanding.
+    let needs_ack: bool = if let Some(outbox_addr) = outbox {
+        if message_ids.is_empty() {
+            true // discovery always records ids; treat the impossible case fail-open
+        } else {
+            match any_requires_ack(source_provider, outbox_addr, message_ids).await {
+                Ok(needed) => needed,
+                Err(err) => {
+                    warn!(chain_key, %tx_hash, %err, "canAck pre-check failed; assuming ack needed");
+                    true
+                }
+            }
+        }
+    } else {
+        true // no Outbox view configured — let the validator decide on-chain
+    };
+
+    let claim_ids: Vec<B256> = match mode {
+        SettlementMode::Ack => Vec::new(),
+        SettlementMode::AckAndClaim {
+            relayer_contract, ..
+        } => match relay_claimable_ids(source_provider, *relayer_contract, message_ids).await {
+            Ok(ids) => ids,
+            Err(err) => {
+                warn!(chain_key, %tx_hash, %err, "relay-claimable pre-check failed; attempting all ids");
+                message_ids.to_vec()
+            }
+        },
+    };
+
+    if !needs_ack && claim_ids.is_empty() {
+        return Ok(AckOutcome::Terminal(
+            "nothing left to settle (no message requires an ack, no unsettled relay fee)".into(),
+        ));
+    }
+
+    let proof = match client.proof_by_tx(chain_key, tx_hash).await? {
+        ProofFetch::Ready(p) => p,
+        ProofFetch::NotReady => return Ok(AckOutcome::NotReady),
+    };
+
+    let encoded_tx = proof.encoded_transaction()?;
+
+    // Mirror the on-chain cap: an oversized prover txBytes payload is rejected on-chain
+    // (EncodedTransactionTooLarge) — the bytes now travel inside `inclusionProof.data`, but the cap
+    // is enforced on the same decoded length — so skip it before spending gas on a guaranteed
+    // revert. Permanent for this proof, hence Terminal (no retry).
+    if encoded_tx.len() > MAX_ENCODED_TRANSACTION_BYTES {
+        return Ok(AckOutcome::Terminal(format!(
+            "encodedTransaction {} bytes exceeds on-chain max {} bytes",
+            encoded_tx.len(),
+            MAX_ENCODED_TRANSACTION_BYTES
+        )));
+    }
+
+    let height = proof.header_number;
+
+    // Serialized on the submitter address so this tick's concurrent sends (and any other worker
+    // sharing this Creditcoin key) cannot read the same chain nonce. The guard (inside `broadcast`)
+    // covers the broadcast only — the receipt is awaited in `classify_submit`, outside it, so one
+    // confirmation does not stall the batch. A stall consumes no nonce, so it is reported as
+    // transient and retried (idempotently: a duplicate lands as `MessageAlreadyAcknowledged` /
+    // `RelayAlreadySettled`).
+    //
+    // Ack FIRST, claim second: the ack fee is an open bounty paid to the first successful
+    // submitter (front-runnable by design), while the relay-fee claim always pays the proven
+    // relayer no matter who or when submits — so the time-sensitive settlement goes first.
+    // A transient failure anywhere aborts the whole tx for retry; both settlements are idempotent
+    // on-chain, and the pre-checks drop already-settled work on the retry, so retries converge.
+    if needs_ack {
+        let (inclusion, continuity) = proof.to_inclusion_and_continuity()?;
+        let validator =
+            crate::abi::IAcknowledgmentValidator::new(ack.validator_address, source_provider);
+        let pending_tx = match broadcast_locks
+            .broadcast(
+                submitter_address,
+                SEND_TIMEOUT,
+                validator
+                    .submitAcknowledgment(height, inclusion, continuity)
+                    .send(),
+            )
+            .await
+        {
+            Ok(res) => res,
+            Err(stalled) => return Err(anyhow!("submitAcknowledgment {stalled}")),
+        };
+        match classify_submit(pending_tx, "submitAcknowledgment").await? {
+            SubmitOutcome::Confirmed {
+                gas_used,
+                effective_gas_price,
+                gas_cost_wei,
+                tx_hash: settle_tx,
+            } => {
+                info!(
+                    chain_key,
+                    %tx_hash,
+                    ack_tx_hash = %settle_tx,
+                    gas_used = %gas_used,
+                    effective_gas_price_wei = %effective_gas_price,
+                    gas_cost_wei = %gas_cost_wei,
+                    "submitAcknowledgment confirmed (ack fee, if any, paid to this submitter)",
+                );
+            }
+            // Terminal here (e.g. NoMessageDeliveredLogs because another submitter front-ran the
+            // bounty and every log is now already-acked) must not block the relay-fee claim below —
+            // the claim pays the proven relayer regardless of who acknowledged.
+            SubmitOutcome::Terminal(reason) => {
+                info!(chain_key, %tx_hash, %reason, "submitAcknowledgment terminal; continuing to claim");
+            }
+        }
+    }
+
+    // One claimDelivery per messageId (the ledger settles a single message per call, unlike the
+    // validator which acks every log in one tx). A tx usually carries one delivery, so the proof
+    // structs are rebuilt per id rather than cloned.
+    if let SettlementMode::AckAndClaim {
+        relayer_contract,
+        chain_key: ck,
+    } = mode
+    {
+        let ledger = crate::abi::IRelayerContract::new(*relayer_contract, source_provider);
+        for id in &claim_ids {
+            let (inclusion, continuity) = proof.to_inclusion_and_continuity()?;
+            let pending_tx = match broadcast_locks
+                .broadcast(
+                    submitter_address,
+                    SEND_TIMEOUT,
+                    ledger
+                        .claimDelivery(*id, *ck, height, inclusion, continuity)
+                        .send(),
+                )
+                .await
+            {
+                Ok(res) => res,
+                Err(stalled) => return Err(anyhow!("claimDelivery {stalled}")),
+            };
+            match classify_submit(pending_tx, "claimDelivery").await? {
+                SubmitOutcome::Confirmed {
+                    gas_used,
+                    effective_gas_price,
+                    gas_cost_wei,
+                    tx_hash: settle_tx,
+                } => info!(
+                    chain_key,
+                    %tx_hash,
+                    message_id = %id,
+                    claim_tx_hash = %settle_tx,
+                    gas_used = %gas_used,
+                    effective_gas_price_wei = %effective_gas_price,
+                    gas_cost_wei = %gas_cost_wei,
+                    "claimDelivery confirmed (relay fee settled to proven relayer)",
+                ),
+                SubmitOutcome::Terminal(reason) => info!(
+                    chain_key,
+                    %tx_hash,
+                    message_id = %id,
+                    %reason,
+                    "claimDelivery skipped for message (terminal)",
+                ),
+            }
+        }
+    }
+
+    Ok(AckOutcome::Acknowledged)
+}
+
 /// Whether any of `ids` still needs an acknowledgment on the source Outbox: published with
-/// `requiresAck = true`, known to the outbox (`emitter != 0`), and not yet acknowledged.
+/// `canAck = true`, known to the outbox (`emitter != 0`), and not yet acknowledged.
 async fn any_requires_ack<P: Provider>(
     provider: &P,
     outbox: alloy::primitives::Address,
@@ -599,10 +804,10 @@ async fn any_requires_ack<P: Provider>(
     let outbox = IOutbox::new(outbox, provider);
     for id in ids {
         if !outbox
-            .messageRequiresAck(*id)
+            .messageCanAck(*id)
             .call()
             .await
-            .context("IOutbox.messageRequiresAck call failed")?
+            .context("IOutbox.messageCanAck call failed")?
         {
             // `messageRequiresAck` is false for an unknown id (mapping default), so passing this
             // gate already implies the message exists — no separate existence check needed.
@@ -624,13 +829,15 @@ async fn any_requires_ack<P: Provider>(
 /// (Creditcoin's EVM RPC returns raw selector data with no decoded name). Selectors come from the
 /// shared [`write_ability::abi`] `sol!` declarations, so they cannot drift from the contracts.
 fn ack_revert_name(sel: [u8; 4]) -> Option<&'static str> {
-    use crate::abi::{IAcknowledgmentValidator as V, IOutbox as O};
+    use crate::abi::{IAcknowledgmentValidator as V, IOutbox as O, IRelayerContract as RC};
     Some(match sel {
         s if s == O::MessageDoesNotRequireAck::SELECTOR => "MessageDoesNotRequireAck",
         s if s == O::MessageAlreadyAcknowledged::SELECTOR => "MessageAlreadyAcknowledged",
         s if s == O::MessageNotFound::SELECTOR => "MessageNotFound",
-        s if s == V::ProofVerificationFailed::SELECTOR => "ProofVerificationFailed",
+        s if s == V::ProofInvalid::SELECTOR => "ProofInvalid",
         s if s == V::NoMessageDeliveredLogs::SELECTOR => "NoMessageDeliveredLogs",
+        s if s == RC::RelayAlreadySettled::SELECTOR => "RelayAlreadySettled",
+        s if s == RC::UnknownOperation::SELECTOR => "UnknownOperation",
         _ => return None,
     })
 }
@@ -650,8 +857,10 @@ fn is_terminal_revert(err: &impl std::fmt::Display) -> bool {
     s.contains("AlreadyAcknowledged")
         || s.contains("DoesNotRequireAck")
         || s.contains("MessageNotFound")
-        || s.contains("ProofVerificationFailed")
+        || s.contains("ProofInvalid")
         || s.contains("NoMessageDeliveredLogs")
+        || s.contains("RelayAlreadySettled")
+        || s.contains("UnknownOperation")
 }
 
 /// Prefix a terminal revert with the decoded error name when the selector is recognized, so the

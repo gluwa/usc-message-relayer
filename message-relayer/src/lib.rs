@@ -243,7 +243,23 @@ impl Server {
 
         // Acknowledgment submitters (per route, opt-in). Each watches the destination Inbox for
         // `MessageDelivered`, fetches a native USC delivery proof, and submits it to the
-        // source-chain `AcknowledgmentValidator`. Routes without `ack` config are skipped.
+        // source-chain `AcknowledgmentValidator` — and, when the route has a RelayerContract
+        // configured, additionally submits `RelayerContract.claimDelivery` for the relay fee (the
+        // two settlements are independent since usc-contracts #23; the claim no longer acks).
+        // Routes without `ack` config are skipped, so a relayer contract configured without an
+        // `ack` block would silently never claim — warn on that misconfiguration.
+        for route in self
+            .config
+            .routes
+            .iter()
+            .filter(|r| r.relayer_contract_address.is_some() && r.ack.is_none())
+        {
+            tracing::warn!(
+                chain_key = route.chain_key,
+                "route has a relayer_contract_address but no `ack` config; relay-fee claiming \
+                 (claimDelivery) will NOT run — add an `ack` block to enable it"
+            );
+        }
         for route in self.config.routes.iter().filter(|r| r.ack.is_some()) {
             spawn_worker(
                 &mut tasks,

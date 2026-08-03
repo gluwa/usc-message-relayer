@@ -98,12 +98,19 @@ struct Cli {
     #[arg(long, env = "RELAYER_THRESHOLD_OVERRIDE", required = false)]
     threshold_override: Option<u32>,
 
-    /// `RelayerFeeVault` on the Creditcoin (source) chain. When set, the delivery worker pins each
-    /// `deliverMessage` tx to the message's funded `gasLimit` so the relayer can later claim its
-    /// fee (the vault requires the proven delivery gasLimit to match a funded tier). Omit on
-    /// routes without the fee flow.
-    #[arg(long, env = "RELAYER_RELAYER_FEE_VAULT_ADDRESS", required = false)]
-    relayer_fee_vault_address: Option<String>,
+    /// `RelayerContract(Lite)` on the Creditcoin (source) chain — the fee ledger (usc-contracts
+    /// #23 moved `getMessageInfo`/`claimDelivery` off the RelayerFeeVault). When set, the delivery
+    /// worker pins each `deliverMessage` tx to the message's funded `gasLimit`, and the ack worker
+    /// additionally claims the relay fee. Omit on routes without the fee flow. The old
+    /// `--relayer-fee-vault-address` / RELAYER_RELAYER_FEE_VAULT_ADDRESS spelling is kept as an
+    /// alias for existing deployments.
+    #[arg(
+        long,
+        env = "RELAYER_RELAYER_CONTRACT_ADDRESS",
+        alias = "relayer-fee-vault-address",
+        required = false
+    )]
+    relayer_contract_address: Option<String>,
 
     // ---------- acknowledgment submitter (opt-in; all three required to enable) ---------------
     /// Proof-gen API base URL (e.g. `http://127.0.0.1:8080`). Enables the ack submitter when set
@@ -309,8 +316,8 @@ fn single_route_config(cli: Cli) -> Result<Config> {
         ),
     };
 
-    let relayer_fee_vault_address = cli
-        .relayer_fee_vault_address
+    let relayer_contract_address = cli
+        .relayer_contract_address
         .as_deref()
         .map(|raw| {
             Address::from_str(raw.trim())
@@ -325,7 +332,7 @@ fn single_route_config(cli: Cli) -> Result<Config> {
         destination_rpc_url,
         inbox_address,
         signer_key: cli.signer_key,
-        relayer_fee_vault_address,
+        relayer_contract_address,
         block_confirmation_depth: DEFAULT_BLOCK_CONFIRMATION_DEPTH,
         start_block: None,
         attestor_set: AttestorSet::Static(attestor_addresses),
