@@ -77,7 +77,15 @@ struct RouteState {
 /// the update digest, and the recovered signer if (and only if) the vote is aggregatable: nonce
 /// matches, the signature is canonical + recovers over the digest, and the signer is a current
 /// attestor. Pure (no I/O) so the aggregation rules are unit-testable.
-fn verify_vote(vote: &SetUpdateVote, current: &OnChain) -> Option<(Vec<Address>, B256, Address)> {
+///
+/// `validator` comes from local route config, never from the vote: the contract binds its own
+/// address into the preimage, and trusting a peer-supplied address would let anyone redirect
+/// aggregation at an arbitrary contract.
+fn verify_vote(
+    vote: &SetUpdateVote,
+    validator: Address,
+    current: &OnChain,
+) -> Option<(Vec<Address>, B256, Address)> {
     let nonce = U256::from_be_bytes(vote.nonce);
     if nonce != current.nonce {
         // Stale (an update already landed) or ahead of what we've observed — not aggregatable now.
@@ -91,7 +99,7 @@ fn verify_vote(vote: &SetUpdateVote, current: &OnChain) -> Option<(Vec<Address>,
     // Recompute the digest over the CANONICAL order — the exact bytes the attestor signed. A vote
     // whose array isn't canonical simply won't recover to a current attestor and is dropped.
     let canonical = canonical_attestor_order(&proposed);
-    let digest = attestor_set_update_digest(&canonical, current.chain_id, nonce);
+    let digest = attestor_set_update_digest(validator, &canonical, current.chain_id, nonce);
     let signer = recover_signer(&digest, &vote.signature).ok()?;
     if !current.attestors.contains(&signer) {
         return None;
@@ -200,7 +208,7 @@ async fn handle_vote(
         );
         return;
     };
-    let Some((canonical, digest, signer)) = verify_vote(&vote, &current) else {
+    let Some((canonical, digest, signer)) = verify_vote(&vote, state.validator, &current) else {
         debug!(
             chain_key = vote.chain_key,
             "set-update vote failed validation — dropping"
@@ -338,6 +346,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::address;
     use alloy::signers::SignerSync;
 
     fn onchain(attestors: &[Address], threshold: usize, nonce: u64, chain_id: u64) -> OnChain {
@@ -349,6 +358,9 @@ mod tests {
         }
     }
 
+    /// Validator every test signs for; `verify_vote` must be given the same one to aggregate.
+    const TEST_VALIDATOR: Address = address!("00000000000000000000000000000000000000e1");
+
     /// Build a valid set-update vote signed by `signer` over the canonical digest.
     fn signed_vote(
         signer: &PrivateKeySigner,
@@ -358,8 +370,12 @@ mod tests {
         chain_id: u64,
     ) -> SetUpdateVote {
         let canonical = canonical_attestor_order(new_attestors);
-        let digest =
-            attestor_set_update_digest(&canonical, U256::from(chain_id), U256::from(nonce));
+        let digest = attestor_set_update_digest(
+            TEST_VALIDATOR,
+            &canonical,
+            U256::from(chain_id),
+            U256::from(nonce),
+        );
         let sig = signer.sign_hash_sync(&digest).unwrap();
         SetUpdateVote {
             chain_key,
@@ -384,12 +400,18 @@ mod tests {
         let current = onchain(&[s.address()], 1, 5, 11_155_111);
         let vote = signed_vote(&s, 2, &new_set, 5, 11_155_111);
 
-        let (canonical, digest, signer) = verify_vote(&vote, &current).expect("valid vote");
+        let (canonical, digest, signer) =
+            verify_vote(&vote, TEST_VALIDATOR, &current).expect("valid vote");
         assert_eq!(signer, s.address());
         assert_eq!(canonical, canonical_attestor_order(&new_set));
         assert_eq!(
             digest,
-            attestor_set_update_digest(&canonical, U256::from(11_155_111u64), U256::from(5u64))
+            attestor_set_update_digest(
+                TEST_VALIDATOR,
+                &canonical,
+                U256::from(11_155_111u64),
+                U256::from(5u64)
+            )
         );
     }
 
@@ -398,7 +420,7 @@ mod tests {
         let s = key(7);
         let current = onchain(&[addr(0x01)], 1, 5, 1); // s is NOT in the set
         let vote = signed_vote(&s, 2, &[addr(0xaa)], 5, 1);
-        assert!(verify_vote(&vote, &current).is_none());
+        assert!(verify_vote(&vote, TEST_VALIDATOR, &current).is_none());
     }
 
     #[test]
@@ -406,7 +428,7 @@ mod tests {
         let s = key(7);
         let current = onchain(&[s.address()], 1, 6, 1); // on-chain nonce advanced to 6
         let vote = signed_vote(&s, 2, &[addr(0xaa)], 5, 1); // signed against 5
-        assert!(verify_vote(&vote, &current).is_none());
+        assert!(verify_vote(&vote, TEST_VALIDATOR, &current).is_none());
     }
 
     #[test]
@@ -414,6 +436,6 @@ mod tests {
         let s = key(7);
         let current = onchain(&[s.address()], 1, 5, 999); // on-chain chain id differs
         let vote = signed_vote(&s, 2, &[addr(0xaa)], 5, 1);
-        assert!(verify_vote(&vote, &current).is_none());
+        assert!(verify_vote(&vote, TEST_VALIDATOR, &current).is_none());
     }
 }
