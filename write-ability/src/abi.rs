@@ -63,7 +63,9 @@ sol! {
         /// Reverts bubbled up through `AcknowledgmentValidator.submitAcknowledgment` when it calls
         /// `acknowledgeMessage` here. All three are permanent for a given delivery tx — the ack
         /// submitter classifies them as terminal (see `message-relayer/src/ack`).
-        error MessageDoesNotRequireAck(bytes32 messageId);
+        /// `MessageCannotBeAcknowledged` is the post-#23 name of `MessageDoesNotRequireAck`
+        /// (`canAck == false`); the abi_surface drift test caught the stale selector.
+        error MessageCannotBeAcknowledged(bytes32 messageId);
         error MessageNotFound(bytes32 messageId);
         error MessageAlreadyAcknowledged(bytes32 messageId);
     }
@@ -88,13 +90,6 @@ sol! {
         /// retryable via `retryPendingMessage`. Mirrors `SimpleInbox.isPending`.
         function isPending(bytes32 messageId) external view returns (bool);
 
-        /// Pure check used by the relayer to simulate before paying gas. Reverts if the votes
-        /// are malformed, below threshold, or signed by unauthorized signers.
-        function validateVotes(bytes32 messageHash, bytes calldata votes)
-            external
-            view
-            returns (bool);
-
         /// Emitted when `deliverMessage`'s dApp callback succeeds. `processor` is the vote
         /// validator that authorized delivery; `relayer` is the `msg.sender` that delivered.
         /// Only `messageId` (topics[1]) is read; the two addresses are ignored. The 3-arg shape
@@ -107,41 +102,24 @@ sol! {
         );
         /// Emitted (on a **successful** `deliverMessage` tx) when the votes validated but the
         /// dApp's `receiveMessage` callback reverted — the message is stored for
-        /// `retryPendingMessage`. Signature must match `SimpleInbox.MessagePending` exactly or
-        /// receipt-log classification silently misses it.
-        event MessagePending(bytes32 indexed messageId, address indexed destinationContract);
+        /// `retryPendingMessage`. Signature must match `Inbox.MessagePending` exactly or
+        /// receipt-log classification silently misses it: the 2-arg shape from the retired
+        /// SimpleInbox had exactly that effect (caught by the abi_surface drift test). Only
+        /// `messageId` (topics[1]) is read; `relayer` (the delivery-fee payee, see
+        /// `IDeliveryDecoder`) is ignored here.
+        event MessagePending(
+            bytes32 indexed messageId,
+            address indexed destinationContract,
+            address indexed relayer
+        );
 
-        /// Reverts emitted by the inbox when delivery fails or is redundant. Used to classify
-        /// transaction outcomes for metrics + retry logic. NOTE: the current `SimpleInbox` rejects
-        /// duplicates with `require(..., "Already validated")` (a string revert) — classifiers must
-        /// match that string as well as the custom-error selector kept for future inbox versions.
-        error MessageAlreadyValidated();
-        error InvalidVotes();
-        error VotesBelowThreshold();
-    }
-
-    #[sol(rpc)]
-    #[derive(Debug)]
-    contract IOutboxFactory {
-        /// Resolve the per-destination Outbox instance for a USC chain key. The factory creates
-        /// one Outbox per `bytes32 chainKey`; attestors call this to discover the address to watch.
-        /// Returns `address(0)` when no outbox has been created for `chainKey` yet.
-        function getOutbox(bytes32 chainKey) external view returns (address);
-
-        /// @notice Emitted when a new outbox is created
-        event OutboxCreated(bytes32 indexed chainKey, address indexed outboxAddress);
-    }
-
-    #[sol(rpc)]
-    #[derive(Debug)]
-    contract IChainInfo {
-        /// `chain-info` precompile accessor (PR #873) exposing the per-chain Outbox factory
-        /// address registered in `SupportedChains::OutboxFactories`. `exists` is false when no
-        /// factory has been set for `chainKey`. Precompile address: `0x…0fD3` (4051).
-        function outbox_factory_address(uint64 chainKey)
-            external
-            view
-            returns (address factory_addr, bool exists);
+        /// Revert used to classify duplicate deliveries for metrics + retry logic. NOTE: older
+        /// inboxes rejected duplicates with `require(..., "Already validated")` (a string revert) —
+        /// classifiers must match that string as well as this custom-error selector.
+        /// (Vote-validation failures revert from the EOAValidator with its own error names, so no
+        /// vote errors are mirrored here.) Post-#23 the error carries the messageId — the old
+        /// zero-arg selector matched nothing (caught by the abi_surface drift test).
+        error MessageAlreadyValidated(bytes32 messageId);
     }
 
     #[sol(rpc)]
@@ -194,7 +172,7 @@ sol! {
         event AckFeeClaimed(bytes32 indexed messageId, address indexed claimant, uint256 amount);
 
         /// Reverts the ack submitter treats as terminal for a given proof. Outbox message-state
-        /// errors (`MessageDoesNotRequireAck` / `MessageNotFound` / `MessageAlreadyAcknowledged`)
+        /// errors (`MessageCannotBeAcknowledged` / `MessageNotFound` / `MessageAlreadyAcknowledged`)
         /// no longer bubble up — the validator catches them per log — so a submission only reverts
         /// when NOTHING was acknowledged (`NoMessageDeliveredLogs`) or the proof itself is bad.
         /// `ProofInvalid` is raised by the `USCProofVerifier` the validator delegates to.

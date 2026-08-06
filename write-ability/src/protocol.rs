@@ -2,7 +2,7 @@
 //!
 //! The gossipsub topic and the `u64 → bytes32` chain-key encoding both have to agree across the
 //! attestor (publisher), the relayer (subscriber), and the on-chain Outbox/factory. Defining them
-//! once here is what keeps the mesh and the `getOutbox(bytes32)` lookups consistent.
+//! once here is what keeps the mesh and the per-chain Outbox resolution consistent.
 
 use alloy::primitives::B256;
 
@@ -37,7 +37,7 @@ pub fn attestor_set_update_topic(chain_key: u64) -> String {
 }
 
 /// Canonical mapping of a Substrate `ChainKey` (`u64`) to the Solidity `bytes32` chain key passed
-/// to `IOutboxFactory.getOutbox` and bound into each `messageHash` (research §2.3).
+/// to the factory's Outbox deployment and bound into each `messageHash` (research §2.3).
 ///
 /// The `u64` is stored big-endian in the **low** 8 bytes (left-padded with zeros), i.e.
 /// `bytes32(uint256(value))` in Solidity terms.

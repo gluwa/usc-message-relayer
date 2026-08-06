@@ -14,3 +14,6 @@ path = "src/lib.rs"
 alloy = { workspace = true, features = ["full"] }
 parity-scale-codec = { workspace = true, features = ["derive"] }
 sha3 = { workspace = true, default-features = false }
+
+[dev-dependencies]
+serde_json = { workspace = true }
