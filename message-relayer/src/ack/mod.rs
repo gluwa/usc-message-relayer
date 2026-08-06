@@ -870,8 +870,11 @@ fn is_terminal_revert(err: &impl std::fmt::Display) -> bool {
         return true;
     }
     // Decoded error-name fallback (nodes that surface the custom-error name without standard
-    // revert phrasing).
+    // revert phrasing). Both the current name (CannotBeAcknowledged) and its pre-#23 predecessor
+    // (DoesNotRequireAck) are matched: name-decoding nodes fronting an old deployment still emit
+    // the retired string, and matching one extra name costs nothing.
     s.contains("AlreadyAcknowledged")
+        || s.contains("CannotBeAcknowledged")
         || s.contains("DoesNotRequireAck")
         || s.contains("MessageNotFound")
         || s.contains("ProofInvalid")
@@ -898,6 +901,11 @@ mod tests {
     fn terminal_revert_classification() {
         // Decoded-name form (nodes that surface the custom-error name).
         assert!(is_terminal_revert(&"reverted: MessageAlreadyAcknowledged"));
+        // Both names of the no-ack-required error: the current one and its pre-#23 predecessor
+        // (bugbot: the rename fixed the selector map but left this fallback matching only the
+        // retired string — a name-decoding node without standard revert phrasing looped forever).
+        assert!(is_terminal_revert(&"reverted: MessageCannotBeAcknowledged"));
+        assert!(is_terminal_revert(&"reverted: MessageDoesNotRequireAck"));
         assert!(is_terminal_revert(&"execution reverted"));
 
         // NativeTransferFailed is the documented retryable exception: it clears when the recipient
