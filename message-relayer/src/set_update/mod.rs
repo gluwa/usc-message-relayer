@@ -303,6 +303,7 @@ pub async fn run(
     }
 
     let mut refresh_tick = tokio::time::interval(Duration::from_secs(REFRESH_SECS));
+    let mut pacer = crate::pacing::RateLimitPacer::default();
     refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -312,6 +313,7 @@ pub async fn run(
                 return Ok(());
             }
             _ = refresh_tick.tick() => {
+                let mut rate_limited = false;
                 for (chain_key, state) in states.iter_mut() {
                     match refresh(state).await {
                         // Beat per route on a *successful* refresh, matching the outbox/ack/claim
@@ -324,7 +326,24 @@ pub async fn run(
                         // the exact failure class this watchdog exists to catch.
                         Ok(()) => health.heartbeat(&health_key(*chain_key)),
                         Err(err) => {
+                            rate_limited = rate_limited
+                                || crate::pacing::error_looks_rate_limited(&format!("{err:#}"));
                             warn!(%chain_key, %err, "attestor-set-update: on-chain refresh failed; keeping last-known view");
+                        }
+                    }
+                }
+
+                // Rate-limit pacing — see `crate::pacing`. Votes keep arriving during the
+                // cooldown (the vote_rx arm is unaffected); only the on-chain refresh is deferred.
+                let cooldown = pacer.after(rate_limited);
+                if !cooldown.is_zero() {
+                    warn!(cooldown_ms = cooldown.as_millis() as u64,
+                        "🧯 provider is rate limiting — pacing set-update refresh");
+                    tokio::select! {
+                        () = tokio::time::sleep(cooldown) => {}
+                        () = cancel.cancelled() => {
+                            info!("🛑 attestor-set-update aggregator exiting on cancel");
+                            return Ok(());
                         }
                     }
                 }

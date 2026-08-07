@@ -76,6 +76,7 @@ pub async fn run(
 
     // `interval` fires immediately on the first tick, so the set is resolved promptly at startup.
     let mut tick = tokio::time::interval(Duration::from_secs(ATTESTOR_SET_POLL_SECS));
+    let mut pacer = crate::pacing::RateLimitPacer::default();
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -85,6 +86,7 @@ pub async fn run(
                 return Ok(());
             }
             _ = tick.tick() => {
+                let mut rate_limited = false;
                 // Connect per poll (a bare alloy WS provider's pubsub service exits permanently
                 // after one failed reconnect, which would silently freeze this watcher on a routine
                 // RPC blip — part of C4). A fresh connection each 30s tick is cheap and self-heals.
@@ -118,7 +120,21 @@ pub async fn run(
                         }
                     }
                     Err(err) => {
+                        rate_limited = crate::pacing::error_looks_rate_limited(&format!("{err:#}"));
                         warn!(chain_key, %err, "failed to read on-chain attestor set; will retry");
+                    }
+                }
+
+                // Rate-limit pacing — see `crate::pacing`: this 30s poll runs on every route and
+                // collides with the attestor fleet's synchronized per-block bursts on shared,
+                // RPS-capped endpoints. Escalate the poll's cooldown instead of colliding again.
+                let cooldown = pacer.after(rate_limited);
+                if !cooldown.is_zero() {
+                    warn!(chain_key, cooldown_ms = cooldown.as_millis() as u64,
+                        "🧯 provider is rate limiting — pacing attestor-set watcher");
+                    tokio::select! {
+                        () = tokio::time::sleep(cooldown) => {}
+                        () = cancel.cancelled() => return Ok(()),
                     }
                 }
             }

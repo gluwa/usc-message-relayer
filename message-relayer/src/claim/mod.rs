@@ -268,6 +268,7 @@ pub async fn run(
     let mut done = BoundedSeen::new(MAX_DONE_TRACKED);
 
     let mut tick = tokio::time::interval(Duration::from_secs(CLAIM_POLL_INTERVAL_SECS));
+    let mut pacer = crate::pacing::RateLimitPacer::default();
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -277,6 +278,7 @@ pub async fn run(
                 return Ok(());
             }
             _ = tick.tick() => {
+                let mut rate_limited = false;
                 match discover_locks(
                     chain_key,
                     claim.source_bridge_address,
@@ -303,7 +305,10 @@ pub async fn run(
                             }
                         }
                     }
-                    Err(err) => warn!(chain_key, %err, "claim discovery iteration failed; will retry"),
+                    Err(err) => {
+                        rate_limited = crate::pacing::error_looks_rate_limited(&format!("{err:#}"));
+                        warn!(chain_key, %err, "claim discovery iteration failed; will retry");
+                    }
                 }
 
                 process_pending(
@@ -316,6 +321,22 @@ pub async fn run(
                     &mut pending,
                     &mut done,
                 ).await;
+
+                // Rate-limit pacing: a shared, RPS-capped endpoint rejects reads whenever the
+                // co-tenant attestor fleet bursts; retrying at base cadence keeps paying into the
+                // limit that is rejecting us. Escalating cooldown, decays on clean iterations.
+                let cooldown = pacer.after(rate_limited);
+                if !cooldown.is_zero() {
+                    warn!(chain_key, cooldown_ms = cooldown.as_millis() as u64,
+                        "🧯 provider is rate limiting — pacing claim discovery");
+                    tokio::select! {
+                        () = tokio::time::sleep(cooldown) => {}
+                        () = cancel.cancelled() => {
+                            info!(chain_key, "🛑 claim submitter exiting on cancel");
+                            return Ok(());
+                        }
+                    }
+                }
             }
         }
     }

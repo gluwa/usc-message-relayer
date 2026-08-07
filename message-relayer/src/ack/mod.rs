@@ -254,6 +254,7 @@ pub async fn run(
     let mut done = BoundedSeen::new(MAX_DONE_TRACKED);
 
     let mut tick = tokio::time::interval(Duration::from_secs(ACK_POLL_INTERVAL_SECS));
+    let mut pacer = crate::pacing::RateLimitPacer::default();
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -263,6 +264,7 @@ pub async fn run(
                 return Ok(());
             }
             _ = tick.tick() => {
+                let mut rate_limited = false;
                 match discover_delivered(
                     chain_key,
                     route.inbox_address,
@@ -290,7 +292,10 @@ pub async fn run(
                             }
                         }
                     }
-                    Err(err) => warn!(chain_key, %err, "ack discovery iteration failed; will retry"),
+                    Err(err) => {
+                        rate_limited = crate::pacing::error_looks_rate_limited(&format!("{err:#}"));
+                        warn!(chain_key, %err, "ack discovery iteration failed; will retry");
+                    }
                 }
 
                 process_pending(
@@ -305,6 +310,21 @@ pub async fn run(
                     &mut pending,
                     &mut done,
                 ).await;
+
+                // Rate-limit pacing — see `crate::pacing`: escalating cooldown when the shared
+                // endpoint rejects on RPS, decaying on clean iterations.
+                let cooldown = pacer.after(rate_limited);
+                if !cooldown.is_zero() {
+                    warn!(chain_key, cooldown_ms = cooldown.as_millis() as u64,
+                        "🧯 provider is rate limiting — pacing ack discovery");
+                    tokio::select! {
+                        () = tokio::time::sleep(cooldown) => {}
+                        () = cancel.cancelled() => {
+                            info!(chain_key, "🛑 ack submitter exiting on cancel");
+                            return Ok(());
+                        }
+                    }
+                }
             }
         }
     }
