@@ -4067,7 +4067,7 @@ checksum = "78ca9ab1a0babb1e7d5695e3530886289c18cf2f87ec19a575a0abdce112e3a3"
 
 [[package]]
 name = "message-relayer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy",
  "alloy-node-bindings",
@@ -5920,7 +5920,7 @@ checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
 name = "spy-node"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy",
  "anyhow",
@@ -7458,7 +7458,7 @@ dependencies = [
 
 [[package]]
 name = "write-ability"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy",
  "parity-scale-codec",
