@@ -253,7 +253,10 @@ pub async fn run(
     // Tx hashes already acknowledged (or terminally skipped) — never re-submitted (bounded).
     let mut done = BoundedSeen::new(MAX_DONE_TRACKED);
 
-    let mut tick = tokio::time::interval(Duration::from_secs(ACK_POLL_INTERVAL_SECS));
+    let mut tick = tokio::time::interval(Duration::from_secs(crate::config::poll_secs_override(
+        "RELAYER_ACK_POLL_SECS",
+        ACK_POLL_INTERVAL_SECS,
+    )));
     let mut pacer = crate::pacing::RateLimitPacer::default();
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 

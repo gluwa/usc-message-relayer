@@ -733,3 +733,56 @@ routes:
         assert!(err.to_string().contains("invalid inbox_address"));
     }
 }
+
+/// Environment override for a poll interval, in whole seconds. Returns `default_secs` when the
+/// variable is unset, empty, or unparseable (never fails startup on a typo — the default is
+/// always safe). Zero is rejected too: a zero-interval tick loop is a busy spin.
+///
+/// Used by the claim/ack discovery loops so shared, RPS-capped deployments (usc-dev on one
+/// Chainstack key, 2026-08-07) can trade discovery latency for collision rate without a rebuild:
+/// the 6s default is tuned for CI/e2e snappiness, while a fleet-sharing deployment wants 30s+.
+pub fn poll_secs_override(var: &str, default_secs: u64) -> u64 {
+    match std::env::var(var) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => {
+                if secs != default_secs {
+                    tracing::info!(var, secs, default_secs, "⏱️ poll interval overridden");
+                }
+                secs
+            }
+            _ => {
+                tracing::warn!(
+                    var,
+                    raw,
+                    default_secs,
+                    "invalid poll-interval override — using default"
+                );
+                default_secs
+            }
+        },
+        Err(_) => default_secs,
+    }
+}
+
+#[cfg(test)]
+mod poll_override_tests {
+    #[test]
+    fn parses_overrides_and_falls_back_safely() {
+        // Unique var names per case — tests share a process environment.
+        std::env::set_var("TEST_POLL_A", "30");
+        assert_eq!(super::poll_secs_override("TEST_POLL_A", 6), 30);
+        std::env::set_var("TEST_POLL_B", "0");
+        assert_eq!(
+            super::poll_secs_override("TEST_POLL_B", 6),
+            6,
+            "zero rejected"
+        );
+        std::env::set_var("TEST_POLL_C", "fast");
+        assert_eq!(
+            super::poll_secs_override("TEST_POLL_C", 6),
+            6,
+            "garbage rejected"
+        );
+        assert_eq!(super::poll_secs_override("TEST_POLL_UNSET", 6), 6);
+    }
+}
