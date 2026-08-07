@@ -267,7 +267,10 @@ pub async fn run(
     let mut pending = PendingTxs::new(MAX_PENDING_CLAIMS);
     let mut done = BoundedSeen::new(MAX_DONE_TRACKED);
 
-    let mut tick = tokio::time::interval(Duration::from_secs(CLAIM_POLL_INTERVAL_SECS));
+    let mut tick = tokio::time::interval(Duration::from_secs(crate::config::poll_secs_override(
+        "RELAYER_CLAIM_POLL_SECS",
+        CLAIM_POLL_INTERVAL_SECS,
+    )));
     let mut pacer = crate::pacing::RateLimitPacer::default();
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 

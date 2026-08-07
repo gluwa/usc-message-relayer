@@ -733,3 +733,79 @@ routes:
         assert!(err.to_string().contains("invalid inbox_address"));
     }
 }
+
+/// Upper bound on poll-interval overrides. A poll that fires less often than the health
+/// watchdog's [`crate::health::PROGRESS_DEADLINE`] (5 min) can never heartbeat in time, so an
+/// oversized override would put the whole process in a liveness-restart loop (bugbot). 120s keeps
+/// a wide margin for the iteration's own runtime.
+const POLL_OVERRIDE_MAX_SECS: u64 = 120;
+
+/// Environment override for a poll interval, in whole seconds. Returns `default_secs` when the
+/// variable is unset, empty, or unparseable (never fails startup on a typo — the default is
+/// always safe). Zero is rejected (busy spin) and values above [`POLL_OVERRIDE_MAX_SECS`] are
+/// clamped (liveness-restart loop — see the constant).
+///
+/// Used by the claim/ack discovery loops so shared, RPS-capped deployments (usc-dev on one
+/// Chainstack key, 2026-08-07) can trade discovery latency for collision rate without a rebuild:
+/// the 6s default is tuned for CI/e2e snappiness, while a fleet-sharing deployment wants 30s+.
+pub fn poll_secs_override(var: &str, default_secs: u64) -> u64 {
+    match std::env::var(var) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => {
+                let clamped = secs.min(POLL_OVERRIDE_MAX_SECS);
+                if clamped != secs {
+                    tracing::warn!(
+                        var,
+                        secs,
+                        clamped,
+                        "poll-interval override exceeds the health-deadline-safe maximum — clamping"
+                    );
+                } else if clamped != default_secs {
+                    tracing::info!(var, secs, default_secs, "⏱️ poll interval overridden");
+                }
+                clamped
+            }
+            _ => {
+                tracing::warn!(
+                    var,
+                    raw,
+                    default_secs,
+                    "invalid poll-interval override — using default"
+                );
+                default_secs
+            }
+        },
+        Err(_) => default_secs,
+    }
+}
+
+#[cfg(test)]
+mod poll_override_tests {
+    #[test]
+    fn parses_overrides_and_falls_back_safely() {
+        // Unique var names per case — tests share a process environment.
+        std::env::set_var("TEST_POLL_A", "30");
+        assert_eq!(super::poll_secs_override("TEST_POLL_A", 6), 30);
+        // An oversized override must clamp below the health watchdog's deadline, or the
+        // process liveness-restarts forever (bugbot).
+        std::env::set_var("TEST_POLL_D", "86400");
+        assert_eq!(
+            super::poll_secs_override("TEST_POLL_D", 6),
+            super::POLL_OVERRIDE_MAX_SECS,
+            "clamped to the deadline-safe maximum"
+        );
+        std::env::set_var("TEST_POLL_B", "0");
+        assert_eq!(
+            super::poll_secs_override("TEST_POLL_B", 6),
+            6,
+            "zero rejected"
+        );
+        std::env::set_var("TEST_POLL_C", "fast");
+        assert_eq!(
+            super::poll_secs_override("TEST_POLL_C", 6),
+            6,
+            "garbage rejected"
+        );
+        assert_eq!(super::poll_secs_override("TEST_POLL_UNSET", 6), 6);
+    }
+}
