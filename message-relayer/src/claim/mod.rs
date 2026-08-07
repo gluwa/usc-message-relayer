@@ -278,6 +278,13 @@ pub async fn run(
                 return Ok(());
             }
             _ = tick.tick() => {
+                // Rate-limit pacing: while a deferral window is active, skip the tick entirely —
+                // no sleeping inside the select arm (see `crate::pacing`).
+                if let Some(remaining) = pacer.deferring() {
+                    tracing::debug!(chain_key, remaining_ms = remaining.as_millis() as u64,
+                        "⏸️ pacing claim discovery — skipping tick");
+                    continue;
+                }
                 let mut rate_limited = false;
                 match discover_locks(
                     chain_key,
@@ -324,17 +331,13 @@ pub async fn run(
 
                 // Rate-limit pacing: a shared, RPS-capped endpoint rejects reads whenever the
                 // co-tenant attestor fleet bursts; retrying at base cadence keeps paying into the
-                // limit that is rejecting us. Escalating cooldown, decays on clean iterations.
-                let cooldown = pacer.after(rate_limited);
-                if !cooldown.is_zero() {
-                    warn!(chain_key, cooldown_ms = cooldown.as_millis() as u64,
-                        "🧯 provider is rate limiting — pacing claim discovery");
-                    tokio::select! {
-                        () = tokio::time::sleep(cooldown) => {}
-                        () = cancel.cancelled() => {
-                            info!(chain_key, "🛑 claim submitter exiting on cancel");
-                            return Ok(());
-                        }
+                // limit that is rejecting us. A rate-limited failure arms a deferral window
+                // (checked at tick start); clean iterations decay the level and are never slowed.
+                pacer.after(rate_limited);
+                if rate_limited {
+                    if let Some(window) = pacer.deferring() {
+                        warn!(chain_key, defer_ms = window.as_millis() as u64,
+                            "🧯 provider is rate limiting — deferring claim discovery");
                     }
                 }
             }

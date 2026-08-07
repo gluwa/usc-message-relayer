@@ -313,6 +313,14 @@ pub async fn run(
                 return Ok(());
             }
             _ = refresh_tick.tick() => {
+                // Rate-limit pacing: skip the refresh while a deferral window is active. The
+                // vote_rx arm below is untouched — votes keep aggregating during a deferral
+                // (bugbot: an in-arm sleep stalled vote intake for the whole cooldown).
+                if let Some(remaining) = pacer.deferring() {
+                    tracing::debug!(remaining_ms = remaining.as_millis() as u64,
+                        "⏸️ pacing set-update refresh — skipping tick");
+                    continue;
+                }
                 let mut rate_limited = false;
                 for (chain_key, state) in states.iter_mut() {
                     match refresh(state).await {
@@ -333,18 +341,14 @@ pub async fn run(
                     }
                 }
 
-                // Rate-limit pacing — see `crate::pacing`. Votes keep arriving during the
-                // cooldown (the vote_rx arm is unaffected); only the on-chain refresh is deferred.
-                let cooldown = pacer.after(rate_limited);
-                if !cooldown.is_zero() {
-                    warn!(cooldown_ms = cooldown.as_millis() as u64,
-                        "🧯 provider is rate limiting — pacing set-update refresh");
-                    tokio::select! {
-                        () = tokio::time::sleep(cooldown) => {}
-                        () = cancel.cancelled() => {
-                            info!("🛑 attestor-set-update aggregator exiting on cancel");
-                            return Ok(());
-                        }
+                // Rate-limit pacing — see `crate::pacing`: a rate-limited refresh arms a
+                // deferral window (checked at tick start); clean refreshes decay and never slow
+                // the loop. Vote intake is independent of the window entirely.
+                pacer.after(rate_limited);
+                if rate_limited {
+                    if let Some(window) = pacer.deferring() {
+                        warn!(defer_ms = window.as_millis() as u64,
+                            "🧯 provider is rate limiting — deferring set-update refresh");
                     }
                 }
             }

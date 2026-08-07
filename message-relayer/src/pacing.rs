@@ -21,25 +21,38 @@ const LEVEL_CAP: u32 = 5;
 const BASE: Duration = Duration::from_secs(5);
 
 /// Per-loop rate-limit damper. One instance per periodic loop, fed every iteration outcome.
+///
+/// Deliberately **deferral-based, not sleep-based**: the loop checks [`Self::deferring`] at each
+/// tick and skips the iteration while a window is active. Sleeping inside a `select!` arm would
+/// (a) stop sibling arms from being polled (the set-update aggregator must keep draining votes),
+/// and (b) let long cooldowns push a worker past the health watchdog's `PROGRESS_DEADLINE`, whose
+/// restart would reset every pacer and re-burst the shared key — a restart storm worse than the
+/// collision being damped (bugbot).
 #[derive(Debug, Default)]
 pub struct RateLimitPacer {
     level: u32,
+    defer_until: Option<std::time::Instant>,
 }
 
 impl RateLimitPacer {
-    /// Record an iteration outcome and return the extra cooldown to sleep before the next tick
-    /// (zero when calm). Escalates on rate-limited failures, decays one level per clean pass.
-    pub fn after(&mut self, rate_limited: bool) -> Duration {
+    /// Record an iteration outcome. A rate-limited failure escalates the level and arms a deferral
+    /// window (`BASE << (level-1)`, capped); a clean pass decays ONE level (gradual, so a loop that
+    /// collides every other tick stays damped) and arms nothing — clean iterations are never
+    /// slowed, only failed-because-limited ones defer the next attempts.
+    pub fn after(&mut self, rate_limited: bool) {
         if rate_limited {
             self.level = (self.level + 1).min(LEVEL_CAP);
+            self.defer_until = Some(std::time::Instant::now() + BASE * 2u32.pow(self.level - 1));
         } else {
             self.level = self.level.saturating_sub(1);
         }
-        if self.level == 0 {
-            Duration::ZERO
-        } else {
-            BASE * 2u32.pow(self.level - 1)
-        }
+    }
+
+    /// Time remaining in an active deferral window, `None` when the loop should run its tick.
+    pub fn deferring(&self) -> Option<Duration> {
+        let until = self.defer_until?;
+        let now = std::time::Instant::now();
+        (now < until).then(|| until - now)
     }
 }
 
@@ -90,22 +103,35 @@ mod tests {
     #[test]
     fn escalates_to_cap_and_decays_gradually() {
         let mut p = RateLimitPacer::default();
+        // Calm loop: nothing armed, nothing deferred.
+        p.after(false);
+        assert!(p.deferring().is_none(), "clean iterations must never defer");
+
         let mut last = Duration::ZERO;
         for _ in 0..8 {
-            let d = p.after(true);
-            assert!(d >= last, "cooldown must not shrink while rate-limited");
+            p.after(true);
+            let d = p.deferring().expect("rate-limited failure arms a window");
+            assert!(
+                d >= last.saturating_sub(Duration::from_millis(50)),
+                "window must not shrink while rate-limited"
+            );
             last = d;
         }
-        assert_eq!(last, BASE * 2u32.pow(LEVEL_CAP - 1), "capped at LEVEL_CAP");
-        // One clean pass steps DOWN one level, not to zero — a loop colliding every other tick
-        // must stay damped instead of oscillating between full speed and full cooldown.
-        let d = p.after(false);
-        assert_eq!(d, BASE * 2u32.pow(LEVEL_CAP - 2));
-        // Sustained calm drains it to zero.
-        for _ in 0..LEVEL_CAP {
-            p.after(false);
-        }
-        assert_eq!(p.after(false), Duration::ZERO);
+        assert!(
+            last <= BASE * 2u32.pow(LEVEL_CAP - 1),
+            "window capped at LEVEL_CAP"
+        );
+        assert!(last > BASE * 2u32.pow(LEVEL_CAP - 2), "reached the cap");
+
+        // Clean passes decay the LEVEL but do not arm new windows: after the current window
+        // passes, a decayed-but-nonzero level only matters if another collision happens.
+        p.after(false);
+        p.after(false);
+        assert_eq!(p.level, LEVEL_CAP - 2, "one level per clean pass");
+        // A fresh collision after partial decay arms a window sized by the decayed level + 1.
+        p.after(true);
+        let d = p.deferring().expect("armed");
+        assert!(d <= BASE * 2u32.pow(LEVEL_CAP - 2));
     }
 
     #[test]

@@ -264,6 +264,13 @@ pub async fn run(
                 return Ok(());
             }
             _ = tick.tick() => {
+                // Rate-limit pacing: while a deferral window is active, skip the tick entirely —
+                // no sleeping inside the select arm (see `crate::pacing`).
+                if let Some(remaining) = pacer.deferring() {
+                    tracing::debug!(chain_key, remaining_ms = remaining.as_millis() as u64,
+                        "⏸️ pacing ack discovery — skipping tick");
+                    continue;
+                }
                 let mut rate_limited = false;
                 match discover_delivered(
                     chain_key,
@@ -311,18 +318,13 @@ pub async fn run(
                     &mut done,
                 ).await;
 
-                // Rate-limit pacing — see `crate::pacing`: escalating cooldown when the shared
-                // endpoint rejects on RPS, decaying on clean iterations.
-                let cooldown = pacer.after(rate_limited);
-                if !cooldown.is_zero() {
-                    warn!(chain_key, cooldown_ms = cooldown.as_millis() as u64,
-                        "🧯 provider is rate limiting — pacing ack discovery");
-                    tokio::select! {
-                        () = tokio::time::sleep(cooldown) => {}
-                        () = cancel.cancelled() => {
-                            info!(chain_key, "🛑 ack submitter exiting on cancel");
-                            return Ok(());
-                        }
+                // Rate-limit pacing — see `crate::pacing`: a rate-limited failure arms a deferral
+                // window (checked at tick start); clean iterations decay and are never slowed.
+                pacer.after(rate_limited);
+                if rate_limited {
+                    if let Some(window) = pacer.deferring() {
+                        warn!(chain_key, defer_ms = window.as_millis() as u64,
+                            "🧯 provider is rate limiting — deferring ack discovery");
                     }
                 }
             }

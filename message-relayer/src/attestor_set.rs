@@ -86,15 +86,24 @@ pub async fn run(
                 return Ok(());
             }
             _ = tick.tick() => {
-                let mut rate_limited = false;
+                // Rate-limit pacing: skip the poll while a deferral window is active (no arm-
+                // blocking sleeps — see `crate::pacing`).
+                if let Some(remaining) = pacer.deferring() {
+                    tracing::debug!(chain_key, remaining_ms = remaining.as_millis() as u64,
+                        "⏸️ pacing attestor-set watcher — skipping poll");
+                    continue;
+                }
                 // Connect per poll (a bare alloy WS provider's pubsub service exits permanently
                 // after one failed reconnect, which would silently freeze this watcher on a routine
                 // RPC blip — part of C4). A fresh connection each 30s tick is cheap and self-heals.
                 match connect_and_read_set(&route.destination_rpc_url, validator).await {
                     Ok((attestors, threshold)) => {
                         // Before the unchanged-shortcut: an unchanged set is still a successful
-                        // read and must count as progress.
+                        // read and must count as progress — for the health watchdog AND the
+                        // pacer's decay (bugbot: the `continue` below skipped decay, freezing the
+                        // level at its storm-time value through the most common success path).
                         health.heartbeat(&health_key);
+                        pacer.after(false);
                         let changed = last
                             .as_ref()
                             .is_none_or(|(a, t)| a != &attestors || *t != threshold);
@@ -120,21 +129,20 @@ pub async fn run(
                         }
                     }
                     Err(err) => {
-                        rate_limited = crate::pacing::error_looks_rate_limited(&format!("{err:#}"));
+                        let rate_limited =
+                            crate::pacing::error_looks_rate_limited(&format!("{err:#}"));
                         warn!(chain_key, %err, "failed to read on-chain attestor set; will retry");
-                    }
-                }
-
-                // Rate-limit pacing — see `crate::pacing`: this 30s poll runs on every route and
-                // collides with the attestor fleet's synchronized per-block bursts on shared,
-                // RPS-capped endpoints. Escalate the poll's cooldown instead of colliding again.
-                let cooldown = pacer.after(rate_limited);
-                if !cooldown.is_zero() {
-                    warn!(chain_key, cooldown_ms = cooldown.as_millis() as u64,
-                        "🧯 provider is rate limiting — pacing attestor-set watcher");
-                    tokio::select! {
-                        () = tokio::time::sleep(cooldown) => {}
-                        () = cancel.cancelled() => return Ok(()),
+                        // Rate-limit pacing — see `crate::pacing`: this 30s poll runs on every
+                        // route and collides with the attestor fleet's synchronized per-block
+                        // bursts on shared, RPS-capped endpoints. Arm a deferral window instead
+                        // of colliding again next tick.
+                        pacer.after(rate_limited);
+                        if rate_limited {
+                            if let Some(window) = pacer.deferring() {
+                                warn!(chain_key, defer_ms = window.as_millis() as u64,
+                                    "🧯 provider is rate limiting — deferring attestor-set polls");
+                            }
+                        }
                     }
                 }
             }
