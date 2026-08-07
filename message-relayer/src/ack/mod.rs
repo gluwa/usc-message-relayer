@@ -254,6 +254,7 @@ pub async fn run(
     let mut done = BoundedSeen::new(MAX_DONE_TRACKED);
 
     let mut tick = tokio::time::interval(Duration::from_secs(ACK_POLL_INTERVAL_SECS));
+    let mut pacer = crate::pacing::RateLimitPacer::default();
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -263,6 +264,14 @@ pub async fn run(
                 return Ok(());
             }
             _ = tick.tick() => {
+                // Rate-limit pacing: while a deferral window is active, skip the tick entirely —
+                // no sleeping inside the select arm (see `crate::pacing`).
+                if let Some(remaining) = pacer.deferring() {
+                    tracing::debug!(chain_key, remaining_ms = remaining.as_millis() as u64,
+                        "⏸️ pacing ack discovery — skipping tick");
+                    continue;
+                }
+                let mut rate_limited = false;
                 match discover_delivered(
                     chain_key,
                     route.inbox_address,
@@ -290,7 +299,10 @@ pub async fn run(
                             }
                         }
                     }
-                    Err(err) => warn!(chain_key, %err, "ack discovery iteration failed; will retry"),
+                    Err(err) => {
+                        rate_limited = crate::pacing::error_looks_rate_limited(&format!("{err:#}"));
+                        warn!(chain_key, %err, "ack discovery iteration failed; will retry");
+                    }
                 }
 
                 process_pending(
@@ -305,6 +317,16 @@ pub async fn run(
                     &mut pending,
                     &mut done,
                 ).await;
+
+                // Rate-limit pacing — see `crate::pacing`: a rate-limited failure arms a deferral
+                // window (checked at tick start); clean iterations decay and are never slowed.
+                pacer.after(rate_limited);
+                if rate_limited {
+                    if let Some(window) = pacer.deferring() {
+                        warn!(chain_key, defer_ms = window.as_millis() as u64,
+                            "🧯 provider is rate limiting — deferring ack discovery");
+                    }
+                }
             }
         }
     }

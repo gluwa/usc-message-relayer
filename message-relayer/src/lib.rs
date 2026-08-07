@@ -42,6 +42,7 @@ pub mod events;
 pub mod hash;
 pub mod health;
 pub mod p2p;
+pub mod pacing;
 pub mod pending;
 pub mod pool;
 pub mod prom;

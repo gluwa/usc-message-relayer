@@ -268,6 +268,7 @@ pub async fn run(
     let mut done = BoundedSeen::new(MAX_DONE_TRACKED);
 
     let mut tick = tokio::time::interval(Duration::from_secs(CLAIM_POLL_INTERVAL_SECS));
+    let mut pacer = crate::pacing::RateLimitPacer::default();
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -277,6 +278,14 @@ pub async fn run(
                 return Ok(());
             }
             _ = tick.tick() => {
+                // Rate-limit pacing: while a deferral window is active, skip the tick entirely —
+                // no sleeping inside the select arm (see `crate::pacing`).
+                if let Some(remaining) = pacer.deferring() {
+                    tracing::debug!(chain_key, remaining_ms = remaining.as_millis() as u64,
+                        "⏸️ pacing claim discovery — skipping tick");
+                    continue;
+                }
+                let mut rate_limited = false;
                 match discover_locks(
                     chain_key,
                     claim.source_bridge_address,
@@ -303,7 +312,10 @@ pub async fn run(
                             }
                         }
                     }
-                    Err(err) => warn!(chain_key, %err, "claim discovery iteration failed; will retry"),
+                    Err(err) => {
+                        rate_limited = crate::pacing::error_looks_rate_limited(&format!("{err:#}"));
+                        warn!(chain_key, %err, "claim discovery iteration failed; will retry");
+                    }
                 }
 
                 process_pending(
@@ -316,6 +328,18 @@ pub async fn run(
                     &mut pending,
                     &mut done,
                 ).await;
+
+                // Rate-limit pacing: a shared, RPS-capped endpoint rejects reads whenever the
+                // co-tenant attestor fleet bursts; retrying at base cadence keeps paying into the
+                // limit that is rejecting us. A rate-limited failure arms a deferral window
+                // (checked at tick start); clean iterations decay the level and are never slowed.
+                pacer.after(rate_limited);
+                if rate_limited {
+                    if let Some(window) = pacer.deferring() {
+                        warn!(chain_key, defer_ms = window.as_millis() as u64,
+                            "🧯 provider is rate limiting — deferring claim discovery");
+                    }
+                }
             }
         }
     }
