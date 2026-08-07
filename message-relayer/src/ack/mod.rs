@@ -853,7 +853,7 @@ async fn any_requires_ack<P: Provider>(
 fn ack_revert_name(sel: [u8; 4]) -> Option<&'static str> {
     use crate::abi::{IAcknowledgmentValidator as V, IOutbox as O, IRelayerContract as RC};
     Some(match sel {
-        s if s == O::MessageDoesNotRequireAck::SELECTOR => "MessageDoesNotRequireAck",
+        s if s == O::MessageCannotBeAcknowledged::SELECTOR => "MessageCannotBeAcknowledged",
         s if s == O::MessageAlreadyAcknowledged::SELECTOR => "MessageAlreadyAcknowledged",
         s if s == O::MessageNotFound::SELECTOR => "MessageNotFound",
         s if s == V::ProofInvalid::SELECTOR => "ProofInvalid",
@@ -867,7 +867,7 @@ fn ack_revert_name(sel: [u8; 4]) -> Option<&'static str> {
 /// Classify a submit error as a permanent on-chain revert (vs. a transient RPC failure). A contract
 /// revert observed at send / gas-estimation time is deterministic, so it must be terminal — otherwise
 /// the tx is retried forever (e.g. every bridge Release delivery, which reverts
-/// `MessageDoesNotRequireAck`). Matches revert phrasing across node dialects (see [`crate::revert`])
+/// `MessageCannotBeAcknowledged`). Matches revert phrasing across node dialects (see [`crate::revert`])
 /// plus decoded error names as a fallback.
 fn is_terminal_revert(err: &impl std::fmt::Display) -> bool {
     let s = err.to_string();
@@ -885,15 +885,18 @@ fn is_terminal_revert(err: &impl std::fmt::Display) -> bool {
     }
     // Any other revert observed at send/estimation time is deterministic for the proof + message
     // state at hand, so it must be terminal — otherwise e.g. every bridge Release delivery
-    // (MessageDoesNotRequireAck) retries forever. A mined-but-reverted settlement is terminal for
+    // (MessageCannotBeAcknowledged) retries forever. A mined-but-reverted settlement is terminal for
     // the same reason: the state that made it revert (already settled / already acked) does not
     // un-happen, and the pre-checks drop that id on the next pass anyway.
     if crate::revert::is_revert(&s) {
         return true;
     }
     // Decoded error-name fallback (nodes that surface the custom-error name without standard
-    // revert phrasing).
+    // revert phrasing). Both the current name (CannotBeAcknowledged) and its pre-#23 predecessor
+    // (DoesNotRequireAck) are matched: name-decoding nodes fronting an old deployment still emit
+    // the retired string, and matching one extra name costs nothing.
     s.contains("AlreadyAcknowledged")
+        || s.contains("CannotBeAcknowledged")
         || s.contains("DoesNotRequireAck")
         || s.contains("MessageNotFound")
         || s.contains("ProofInvalid")
@@ -920,6 +923,11 @@ mod tests {
     fn terminal_revert_classification() {
         // Decoded-name form (nodes that surface the custom-error name).
         assert!(is_terminal_revert(&"reverted: MessageAlreadyAcknowledged"));
+        // Both names of the no-ack-required error: the current one and its pre-#23 predecessor
+        // (bugbot: the rename fixed the selector map but left this fallback matching only the
+        // retired string — a name-decoding node without standard revert phrasing looped forever).
+        assert!(is_terminal_revert(&"reverted: MessageCannotBeAcknowledged"));
+        assert!(is_terminal_revert(&"reverted: MessageDoesNotRequireAck"));
         assert!(is_terminal_revert(&"execution reverted"));
 
         // NativeTransferFailed is the documented retryable exception: it clears when the recipient
@@ -936,11 +944,12 @@ mod tests {
         )));
 
         // Creditcoin EVM RPC form: raw selector data, no decoded name — this is what was slipping
-        // through and retrying forever on every bridge Release delivery (MessageDoesNotRequireAck).
+        // through and retrying forever on every bridge Release delivery. (Shape captured live;
+        // selector updated for the post-#23 rename to MessageCannotBeAcknowledged.)
         assert!(is_terminal_revert(
             &"submitAcknowledgment send failed: server returned an error response: error code \
               -32603: VM Exception while processing transaction: revert, data: \
-              \"0x2f28bb55c8e0b2db4217508f44fb2d148bd9fab3c94e876a56a3fdbcf71f17570ecbe54c\""
+              \"0x52818d8ec8e0b2db4217508f44fb2d148bd9fab3c94e876a56a3fdbcf71f17570ecbe54c\""
         ));
         // Unknown selector but a clear revert phrasing is still terminal.
         assert!(is_terminal_revert(
@@ -958,18 +967,19 @@ mod tests {
 
     #[test]
     fn describe_revert_decodes_known_selectors() {
-        // The real-world Creditcoin node string for a bridge Release delivery: raw selector, no
-        // name. The Terminal log should still name the error for the operator.
+        // The real-world Creditcoin node string shape for a bridge Release delivery: raw selector,
+        // no name. The Terminal log should still name the error for the operator. (Selector updated
+        // for the post-#23 rename to MessageCannotBeAcknowledged — caught by abi_surface.)
         let s = "VM Exception while processing transaction: revert, data: \
-                 \"0x2f28bb55c8e0b2db4217508f44fb2d148bd9fab3c94e876a56a3fdbcf71f17570ecbe54c\"";
-        assert!(describe_revert(&s).starts_with("MessageDoesNotRequireAck: "));
+                 \"0x52818d8ec8e0b2db4217508f44fb2d148bd9fab3c94e876a56a3fdbcf71f17570ecbe54c\"";
+        assert!(describe_revert(&s).starts_with("MessageCannotBeAcknowledged: "));
         // Unknown selector passes through unchanged.
         let unknown = "revert, data: \"0xdeadbeef\"";
         assert_eq!(describe_revert(&unknown), unknown);
         // Selector constants in the shared ABI must still hash to the on-wire values.
         assert_eq!(
-            crate::abi::IOutbox::MessageDoesNotRequireAck::SELECTOR,
-            [0x2f, 0x28, 0xbb, 0x55]
+            crate::abi::IOutbox::MessageCannotBeAcknowledged::SELECTOR,
+            [0x52, 0x81, 0x8d, 0x8e]
         );
         assert_eq!(
             crate::abi::IOutbox::MessageAlreadyAcknowledged::SELECTOR,

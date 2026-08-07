@@ -7462,6 +7462,7 @@ version = "0.1.2"
 dependencies = [
  "alloy",
  "parity-scale-codec",
+ "serde_json",
  "sha3 0.12.0",
 ]
 

@@ -4,7 +4,8 @@
 //! Creditcoin's EVM RPC says `VM Exception while processing transaction: revert, data: "0x…"`,
 //! and neither reliably decodes custom-error *names*. Matching decoded names alone therefore
 //! misclassifies deterministic reverts as transient failures and retries them forever (the exact
-//! bug behind the ack submitter's infinite `MessageDoesNotRequireAck` loop).
+//! bug behind the ack submitter's infinite no-ack-required loop — the error now named
+//! `MessageCannotBeAcknowledged`).
 //!
 //! The helpers here extract the raw 4-byte custom-error **selector** from the revert data and
 //! detect revert phrasing across node dialects, so callers can classify contract reverts without
