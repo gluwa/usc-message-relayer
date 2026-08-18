@@ -22,7 +22,7 @@ use alloy::primitives::keccak256;
 use alloy::sol_types::{SolCall, SolError, SolEvent};
 use std::path::{Path, PathBuf};
 use write_ability::abi::{
-    IAcknowledgmentValidator, IInbox, IOutbox, IRelayerContract, IVoteValidator,
+    IAcknowledgmentValidator, IInbox, IOutbox, IOutboxFactory, IRelayerContract, IVoteValidator,
 };
 
 /// Canonical ABI type for one artifact input/output, expanding structs: `tuple` →
@@ -322,5 +322,13 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         "error",
         "NativeTransferFailed(address,uint256)",
         &IRelayerContract::NativeTransferFailed::SELECTOR,
+    );
+
+    // --- OutboxFactory (source chain) ---
+    let factory = Artifact::load(&contracts, "deployer/OutboxFactory.sol/OutboxFactory.json");
+    factory.assert_mirrored(
+        "event",
+        IOutboxFactory::OutboxCreated::SIGNATURE,
+        &IOutboxFactory::OutboxCreated::SIGNATURE_HASH.0,
     );
 }
