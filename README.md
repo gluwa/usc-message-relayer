@@ -30,8 +30,8 @@ the message up), but cannot forge.
 
 ## How a message flows (outbound)
 
-1. **Publish** — a dApp on Creditcoin calls `Outbox.publishMessage(requiresAck, payload)`; the
-   Outbox emits `MessagePublished(messageId, emitter, requiresAck, payload)`.
+1. **Publish** — a dApp on Creditcoin calls `Outbox.publishMessage(canAck, payload)`; the
+   Outbox emits `MessagePublished(messageId, emitter, canAck, payload)`.
 2. **Index** — the relayer's per-route *outbox watcher* polls Creditcoin EVM (`eth_getLogs`,
    cursor + confirmation depth, 5 000-block chunks) and inserts an `IndexedMessage` into the vote
    pool. Indexing establishes the **chain-first allowlist**: votes for a `messageHash` the relayer
@@ -45,12 +45,18 @@ the message up), but cannot forge.
 5. **Deliver** — the per-route *delivery worker* (optionally) simulates
    `Inbox.deliverMessage(messageId, emitter, payload, votes)`, then sends it. The Inbox's
    `EOAValidator` re-verifies every signature on-chain and the Inbox invokes the destination
-   dApp's `receiveMessage`.
-6. **Acknowledge** (optional, `requiresAck=true` messages) — the *ack submitter* sees
-   `MessageDelivered` on the destination, fetches a **native USC proof** of that transaction from
-   the proof-gen API, and submits it to `AcknowledgmentValidator` on Creditcoin, which verifies
-   the proof against the block-prover precompile and marks the message acknowledged on the Outbox.
-   Permissionless — the proof, not the sender, is what's trusted.
+   dApp's `receiveMessage`. If that callback reverts, the tx still succeeds but the Inbox emits
+   `MessagePending` instead of `MessageDelivered` and stores the message for permissionless
+   `retryPendingMessage` retries.
+6. **Acknowledge & settle** (optional) — the *ack submitter* watches the destination for
+   `MessageDelivered`/`MessagePending`, fetches a **native USC proof** of that transaction from
+   the proof-gen API, and submits it to `AcknowledgmentValidator` on Creditcoin (verified against
+   the block-prover precompile) for `canAck=true` messages — and, when the route has a
+   `RelayerContract` configured, calls `RelayerContract.claimDelivery` to pay the relay fee to
+   whoever delivered. The claim proof is always built from the *original* `deliverMessage` tx —
+   `MessagePending` is itself a payable, provable outcome, so a message that ever goes pending
+   still settles its fee without waiting on (or requiring) a retry to succeed. Both settlements
+   are permissionless: the proof, not the sender, is what's trusted.
 
 ### The messageHash
 
@@ -75,11 +81,11 @@ Workers communicate over `mpsc` channels only — the pool owns all aggregation 
 
 | Worker | Source | Purpose |
 |---|---|---|
-| Outbox watcher (per route) | `src/events/` | Poll `MessagePublished`, feed the pool's allowlist |
+| Outbox watcher (per route) | `src/events/` | Resolve the route's Outbox (static or on-chain factory lookup, re-checked periodically), poll `MessagePublished`, feed the pool's allowlist |
 | Vote pool (one) | `src/pool/` | Validate + aggregate votes, dispatch deliveries, emit reobservation requests, serve `/votes` queries |
 | p2p worker (one swarm) | `src/p2p/` | gossipsub mesh with the attestors: receive votes, publish reobservation requests |
 | Delivery worker (per route) | `src/delivery/` | Simulate + send `deliverMessage`, classify outcomes, bounded retries |
-| Ack submitter (per route, opt-in) | `src/ack/` | `MessageDelivered` → proof-gen → `submitAcknowledgment` |
+| Ack submitter (per route, opt-in) | `src/ack/` | `MessageDelivered`/`MessagePending` → proof-gen → `submitAcknowledgment` + `claimDelivery` |
 | Claim submitter (per route, opt-in) | `src/claim/` | bridge `Locked` → proof-gen → `CcBridge.claim` on Creditcoin ("relayer on both sides": users only send the lock tx) |
 | Attestor-set watcher (per on-chain route) | `src/attestor_set.rs` | Poll `EOAValidator.attestors()/threshold()` every 30 s, hot-reload the pool |
 | HTTP + metrics | `src/prom/` | `/health`, `/metrics`, `/votes/{message_hash}` |
@@ -107,14 +113,23 @@ retry silently forever:
 - **Ack lifecycle** — `BlockNotReady` (proof not attested yet) defers on a steady 15 s cadence
   without penalty, bounded by a 24 h give-up; transient submit failures back off 30 s → 10 min and
   give up loudly after 20 attempts (the unfunded-signer failure mode); reverts bubbling from the
-  Outbox (`MessageDoesNotRequireAck`, `MessageAlreadyAcknowledged`, …) are terminal. A
-  **requiresAck pre-check** reads the Outbox state first, so bridge-style `requiresAck=false`
-  traffic costs two view calls instead of a proof fetch + guaranteed-revert estimate.
+  Outbox (`MessageCannotBeAcknowledged`, `MessageAlreadyAcknowledged`, …) are terminal. A
+  **canAck pre-check** reads the Outbox state first, so bridge-style `canAck=false` traffic costs
+  a view call instead of a proof fetch + guaranteed-revert estimate — tagged per-message at
+  discovery time against whichever Outbox is currently resolved (next bullet), so it is immune to
+  a later Outbox rotation retroactively changing which contract an already-queued message is
+  checked against.
+- **Outbox resolution follows rotation** — a route with no `outbox_address` configured resolves
+  its Outbox from the chain key alone (on-chain factory lookup + `OutboxCreated` log scan) and
+  re-checks periodically, so a factory-level Outbox rotation is picked up without a restart. New
+  discovery moves to the new address; already-indexed/pending work is unaffected.
 - **Checkpoints + startup lookback** — block cursors persist to `--checkpoint-path` so restarts
   never skip events. Because votes and pending acks are memory-only, cursors are rewound by
   `scan_lookback_blocks` (default 600) on startup: in-flight work is re-discovered, and
   already-finished work resolves idempotently (delivered → `Already validated` at simulate,
-  acked → skipped by the pre-check).
+  acked → skipped by the pre-check). The Outbox watcher's checkpoint additionally records which
+  Outbox address it was scanned against, so a restart can tell a valid long-running cursor apart
+  from one left over from a since-rotated-away Outbox.
 - **Bounded everything** — vote cache (TTL + LRU cap), pending-ack queue (cap 10 000, oldest
   evicted), per-tick ack batch (256) and concurrency (8), 5 000-block `eth_getLogs` chunks (an
   over-large resume range would error on every tick forever on range-capped RPCs), 120 s receipt
@@ -157,7 +172,10 @@ message-relayer --single-route \
 Every flag has a `RELAYER_*` env twin (`--help` lists them); `.env` is loaded via dotenvy.
 Ack flags (`--ack-proof-gen-url`, `--ack-validator-address`, `--ack-signer-key`) must be set
 together or not at all. `--checkpoint-path ""` disables persistence (watchers start at head).
-`--verbose` switches `info` → `debug` logging.
+`--verbose` switches `info` → `debug` logging. A few poll cadences are env-only (no CLI flag,
+sensible defaults): `RELAYER_ACK_POLL_SECS`, `RELAYER_CLAIM_POLL_SECS`,
+`RELAYER_OUTBOX_RESOLVE_POLL_SECS` (how often a factory-resolved route re-checks for an Outbox
+rotation, default 60 s).
 
 ## HTTP API
 
@@ -220,8 +238,8 @@ message-relayer/         the relayer crate
   bin/relayer.rs         CLI entrypoint (clap; --config or --single-route)
   src/lib.rs             Server: worker wiring, channels, supervisor JoinSet
   src/config.rs          YAML schema + validation (see config.example.yaml)
-  src/events/            Outbox watcher + outbox resolver (factory resolver is a stub;
-                         outbox_address must be configured until the OutboxFactory ships)
+  src/events/            Outbox watcher + outbox resolver (static outbox_address, or on-chain
+                         factory-based resolution when it's omitted; see events/factory.rs)
   src/pool/              vote aggregation state machine (allowlist, threshold, retries,
                          reobservation triggers, /votes queries, hot set-reload)
   src/p2p/               libp2p swarm: gossipsub topics, envelope codecs, peer metrics
@@ -239,13 +257,15 @@ Dockerfile               two-stage image build
 
 ## Known gaps
 
-- **OutboxFactory resolution is a stub** — `routes[].outbox_address` is required; factory-based
-  discovery lands when the `OutboxFactory` contract ships.
 - **`cc3_active_set` attestor source is unimplemented** — use `evm_contract` (hot-reloaded) or
   `static`.
 - **Generic intent target** — the claim submitter currently targets the bridge PoC's
   `CcBridge.claim`; when the reviewed `IUSCBridgeInbound.bridgeFromIntent` contracts deploy, the
   swap is an ABI + config change confined to `src/claim/` (identical proof arguments).
-- **Fee integration** — quote-gated delivery (`getMessageInfo` / gas-limit pre-check /
-  `requestTopUp`) and the `RelayerFeeVault.claimDelivery` payment loop land once the
-  RelayerContract/vault/Quoter suite deploys; today the relayer delivers and claims for free.
+- **Factory-based Outbox resolution depends on an unmerged creditcoin3 branch** —
+  `FactoryResolver` calls a chain-info precompile (`get_outbox_factory_address`) that only exists
+  on `writeability-off-usc-dev`, not yet on `main`/`usc-dev`. Until it merges, routes need an
+  explicit `outbox_address` on any network where the precompile isn't deployed.
+- **`FactoryResolver`'s scan cursor is in-memory only** — a process restart re-scans the factory's
+  full `OutboxCreated` history from genesis rather than resuming a persisted position. Slower cold
+  start, not a correctness issue.
