@@ -149,22 +149,27 @@ pub async fn watch_outbox(
     // past it and stray votes are dropped by the chain-first allowlist). Re-indexing the recent
     // window is idempotent — already-delivered messages re-collect votes via reobservation and
     // resolve as "Already validated" at simulate.
-    // A checkpoint is only a valid resume point for the Outbox it was actually scanned against —
-    // recorded alongside the block by `set_with_outbox` (see `checkpoint` module docs). Block
-    // numbers alone can't substitute for this: a long-lived, never-rotated Outbox's checkpoint is
-    // *always* numerically ahead of its own `current_since_block` (you can't publish on a
-    // contract before it exists), and so is a stale checkpoint left over from a since-rotated-away
-    // Outbox — the two cases are indistinguishable by block number alone, only by address.
+    // A checkpoint recorded against a *known, different* Outbox address is not a valid resume
+    // point for the currently resolved one — block numbers alone can't substitute for this check
+    // (a long-lived, never-rotated Outbox's checkpoint is always numerically ahead of its own
+    // `current_since_block`, and so is a stale one left over from a since-rotated-away Outbox;
+    // the two are indistinguishable by block number alone). But the absence of a recorded address
+    // — every checkpoint file written before `set_with_outbox` existed, and any resolver (like
+    // `ConfigOverrideResolver`, whose address never changes and has no rotation to guard against)
+    // that never bothered recording one — is not evidence of a mismatch, and must not be treated
+    // as one: that previously discarded every pre-existing checkpoint on the first restart after
+    // upgrading, silently skipping everything published since (`ConfigOverrideResolver` has no
+    // `current_since_block` to fall back to, so the fallback chain bottomed out at the chain head).
+    // Only an explicit, contradicting address distrusts the checkpoint; "unknown" trusts it, same
+    // as before this address tracking existed.
     let checkpoint_block = checkpoint.as_ref().and_then(|c| c.get(&checkpoint_key));
     let checkpoint_outbox = checkpoint
         .as_ref()
         .and_then(|c| c.get_outbox(&checkpoint_key));
-    let checkpoint_matches_resolved_outbox =
-        checkpoint_outbox.as_deref() == Some(resolved.address.to_string().as_str());
+    let checkpoint_is_stale =
+        checkpoint_contradicts_resolved_outbox(checkpoint_outbox.as_deref(), resolved.address);
 
-    let mut last_seen = if let (Some(block), true) =
-        (checkpoint_block, checkpoint_matches_resolved_outbox)
-    {
+    let mut last_seen = if let (Some(block), false) = (checkpoint_block, checkpoint_is_stale) {
         let resume = block.saturating_sub(scan_lookback_blocks);
         info!(
             chain_key,
@@ -180,8 +185,8 @@ pub async fn watch_outbox(
                 checkpoint = block,
                 recorded_outbox = ?checkpoint_outbox,
                 resolved_outbox = %resolved.address,
-                "↩️ checkpoint is for a different (or pre-migration, untracked) Outbox address; \
-                 not reusing it as a resume point"
+                "↩️ checkpoint is recorded against a different Outbox address; not reusing it as \
+                 a resume point"
             );
         }
         if let Some(since) = resolved.current_since_block {
@@ -395,4 +400,47 @@ async fn poll_once<P: Provider>(
 
     *last_seen = to_block;
     Ok(())
+}
+
+/// Whether a checkpoint's recorded Outbox address (if any) positively contradicts the currently
+/// resolved one. `None` — no address was ever recorded, whether because the checkpoint file
+/// predates `set_with_outbox` or because the resolver (e.g. `ConfigOverrideResolver`, whose
+/// address never changes) never needed to — is deliberately NOT a contradiction: absence of
+/// evidence must not be treated as evidence of staleness, or every pre-existing checkpoint gets
+/// discarded on the first restart after upgrading. Only an address that was actually recorded and
+/// differs counts.
+fn checkpoint_contradicts_resolved_outbox(recorded: Option<&str>, resolved: Address) -> bool {
+    recorded.is_some_and(|recorded| recorded != resolved.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_recorded_outbox_is_not_a_contradiction() {
+        let resolved = Address::from([1u8; 20]);
+        // Pre-migration checkpoint file, or a resolver that never records one — either way,
+        // "unknown" must trust the checkpoint exactly as it did before this tracking existed.
+        assert!(!checkpoint_contradicts_resolved_outbox(None, resolved));
+    }
+
+    #[test]
+    fn matching_recorded_outbox_is_not_a_contradiction() {
+        let resolved = Address::from([1u8; 20]);
+        assert!(!checkpoint_contradicts_resolved_outbox(
+            Some(&resolved.to_string()),
+            resolved
+        ));
+    }
+
+    #[test]
+    fn different_recorded_outbox_is_a_contradiction() {
+        let resolved = Address::from([1u8; 20]);
+        let other = Address::from([2u8; 20]);
+        assert!(checkpoint_contradicts_resolved_outbox(
+            Some(&other.to_string()),
+            resolved
+        ));
+    }
 }
