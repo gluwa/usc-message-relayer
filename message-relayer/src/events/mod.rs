@@ -151,7 +151,17 @@ pub async fn watch_outbox(
     // resolve as "Already validated" at simulate.
     let mut last_seen = match checkpoint.as_ref().and_then(|c| c.get(&checkpoint_key)) {
         Some(block) => {
-            let resume = block.saturating_sub(scan_lookback_blocks);
+            let mut resume = block.saturating_sub(scan_lookback_blocks);
+            // The checkpoint isn't keyed by Outbox address — it may predate the currently
+            // resolved Outbox (a rotation happened, or was only just discovered, since it was
+            // last written) or belong to one rotated away from. Cap it to never start scanning
+            // later than this Outbox's own earliest known block: an old checkpoint that's more
+            // recent than that would otherwise silently skip messages published on this Outbox
+            // before the checkpoint ever knew about it. Extra re-scanning from an old checkpoint
+            // that's earlier is harmless; skipping is not.
+            if let Some(since) = resolved.current_since_block {
+                resume = resume.min(since.saturating_sub(1));
+            }
             info!(
                 chain_key,
                 checkpoint = block,

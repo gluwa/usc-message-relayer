@@ -64,6 +64,7 @@ use tracing::{debug, info, warn};
 use crate::abi::{IInbox, IOutbox};
 use crate::checkpoint::CheckpointStore;
 use crate::config::{AckConfig, ChainRoute};
+use crate::events::{OutboxResolver, DEFAULT_RESOLVE_POLL_INTERVAL_SECS};
 use crate::pending::{BoundedSeen, PendingTxs};
 use crate::proofgen::{ProofFetch, ProofGenClient};
 
@@ -131,9 +132,11 @@ const MAX_ACK_TRANSIENT_ATTEMPTS: u32 = 20;
 /// `ack` config; otherwise loops until `cancel` fires or an unrecoverable error occurs.
 /// `scan_lookback_blocks` rewinds the persisted cursor on startup so acks that were pending when
 /// the process died are re-discovered (see [`crate::config::DEFAULT_SCAN_LOOKBACK_BLOCKS`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     route: ChainRoute,
     creditcoin_eth_rpc_url: String,
+    resolver: Arc<dyn OutboxResolver>,
     checkpoint: Option<Arc<CheckpointStore>>,
     scan_lookback_blocks: u64,
     health: Arc<crate::health::Health>,
@@ -207,6 +210,25 @@ pub async fn run(
 
     let client = ProofGenClient::new(&ack.proof_gen_url)?;
 
+    // Best-effort source Outbox address for `acknowledge_tx`'s `canAck`/already-acked pre-check —
+    // a pure cost-saving shortcut (the contracts enforce the same rules on-chain regardless), so
+    // failure to resolve here is not fatal: it just means the pre-check fails open (assumes ack
+    // needed) until a resolution succeeds. `route.outbox_address` alone is wrong for a
+    // factory-resolved route (it's `None` by construction — see `lib.rs`'s resolver selection),
+    // which would otherwise silently lose this optimization entirely for every such route.
+    let dyn_provider = source_provider.clone().erased();
+    let mut outbox = match resolver.resolve(&route, &dyn_provider).await {
+        Ok(resolved) => Some(resolved.address),
+        Err(err) => {
+            debug!(
+                chain_key,
+                %err,
+                "source Outbox not resolved yet; canAck pre-check fails open until it is"
+            );
+            None
+        }
+    };
+
     match &mode {
         SettlementMode::Ack => info!(
             chain_key,
@@ -274,11 +296,33 @@ pub async fn run(
     let mut pacer = crate::pacing::RateLimitPacer::default();
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let mut resolve_tick =
+        tokio::time::interval(Duration::from_secs(crate::config::poll_secs_override(
+            "RELAYER_OUTBOX_RESOLVE_POLL_SECS",
+            DEFAULT_RESOLVE_POLL_INTERVAL_SECS,
+        )));
+    resolve_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
                 info!(chain_key, "🛑 acknowledgment submitter exiting on cancel");
                 return Ok(());
+            }
+            _ = resolve_tick.tick() => {
+                match resolver.resolve(&route, &dyn_provider).await {
+                    Ok(resolved) => {
+                        if outbox != Some(resolved.address) {
+                            info!(
+                                chain_key,
+                                outbox = %resolved.address,
+                                "🔁 source Outbox resolved for the canAck pre-check"
+                            );
+                            outbox = Some(resolved.address);
+                        }
+                    }
+                    Err(err) => debug!(chain_key, %err, "source Outbox re-resolution failed; keeping previous state"),
+                }
             }
             _ = tick.tick() => {
                 // Rate-limit pacing: while a deferral window is active, skip the tick entirely —
@@ -326,7 +370,7 @@ pub async fn run(
                     chain_key,
                     &ack,
                     &mode,
-                    route.outbox_address,
+                    outbox,
                     &client,
                     &source_provider,
                     submitter_address,

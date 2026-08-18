@@ -218,15 +218,30 @@ impl Server {
             ),
         );
 
-        // Outbox watchers (per route). A route with an explicit `outbox_address` keeps that
-        // static override (`ConfigOverrideResolver`); one without resolves its Outbox
-        // automatically from the chain key via `FactoryResolver` (see `events::factory`).
+        // One resolver per route, shared between its Outbox watcher and its ack submitter below —
+        // both need to agree on the same live Outbox address for a factory-resolved route (the
+        // ack submitter's `canAck` pre-check queries the Outbox too), and sharing one resolver
+        // keeps the on-chain scan progress in one place instead of duplicating it. A route with an
+        // explicit `outbox_address` keeps that static override (`ConfigOverrideResolver`); one
+        // without resolves automatically from the chain key via `FactoryResolver` (see
+        // `events::factory`).
+        let resolvers: HashMap<u64, Arc<dyn OutboxResolver>> = self
+            .config
+            .routes
+            .iter()
+            .map(|route| {
+                let resolver: Arc<dyn OutboxResolver> = if route.outbox_address.is_some() {
+                    Arc::new(ConfigOverrideResolver)
+                } else {
+                    Arc::new(FactoryResolver::new())
+                };
+                (route.chain_key, resolver)
+            })
+            .collect();
+
+        // Outbox watchers (per route).
         for route in &self.config.routes {
-            let resolver: Arc<dyn OutboxResolver> = if route.outbox_address.is_some() {
-                Arc::new(ConfigOverrideResolver)
-            } else {
-                Arc::new(FactoryResolver::new())
-            };
+            let resolver = resolvers[&route.chain_key].clone();
             spawn_worker(
                 &mut tasks,
                 format!("outbox watcher (chain_key {})", route.chain_key),
@@ -268,12 +283,14 @@ impl Server {
             );
         }
         for route in self.config.routes.iter().filter(|r| r.ack.is_some()) {
+            let resolver = resolvers[&route.chain_key].clone();
             spawn_worker(
                 &mut tasks,
                 format!("ack submitter (chain_key {})", route.chain_key),
                 ack::run(
                     route.clone(),
                     self.config.creditcoin_eth_rpc_url.clone(),
+                    resolver,
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
                     health.clone(),
