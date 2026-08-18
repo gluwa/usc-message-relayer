@@ -20,6 +20,20 @@
 //! `RelayerContract.claimDelivery(messageId, ..)` per delivered message, which pays the relay fee
 //! (+ any unexpired tip) to the relayer proven in the destination `MessageDelivered` event.
 //!
+//! The discovery scan also watches `MessagePending` (dApp callback reverted; message stored for
+//! `retryPendingMessage`) for exactly this reason: `EVMDeliveryDecoder` accepts a proof over a
+//! `MessagePending`-emitting tx as a payable outcome (`ExecutionStatus.Reverted`), but only when
+//! the proof is built from the *original* `deliverMessage` tx — a later `retryPendingMessage` tx
+//! carries the wrong call selector and the decoder rejects it (`UnsupportedDestinationTransaction`).
+//! Without watching `MessagePending` too, a message that ever goes pending strands its relay fee
+//! forever: the originating tx is never enqueued (no `MessageDelivered` log to find it by), and if
+//! a retry later succeeds, its tx is unusable as a claim proof. Claiming off the original tx as
+//! soon as it is observed also settles well before `deliveryDeadline`, closing the window where a
+//! payer could otherwise `requestRefund` a message that was in fact delivered. A `MessagePending`
+//! tx has no `submitAcknowledgment` proof to offer (no `MessageDelivered` log for the validator to
+//! decode) — `acknowledge_tx`'s pre-checks and terminal classification already handle that
+//! gracefully, skipping straight to the claim.
+//!
 //! Since usc-contracts #23 the claim does NOT acknowledge — ack settlement lives solely on the
 //! `AcknowledgmentValidator` — so the two submissions are independent and BOTH run here, ack first:
 //! the message's user-set ackFee is an open bounty paid to the first successful `submitAcknowledgment`
@@ -335,7 +349,12 @@ pub async fn run(
     }
 }
 
-/// Poll the destination Inbox for new `MessageDelivered` events and enqueue their tx hashes.
+/// Poll the destination Inbox for new `MessageDelivered` AND `MessagePending` events and enqueue
+/// their tx hashes.
+///
+/// `MessagePending` is scanned alongside `MessageDelivered` so a message whose dApp callback
+/// reverted still gets its relay fee claimed off the *originating* `deliverMessage` tx — see the
+/// module docs' "Relay-fee claiming" section for why this is the only tx that can prove it.
 ///
 /// Scans only up to `tip - confirmation_depth` so a destination reorg on the unsafe head cannot
 /// enqueue an ack for a delivery that later disappears.
@@ -359,39 +378,50 @@ async fn discover_delivered<P: Provider>(
 
     let filter = Filter::new()
         .address(inbox)
-        .event_signature(IInbox::MessageDelivered::SIGNATURE_HASH)
+        .event_signature(vec![
+            IInbox::MessageDelivered::SIGNATURE_HASH,
+            IInbox::MessagePending::SIGNATURE_HASH,
+        ])
         .from_block(from_block)
         .to_block(to_block);
 
     let logs = provider.get_logs(&filter).await.with_context(|| {
-        format!("eth_getLogs MessageDelivered from {from_block} to {to_block} failed")
+        format!(
+            "eth_getLogs MessageDelivered/MessagePending from {from_block} to {to_block} failed"
+        )
     })?;
 
     for log in logs {
         let Some(tx_hash) = log.transaction_hash else {
-            warn!(
-                chain_key,
-                "MessageDelivered log without transaction_hash; skipping"
-            );
+            warn!(chain_key, "delivery log without transaction_hash; skipping");
             continue;
         };
         let Some(block) = log.block_number else {
             warn!(
                 chain_key,
                 %tx_hash,
-                "MessageDelivered log without block_number; skipping"
+                "delivery log without block_number; skipping"
             );
             continue;
         };
-        // The delivered messageId feeds the canAck pre-check on the source Outbox, so bridge
-        // traffic never costs a proof fetch. A tx may carry several MessageDelivered logs.
-        let message_id = match IInbox::MessageDelivered::decode_log(&log.inner) {
-            Ok(decoded) => decoded.data.messageId,
+
+        // The delivered/pending messageId feeds the canAck and relay-claimable pre-checks, so
+        // bridge or already-settled traffic never costs a proof fetch. A tx may carry several
+        // such logs (one call, several messages).
+        let (event_name, message_id) = match decode_delivery_log(&log) {
+            Ok(Some(decoded)) => decoded,
+            Ok(None) => {
+                // The filter only asks for MessageDelivered/MessagePending topic0s; an RPC that
+                // ignores event_signature and returns everything on the Inbox would land here.
+                // Skip rather than mis-decode.
+                continue;
+            }
             Err(err) => {
-                warn!(chain_key, %tx_hash, %err, "could not decode MessageDelivered log; skipping");
+                warn!(chain_key, %tx_hash, %err, "could not decode delivery log; skipping");
                 continue;
             }
         };
+
         if done.contains(&tx_hash) {
             continue;
         }
@@ -406,11 +436,33 @@ async fn discover_delivered<P: Provider>(
                 "ack pending queue at capacity; giving up on oldest un-acknowledged delivery"
             );
         }
-        debug!(chain_key, %tx_hash, %message_id, "🧾 observed MessageDelivered; queued for acknowledgment");
+        debug!(chain_key, %tx_hash, %message_id, event_name, "🧾 observed delivery event; queued for settlement");
     }
 
     *last_seen = to_block;
     Ok(())
+}
+
+/// Classify and decode one destination log by topic0: `Ok(Some((name, messageId)))` for a
+/// recognized `MessageDelivered`/`MessagePending` log, `Ok(None)` for anything else (the caller's
+/// filter should never produce this, but a permissive RPC is not trusted to honor it), `Err` if
+/// the topic0 matched but the log body failed to decode. Split out from [`discover_delivered`] so
+/// the topic0 dispatch — the part of the fee-claim fix that must never silently pick the wrong
+/// event — is unit-testable without a live provider.
+fn decode_delivery_log(
+    log: &alloy::rpc::types::Log,
+) -> Result<Option<(&'static str, B256)>, alloy::sol_types::Error> {
+    match log.topics().first().copied() {
+        Some(sig) if sig == IInbox::MessageDelivered::SIGNATURE_HASH => {
+            IInbox::MessageDelivered::decode_log(&log.inner)
+                .map(|decoded| Some(("MessageDelivered", decoded.data.messageId)))
+        }
+        Some(sig) if sig == IInbox::MessagePending::SIGNATURE_HASH => {
+            IInbox::MessagePending::decode_log(&log.inner)
+                .map(|decoded| Some(("MessagePending", decoded.data.messageId)))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Try to fetch a proof and submit an acknowledgment for every pending destination tx that is due
@@ -992,5 +1044,72 @@ mod tests {
             crate::abi::IOutbox::MessageNotFound::SELECTOR,
             [0x5d, 0x80, 0x3c, 0xca]
         );
+    }
+
+    fn rpc_log(address: Address, data: alloy::primitives::LogData) -> alloy::rpc::types::Log {
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log { address, data },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn decode_delivery_log_dispatches_on_topic0() {
+        // The fee-claim fix hinges on telling these two events apart correctly — a MessagePending
+        // log misclassified as MessageDelivered (or vice versa) would either skip the claim or
+        // waste gas on a guaranteed-revert ack.
+        let message_id = B256::from([7u8; 32]);
+        let addr = Address::from([1u8; 20]);
+
+        let delivered = IInbox::MessageDelivered {
+            messageId: message_id,
+            processor: addr,
+            relayer: addr,
+        };
+        let (name, id) = decode_delivery_log(&rpc_log(addr, delivered.encode_log_data()))
+            .expect("decodes")
+            .expect("recognized");
+        assert_eq!(name, "MessageDelivered");
+        assert_eq!(id, message_id);
+
+        let pending = IInbox::MessagePending {
+            messageId: message_id,
+            destinationContract: addr,
+            relayer: addr,
+        };
+        let (name, id) = decode_delivery_log(&rpc_log(addr, pending.encode_log_data()))
+            .expect("decodes")
+            .expect("recognized");
+        assert_eq!(name, "MessagePending");
+        assert_eq!(id, message_id);
+    }
+
+    #[test]
+    fn decode_delivery_log_ignores_unrelated_topic0() {
+        // The discovery filter only requests these two topic0s, but an RPC is not trusted to
+        // honor that — an unrelated event on the same Inbox (e.g. the ack validator's
+        // Acknowledged, a completely different contract in practice but same shape of concern)
+        // must be skipped, not mis-decoded as one of the two we expect.
+        let unrelated = crate::abi::IAcknowledgmentValidator::Acknowledged {
+            messageId: B256::from([9u8; 32]),
+        };
+        let log = rpc_log(Address::ZERO, unrelated.encode_log_data());
+        assert!(decode_delivery_log(&log)
+            .expect("no decode error")
+            .is_none());
+    }
+
+    #[test]
+    fn decode_delivery_log_surfaces_decode_errors_for_matching_topic0() {
+        // Right topic0, but too few topics for the event's three indexed fields (messageId,
+        // processor, relayer) — a malformed/truncated log must error, not silently drop the
+        // relay-fee claim by falling through as "unrecognized".
+        let malformed = alloy::primitives::LogData::new(
+            vec![IInbox::MessageDelivered::SIGNATURE_HASH],
+            Default::default(),
+        )
+        .expect("valid LogData");
+        let log = rpc_log(Address::ZERO, malformed);
+        assert!(decode_delivery_log(&log).is_err());
     }
 }
