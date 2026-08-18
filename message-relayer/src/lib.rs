@@ -218,13 +218,10 @@ impl Server {
             ),
         );
 
-        // One resolver per route, shared between its Outbox watcher and its ack submitter below —
-        // both need to agree on the same live Outbox address for a factory-resolved route (the
-        // ack submitter's `canAck` pre-check queries the Outbox too), and sharing one resolver
-        // keeps the on-chain scan progress in one place instead of duplicating it. A route with an
-        // explicit `outbox_address` keeps that static override (`ConfigOverrideResolver`); one
-        // without resolves automatically from the chain key via `FactoryResolver` (see
-        // `events::factory`).
+        // One resolver per route, shared between its Outbox watcher and ack submitter below — both
+        // need to agree on the same live Outbox address, and sharing keeps the on-chain scan
+        // progress in one place. An explicit `outbox_address` keeps that static override; a route
+        // without one resolves automatically via `FactoryResolver`.
         let resolvers: HashMap<u64, Arc<dyn OutboxResolver>> = self
             .config
             .routes

@@ -13,15 +13,11 @@
 //! (`MessageAlreadyAcknowledged`), so the cursor gives at-least-once, never at-most-once.
 //!
 //! Each entry is `{ "block": 1234, "outbox": "0x..." }` — `outbox` records which Outbox address
-//! that block cursor was scanned against (the Outbox watcher's own key; unused/`None` for the ack
-//! watcher's `ack:{chain_key}` keys, which don't have this ambiguity). This matters for a
-//! factory-resolved route: a bare block number says nothing about whether it was scanned against
-//! the Outbox that's *currently* resolved or one since rotated away from — see
-//! `events::watch_outbox`'s startup resume logic, which compares this against the freshly
-//! resolved address rather than assuming the cursor is still valid for it. Older checkpoint files
-//! (written before this field existed) store a bare number per key instead of an object; both
-//! shapes deserialize, and any key touched by [`CheckpointStore::set`]/[`set_with_outbox`] is
-//! rewritten in the current shape on its next save (the whole map is re-serialized every write).
+//! that block cursor was scanned against (Outbox watcher keys only; a bare block number can't
+//! tell a valid checkpoint apart from one left over from a since-rotated-away Outbox, see
+//! `events::watch_outbox`'s resume logic). Checkpoint files written before this field existed
+//! store a bare number per key instead; both shapes deserialize, and any touched key is rewritten
+//! in the current shape on its next save.
 //!
 //! Note: this covers durable *on-chain* events. Attestor votes travel over gossip (ephemeral) and
 //! are out of scope here — a relayer that was down while votes were gossiped relies on the votes

@@ -149,19 +149,9 @@ pub async fn watch_outbox(
     // past it and stray votes are dropped by the chain-first allowlist). Re-indexing the recent
     // window is idempotent — already-delivered messages re-collect votes via reobservation and
     // resolve as "Already validated" at simulate.
-    // A checkpoint recorded against a *known, different* Outbox address is not a valid resume
-    // point for the currently resolved one — block numbers alone can't substitute for this check
-    // (a long-lived, never-rotated Outbox's checkpoint is always numerically ahead of its own
-    // `current_since_block`, and so is a stale one left over from a since-rotated-away Outbox;
-    // the two are indistinguishable by block number alone). But the absence of a recorded address
-    // — every checkpoint file written before `set_with_outbox` existed, and any resolver (like
-    // `ConfigOverrideResolver`, whose address never changes and has no rotation to guard against)
-    // that never bothered recording one — is not evidence of a mismatch, and must not be treated
-    // as one: that previously discarded every pre-existing checkpoint on the first restart after
-    // upgrading, silently skipping everything published since (`ConfigOverrideResolver` has no
-    // `current_since_block` to fall back to, so the fallback chain bottomed out at the chain head).
-    // Only an explicit, contradicting address distrusts the checkpoint; "unknown" trusts it, same
-    // as before this address tracking existed.
+    // A checkpoint recorded against a different, known Outbox address is not a valid resume point
+    // for the one just resolved — see `checkpoint_contradicts_resolved_outbox` for why "unknown"
+    // must not be treated the same as "different".
     let checkpoint_block = checkpoint.as_ref().and_then(|c| c.get(&checkpoint_key));
     let checkpoint_outbox = checkpoint
         .as_ref()
@@ -231,11 +221,9 @@ pub async fn watch_outbox(
                 match resolver.resolve(&route, &dyn_provider).await {
                     Ok(fresh) => {
                         if fresh.address != outbox {
-                            // In-flight/already-indexed messages are unaffected — the pool tracks
-                            // them independently of which Outbox they came from. Only the
-                            // MessagePublished scan below switches: new discovery moves to the new
-                            // address, resuming at its earliest known block so nothing published
-                            // between deployment and this check is missed.
+                            // In-flight/already-indexed messages are unaffected (the pool tracks
+                            // them independently of the Outbox); only new discovery moves to the
+                            // new address, resuming at its earliest known block.
                             info!(
                                 chain_key,
                                 old = %outbox,
@@ -275,10 +263,8 @@ pub async fn watch_outbox(
                             // unfinished message no matter how long it has been stalled. The
                             // in-memory cursor keeps advancing; re-indexing is idempotent
                             // (duplicate slots kept, delivery resolves AlreadyValidated).
-                            // Recording which Outbox this cursor was scanned against (not just a
-                            // plain `set`) is what lets a future restart's resume logic above tell
-                            // a valid long-running checkpoint apart from a stale one left over
-                            // from a since-rotated-away Outbox.
+                            // Recording the Outbox address (not just a plain `set`) is what lets
+                            // the resume logic above tell a valid checkpoint from a stale one.
                             let persist = holdback.clamp(chain_key, last_seen);
                             if let Err(err) =
                                 cp.set_with_outbox(&checkpoint_key, persist, &outbox.to_string())
@@ -403,12 +389,9 @@ async fn poll_once<P: Provider>(
 }
 
 /// Whether a checkpoint's recorded Outbox address (if any) positively contradicts the currently
-/// resolved one. `None` — no address was ever recorded, whether because the checkpoint file
-/// predates `set_with_outbox` or because the resolver (e.g. `ConfigOverrideResolver`, whose
-/// address never changes) never needed to — is deliberately NOT a contradiction: absence of
-/// evidence must not be treated as evidence of staleness, or every pre-existing checkpoint gets
-/// discarded on the first restart after upgrading. Only an address that was actually recorded and
-/// differs counts.
+/// resolved one. `None` — no address was ever recorded, whether a pre-migration checkpoint file
+/// or a resolver (e.g. `ConfigOverrideResolver`) that never needed to — is deliberately NOT a
+/// contradiction: only a recorded address that actually differs counts.
 fn checkpoint_contradicts_resolved_outbox(recorded: Option<&str>, resolved: Address) -> bool {
     recorded.is_some_and(|recorded| recorded != resolved.to_string())
 }

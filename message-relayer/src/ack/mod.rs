@@ -21,18 +21,13 @@
 //! (+ any unexpired tip) to the relayer proven in the destination `MessageDelivered` event.
 //!
 //! The discovery scan also watches `MessagePending` (dApp callback reverted; message stored for
-//! `retryPendingMessage`) for exactly this reason: `EVMDeliveryDecoder` accepts a proof over a
-//! `MessagePending`-emitting tx as a payable outcome (`ExecutionStatus.Reverted`), but only when
-//! the proof is built from the *original* `deliverMessage` tx — a later `retryPendingMessage` tx
-//! carries the wrong call selector and the decoder rejects it (`UnsupportedDestinationTransaction`).
-//! Without watching `MessagePending` too, a message that ever goes pending strands its relay fee
-//! forever: the originating tx is never enqueued (no `MessageDelivered` log to find it by), and if
-//! a retry later succeeds, its tx is unusable as a claim proof. Claiming off the original tx as
-//! soon as it is observed also settles well before `deliveryDeadline`, closing the window where a
-//! payer could otherwise `requestRefund` a message that was in fact delivered. A `MessagePending`
-//! tx has no `submitAcknowledgment` proof to offer (no `MessageDelivered` log for the validator to
-//! decode) — `acknowledge_tx`'s pre-checks and terminal classification already handle that
-//! gracefully, skipping straight to the claim.
+//! `retryPendingMessage`): `EVMDeliveryDecoder` accepts a proof over a `MessagePending`-emitting
+//! tx as payable, but only from the *original* `deliverMessage` tx — a later `retryPendingMessage`
+//! tx carries the wrong call selector and the decoder rejects it. Without this, a message that
+//! ever goes pending strands its relay fee forever: the originating tx is never enqueued, and a
+//! successful retry's tx is unusable as a claim proof. A `MessagePending` tx has no
+//! `submitAcknowledgment` proof to offer — `acknowledge_tx`'s existing terminal classification
+//! already handles that, skipping straight to the claim.
 //!
 //! Since usc-contracts #23 the claim does NOT acknowledge — ack settlement lives solely on the
 //! `AcknowledgmentValidator` — so the two submissions are independent and BOTH run here, ack first:
@@ -212,11 +207,8 @@ pub async fn run(
     let client = ProofGenClient::new(&ack.proof_gen_url)?;
 
     // Best-effort source Outbox address for `acknowledge_tx`'s `canAck`/already-acked pre-check —
-    // a pure cost-saving shortcut (the contracts enforce the same rules on-chain regardless), so
-    // failure to resolve here is not fatal: it just means the pre-check fails open (assumes ack
-    // needed) until a resolution succeeds. `route.outbox_address` alone is wrong for a
-    // factory-resolved route (it's `None` by construction — see `lib.rs`'s resolver selection),
-    // which would otherwise silently lose this optimization entirely for every such route.
+    // a pure cost-saving shortcut, so failure to resolve here is not fatal: the pre-check just
+    // fails open until a resolution succeeds.
     let dyn_provider = source_provider.clone().erased();
     let mut outbox = match resolver.resolve(&route, &dyn_provider).await {
         Ok(resolved) => Some(resolved.address),
@@ -289,13 +281,11 @@ pub async fn run(
     let mut pending = PendingTxs::new(MAX_PENDING_ACKS);
     // Tx hashes already acknowledged (or terminally skipped) — never re-submitted (bounded).
     let mut done = BoundedSeen::new(MAX_DONE_TRACKED);
-    // The source Outbox address that was resolved at the moment each pending tx was FIRST
-    // discovered — captured once and never updated again for that entry, even if `outbox` later
-    // rotates. This is what `acknowledge_tx`'s canAck pre-check is actually checked against: using
-    // whatever `outbox` happens to be *now* would ask a message's `messageCanAck`/`isAcknowledged`
-    // state from a contract it was never published on after a rotation (unknown id defaults to
-    // `false` there), turning a real unsettled ack into a false "nothing to do" — see the PR #39
-    // review this closes. Kept in lockstep with `pending`/`done`: removed wherever they are.
+    // The source Outbox each pending tx was tagged with at first discovery — captured once and
+    // never updated again for that entry, even if `outbox` later rotates. Using whatever `outbox`
+    // is *now* would ask a message's canAck state from a contract it was never published on after
+    // a rotation (unknown id defaults to `false`), turning a real unsettled ack into a false
+    // "nothing to do". Kept in lockstep with `pending`/`done`: removed wherever they are.
     let mut pending_outbox: HashMap<B256, Address> = HashMap::new();
 
     let mut tick = tokio::time::interval(Duration::from_secs(crate::config::poll_secs_override(
@@ -405,19 +395,14 @@ pub async fn run(
 }
 
 /// Poll the destination Inbox for new `MessageDelivered` AND `MessagePending` events and enqueue
-/// their tx hashes.
-///
-/// `MessagePending` is scanned alongside `MessageDelivered` so a message whose dApp callback
-/// reverted still gets its relay fee claimed off the *originating* `deliverMessage` tx — see the
-/// module docs' "Relay-fee claiming" section for why this is the only tx that can prove it.
+/// their tx hashes (see the module docs' "Relay-fee claiming" section for why `MessagePending`
+/// matters here too).
 ///
 /// Scans only up to `tip - confirmation_depth` so a destination reorg on the unsafe head cannot
 /// enqueue an ack for a delivery that later disappears.
 ///
-/// `outbox`, if known, is recorded in `pending_outbox` for every *newly* discovered tx — captured
-/// once, at first sight, and never touched again for that entry regardless of later resolver
-/// rotations (see the field's doc in [`run`]). `None` records nothing, leaving that tx's pre-check
-/// to fail open exactly as it always has for a route with no resolved Outbox yet.
+/// `outbox`, if known, is recorded in `pending_outbox` for every *newly* discovered tx (see that
+/// field's doc in [`run`]); `None` just leaves that tx's pre-check failing open.
 #[allow(clippy::too_many_arguments)]
 async fn discover_delivered<P: Provider>(
     chain_key: u64,
@@ -474,9 +459,7 @@ async fn discover_delivered<P: Provider>(
         let (event_name, message_id) = match decode_delivery_log(&log) {
             Ok(Some(decoded)) => decoded,
             Ok(None) => {
-                // The filter only asks for MessageDelivered/MessagePending topic0s; an RPC that
-                // ignores event_signature and returns everything on the Inbox would land here.
-                // Skip rather than mis-decode.
+                // Filter should prevent this, but skip rather than mis-decode if it doesn't.
                 continue;
             }
             Err(err) => {
@@ -511,11 +494,9 @@ async fn discover_delivered<P: Provider>(
 }
 
 /// Classify and decode one destination log by topic0: `Ok(Some((name, messageId)))` for a
-/// recognized `MessageDelivered`/`MessagePending` log, `Ok(None)` for anything else (the caller's
-/// filter should never produce this, but a permissive RPC is not trusted to honor it), `Err` if
-/// the topic0 matched but the log body failed to decode. Split out from [`discover_delivered`] so
-/// the topic0 dispatch — the part of the fee-claim fix that must never silently pick the wrong
-/// event — is unit-testable without a live provider.
+/// recognized `MessageDelivered`/`MessagePending` log, `Ok(None)` for anything else, `Err` if the
+/// topic0 matched but the log body failed to decode. Split out from [`discover_delivered`] so
+/// this dispatch is unit-testable without a live provider.
 fn decode_delivery_log(
     log: &alloy::rpc::types::Log,
 ) -> Result<Option<(&'static str, B256)>, alloy::sol_types::Error> {
@@ -562,10 +543,7 @@ async fn process_pending<P: Provider>(
     // afterwards, on this task, so no shared-state synchronization is needed.
     let results: Vec<(B256, Result<AckOutcome>)> = futures::stream::iter(batch)
         .map(|(tx_hash, message_ids)| {
-            // The Outbox this specific tx was tagged with at discovery time — NOT whatever the
-            // resolver currently reports. A later rotation must not retroactively change which
-            // contract an already-queued entry's canAck pre-check is asked against; see the field
-            // doc on `pending_outbox` in `run`.
+            // Tagged at discovery time, not whatever the resolver reports now — see `pending_outbox`.
             let outbox = pending_outbox.get(&tx_hash).copied();
             async move {
                 let outcome = acknowledge_tx(
@@ -1132,9 +1110,6 @@ mod tests {
 
     #[test]
     fn decode_delivery_log_dispatches_on_topic0() {
-        // The fee-claim fix hinges on telling these two events apart correctly — a MessagePending
-        // log misclassified as MessageDelivered (or vice versa) would either skip the claim or
-        // waste gas on a guaranteed-revert ack.
         let message_id = B256::from([7u8; 32]);
         let addr = Address::from([1u8; 20]);
 

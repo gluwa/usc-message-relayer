@@ -58,7 +58,6 @@ impl OutboxResolver for ConfigOverrideResolver {
         })?;
         Ok(ResolvedOutbox {
             address,
-            // Statically configured: there is no "became current at block N" to report.
             current_since_block: None,
         })
     }
@@ -100,10 +99,8 @@ const MAX_SCAN_CHUNKS_PER_CALL: usize = 20;
 /// Per-`chain_key` scan progress, cached across [`FactoryResolver::resolve`] calls.
 #[derive(Debug, Clone, Copy, Default)]
 struct ScanState {
-    /// Factory this progress applies to. A mismatch against a freshly-resolved factory address
-    /// (the pallet re-pointing `chain_key` at a different factory, or the very first resolution —
-    /// the zero-address default never legitimately matches) means the cached progress is for a
-    /// different log stream and must be discarded.
+    /// Factory this progress applies to; a mismatch against a freshly-resolved factory means it's
+    /// for a different log stream and must be discarded (handled in `resolve`).
     factory: Address,
     /// Highest block scanned so far (inclusive); the next scan starts at `scanned_to + 1`.
     scanned_to: u64,
@@ -128,32 +125,25 @@ impl ScanState {
     }
 }
 
-/// Production resolver: finds the Outbox for `route.chain_key` entirely from on-chain state, with
-/// no operator-supplied address. Two steps, both mirroring creditcoin3's own attestor-fleet
-/// resolver (`attestor/attestor/src/tasks/write_ability/resolver.rs` on branch
-/// `writeability-off-usc-dev`), which deliberately avoids a configured factory address: "an
-/// address supplied separately from the chain key may not correspond to it."
+/// Production resolver: finds the Outbox for `route.chain_key` entirely from on-chain state, no
+/// operator-supplied address — mirroring creditcoin3's own attestor-fleet resolver, which avoids a
+/// configured factory address on the same grounds ("an address supplied separately from the chain
+/// key may not correspond to it").
 ///
-///  1. `get_outbox_factory_address(chainKey)` on [`CHAIN_INFO_PRECOMPILE`] — the factory contract
-///     governing this chain key.
-///  2. Scan that factory's `OutboxCreated` logs for `chainKey`, taking the latest by block order
-///     as current — `deployOutbox` is permissionless, so more than one may exist over time.
+///  1. `get_outbox_factory_address(chainKey)` on [`CHAIN_INFO_PRECOMPILE`] — the factory governing
+///     this chain key.
+///  2. Scan that factory's `OutboxCreated` logs for `chainKey`, latest by block order wins —
+///     `deployOutbox` is permissionless, so more than one may exist over time.
 ///
-/// Re-entrant and cheap once caught up: `resolve()` is called both once at startup and
-/// periodically thereafter, so progress is cached per `chain_key` in `state` rather than rescanned
-/// from the start on every call. A call only returns `Ok` once its view of the confirmed tip has
-/// been fully scanned — an early, not-yet-caught-up match is never returned, since a more recent
-/// (superseding) `OutboxCreated` could still be sitting in the unscanned remainder and "latest
-/// wins" would otherwise pick the wrong one.
+/// Called both once at startup and periodically thereafter; progress is cached per `chain_key` in
+/// `state`. Only returns `Ok` once fully caught up to that call's confirmed tip, never an
+/// early/not-yet-final match — a more recent `OutboxCreated` could still be sitting unscanned.
 ///
-/// **Known limitation:** `state` is in-memory only and always starts from genesis (block 0) — a
-/// process restart re-scans the factory's full `OutboxCreated` history rather than resuming a
-/// persisted cursor. `route.start_block` is deliberately NOT reused here: it exists for
-/// `MessagePublished` backfill on the Outbox itself, a different contract with a different
-/// history, and reusing it could seed the scan after the very `OutboxCreated` it needs to find.
-/// The genesis start only slows a cold start; it does not affect correctness (a re-scan converges
-/// on the same "latest wins" answer). Revisit with `CheckpointStore`-backed persistence if restart
-/// latency becomes a real problem.
+/// **Known limitation:** `state` is in-memory only and always starts from genesis — a restart
+/// re-scans full history rather than resuming a persisted cursor (slower, not incorrect).
+/// `route.start_block` is deliberately not reused here: it backfills `MessagePublished` on the
+/// Outbox, a different contract's history, and could seed the scan after the very `OutboxCreated`
+/// it needs to find.
 #[derive(Debug, Default)]
 pub struct FactoryResolver {
     state: Mutex<HashMap<u64, ScanState>>,
@@ -189,10 +179,7 @@ impl OutboxResolver for FactoryResolver {
         let mut states = self.state.lock().await;
         let scan = states.entry(chain_key).or_default();
         if scan.factory != factory {
-            // Always genesis, never `route.start_block` — that field backfills `MessagePublished`
-            // on the Outbox, a different contract's history; reusing it here could start the scan
-            // after the very `OutboxCreated` this is trying to find, and this chain_key's
-            // FactoryResolver route would never come online.
+            // New factory (or first resolution): scan its history from scratch, always genesis.
             *scan = ScanState {
                 factory,
                 scanned_to: 0,
@@ -249,11 +236,9 @@ impl OutboxResolver for FactoryResolver {
         }
 
         if scan.scanned_to < confirmed {
-            // Caught up on progress, but not yet on the confirmed tip: a match found so far could
-            // still be superseded by a more recent `OutboxCreated` sitting in the unscanned
-            // remainder. Returning it now would let the caller start watching a stale Outbox —
-            // bail so the bootstrap/periodic caller retries, resuming this cursor rather than
-            // rescanning.
+            // Not yet caught up to the confirmed tip — a match found so far could still be
+            // superseded by a more recent one further ahead. Bail so the caller retries, resuming
+            // this cursor rather than rescanning.
             anyhow::bail!(
                 "chain_key {chain_key}: still scanning OutboxCreated backlog on factory {factory} \
                  ({} of {confirmed} blocks); resolution not final yet",
