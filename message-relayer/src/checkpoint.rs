@@ -7,11 +7,21 @@
 //! consulted on startup, so a restart resumes from `last_processed + 1` instead of the head — the
 //! relayer never misses an on-chain event, even across downtime.
 //!
-//! Storage is a single JSON file (`{ "outbox:2": 1234, "ack:2": 5678 }`) written atomically
-//! (temp file + rename) so a crash mid-write cannot corrupt it. Reprocessing the tail of a range
-//! after an unclean shutdown is safe: delivery is idempotent (`MessageAlreadyValidated`) and acks
-//! are deduped + idempotent (`MessageAlreadyAcknowledged`), so the cursor gives at-least-once,
-//! never at-most-once.
+//! Storage is a single JSON file written atomically (temp file + rename) so a crash mid-write
+//! cannot corrupt it. Reprocessing the tail of a range after an unclean shutdown is safe:
+//! delivery is idempotent (`MessageAlreadyValidated`) and acks are deduped + idempotent
+//! (`MessageAlreadyAcknowledged`), so the cursor gives at-least-once, never at-most-once.
+//!
+//! Each entry is `{ "block": 1234, "outbox": "0x..." }` — `outbox` records which Outbox address
+//! that block cursor was scanned against (the Outbox watcher's own key; unused/`None` for the ack
+//! watcher's `ack:{chain_key}` keys, which don't have this ambiguity). This matters for a
+//! factory-resolved route: a bare block number says nothing about whether it was scanned against
+//! the Outbox that's *currently* resolved or one since rotated away from — see
+//! `events::watch_outbox`'s startup resume logic, which compares this against the freshly
+//! resolved address rather than assuming the cursor is still valid for it. Older checkpoint files
+//! (written before this field existed) store a bare number per key instead of an object; both
+//! shapes deserialize, and any key touched by [`CheckpointStore::set`]/[`set_with_outbox`] is
+//! rewritten in the current shape on its next save (the whole map is re-serialized every write).
 //!
 //! Note: this covers durable *on-chain* events. Attestor votes travel over gossip (ephemeral) and
 //! are out of scope here — a relayer that was down while votes were gossiped relies on the votes
@@ -22,12 +32,49 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
-/// A JSON-file-backed map of `watcher key -> last fully-processed block`.
+/// One watcher's persisted state: the last fully-processed block, and (for the Outbox watcher
+/// only) which Outbox address it was scanned against.
+#[derive(Debug, Clone, Default, Serialize)]
+struct Entry {
+    block: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outbox: Option<String>,
+}
+
+/// Deserialization-only shape: a bare JSON number is a checkpoint file written before per-entry
+/// Outbox tracking existed; an object is the current shape. Untagged so both parse from the same
+/// JSON value without a version field or a migration pass.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawEntry {
+    Legacy(u64),
+    Full {
+        block: u64,
+        #[serde(default)]
+        outbox: Option<String>,
+    },
+}
+
+impl From<RawEntry> for Entry {
+    fn from(raw: RawEntry) -> Self {
+        match raw {
+            RawEntry::Legacy(block) => Entry {
+                block,
+                outbox: None,
+            },
+            RawEntry::Full { block, outbox } => Entry { block, outbox },
+        }
+    }
+}
+
+/// A JSON-file-backed map of `watcher key -> last fully-processed block` (+ optional Outbox
+/// address per key — see the module docs).
 #[derive(Debug)]
 pub struct CheckpointStore {
     path: PathBuf,
-    inner: Mutex<HashMap<String, u64>>,
+    inner: Mutex<HashMap<String, Entry>>,
 }
 
 impl CheckpointStore {
@@ -43,7 +90,7 @@ impl CheckpointStore {
     /// better than losing messages quietly.
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let inner: HashMap<String, u64> = match std::fs::read_to_string(&path) {
+        let inner: HashMap<String, Entry> = match std::fs::read_to_string(&path) {
             Ok(text) if text.trim().is_empty() => anyhow::bail!(
                 "checkpoint file {} exists but is empty — this indicates an interrupted write, not \
                  a fresh start. Resuming would skip every block since the last durable cursor. \
@@ -51,8 +98,11 @@ impl CheckpointStore {
                  the chain head (or from `start_block`).",
                 path.display()
             ),
-            Ok(text) => serde_json::from_str(&text)
-                .with_context(|| format!("parsing checkpoint file {}", path.display()))?,
+            Ok(text) => {
+                let raw: HashMap<String, RawEntry> = serde_json::from_str(&text)
+                    .with_context(|| format!("parsing checkpoint file {}", path.display()))?;
+                raw.into_iter().map(|(k, v)| (k, Entry::from(v))).collect()
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
             Err(e) => {
                 return Err(e)
@@ -71,19 +121,54 @@ impl CheckpointStore {
             .lock()
             .expect("checkpoint mutex")
             .get(key)
-            .copied()
+            .map(|e| e.block)
+    }
+
+    /// The Outbox address `key`'s block cursor was last scanned against, if any was recorded
+    /// (via [`Self::set_with_outbox`]) — `None` for a key that has never recorded one (including
+    /// every entry in a pre-migration checkpoint file).
+    pub fn get_outbox(&self, key: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("checkpoint mutex")
+            .get(key)
+            .and_then(|e| e.outbox.clone())
     }
 
     /// Record `block` as the last fully-processed block for `key` and persist the whole store.
+    /// Preserves whatever Outbox address (if any) was last recorded for `key` — this is the
+    /// ordinary per-tick progress update, not an Outbox change; use [`Self::set_with_outbox`] for
+    /// that.
     ///
     /// The lock is held across the file write so concurrent watchers cannot interleave a stale
     /// snapshot over a newer one; writes are small and infrequent (one per poll tick).
     pub fn set(&self, key: &str, block: u64) -> Result<()> {
         let mut guard = self.inner.lock().expect("checkpoint mutex");
-        guard.insert(key.to_string(), block);
+        let outbox = guard.get(key).and_then(|e| e.outbox.clone());
+        guard.insert(key.to_string(), Entry { block, outbox });
+        Self::persist(&self.path, &guard)
+    }
+
+    /// Like [`Self::set`], but also records `outbox` as the Outbox address this block cursor was
+    /// scanned against — call this whenever the scanned Outbox address is known (including when
+    /// it hasn't changed), so a later restart can tell a valid long-running cursor apart from one
+    /// left over from an Outbox since rotated away from.
+    pub fn set_with_outbox(&self, key: &str, block: u64, outbox: &str) -> Result<()> {
+        let mut guard = self.inner.lock().expect("checkpoint mutex");
+        guard.insert(
+            key.to_string(),
+            Entry {
+                block,
+                outbox: Some(outbox.to_string()),
+            },
+        );
+        Self::persist(&self.path, &guard)
+    }
+
+    fn persist(path: &Path, entries: &HashMap<String, Entry>) -> Result<()> {
         let serialized =
-            serde_json::to_string_pretty(&*guard).context("serializing checkpoint store")?;
-        write_atomic(&self.path, serialized.as_bytes())
+            serde_json::to_string_pretty(entries).context("serializing checkpoint store")?;
+        write_atomic(path, serialized.as_bytes())
     }
 }
 
@@ -197,6 +282,60 @@ mod tests {
         assert_eq!(reloaded.get("outbox:2"), Some(150));
         assert_eq!(reloaded.get("ack:2"), Some(250));
         assert_eq!(reloaded.get("missing"), None);
+    }
+
+    /// `set_with_outbox` records both fields; `set` (the ordinary per-tick progress update)
+    /// preserves whatever Outbox address was last recorded rather than clearing it.
+    #[test]
+    fn set_with_outbox_round_trips_and_set_preserves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        let store = CheckpointStore::load(&path).unwrap();
+
+        store.set_with_outbox("outbox:2", 100, "0xaaa").unwrap();
+        assert_eq!(store.get("outbox:2"), Some(100));
+        assert_eq!(store.get_outbox("outbox:2"), Some("0xaaa".to_string()));
+
+        // A plain `set` (no Outbox change) advances the block but keeps the recorded address.
+        store.set("outbox:2", 200).unwrap();
+        assert_eq!(store.get("outbox:2"), Some(200));
+        assert_eq!(store.get_outbox("outbox:2"), Some("0xaaa".to_string()));
+
+        // Both fields survive a reload.
+        let reloaded = CheckpointStore::load(&path).unwrap();
+        assert_eq!(reloaded.get("outbox:2"), Some(200));
+        assert_eq!(reloaded.get_outbox("outbox:2"), Some("0xaaa".to_string()));
+
+        // Rotating to a new Outbox overwrites the recorded address.
+        store.set_with_outbox("outbox:2", 300, "0xbbb").unwrap();
+        assert_eq!(store.get_outbox("outbox:2"), Some("0xbbb".to_string()));
+
+        // A key that never recorded an address (e.g. an ack checkpoint) has none.
+        store.set("ack:2", 50).unwrap();
+        assert_eq!(store.get_outbox("ack:2"), None);
+    }
+
+    /// A checkpoint file written before per-entry Outbox tracking existed stores a bare number
+    /// per key. It must still load, with no recorded Outbox address for any of its entries — and
+    /// a `set` against one of its keys must not error out preserving a (nonexistent) address.
+    #[test]
+    fn legacy_bare_number_file_loads_with_no_outbox_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        std::fs::write(&path, r#"{"outbox:2": 1234, "ack:2": 5678}"#).unwrap();
+
+        let store = CheckpointStore::load(&path).unwrap();
+        assert_eq!(store.get("outbox:2"), Some(1234));
+        assert_eq!(store.get_outbox("outbox:2"), None);
+        assert_eq!(store.get("ack:2"), Some(5678));
+
+        // Touching a legacy key with a plain `set` must not panic/error for lack of a prior
+        // Outbox field, and the file must still be readable afterward.
+        store.set("outbox:2", 1300).unwrap();
+        assert_eq!(
+            CheckpointStore::load(&path).unwrap().get("outbox:2"),
+            Some(1300)
+        );
     }
 
     #[test]

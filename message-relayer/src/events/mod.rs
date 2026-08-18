@@ -149,48 +149,60 @@ pub async fn watch_outbox(
     // past it and stray votes are dropped by the chain-first allowlist). Re-indexing the recent
     // window is idempotent — already-delivered messages re-collect votes via reobservation and
     // resolve as "Already validated" at simulate.
-    let mut last_seen = match checkpoint.as_ref().and_then(|c| c.get(&checkpoint_key)) {
-        Some(block) => {
-            let mut resume = block.saturating_sub(scan_lookback_blocks);
-            // The checkpoint isn't keyed by Outbox address — it may predate the currently
-            // resolved Outbox (a rotation happened, or was only just discovered, since it was
-            // last written) or belong to one rotated away from. Cap it to never start scanning
-            // later than this Outbox's own earliest known block: an old checkpoint that's more
-            // recent than that would otherwise silently skip messages published on this Outbox
-            // before the checkpoint ever knew about it. Extra re-scanning from an old checkpoint
-            // that's earlier is harmless; skipping is not.
-            if let Some(since) = resolved.current_since_block {
-                resume = resume.min(since.saturating_sub(1));
-            }
+    // A checkpoint is only a valid resume point for the Outbox it was actually scanned against —
+    // recorded alongside the block by `set_with_outbox` (see `checkpoint` module docs). Block
+    // numbers alone can't substitute for this: a long-lived, never-rotated Outbox's checkpoint is
+    // *always* numerically ahead of its own `current_since_block` (you can't publish on a
+    // contract before it exists), and so is a stale checkpoint left over from a since-rotated-away
+    // Outbox — the two cases are indistinguishable by block number alone, only by address.
+    let checkpoint_block = checkpoint.as_ref().and_then(|c| c.get(&checkpoint_key));
+    let checkpoint_outbox = checkpoint
+        .as_ref()
+        .and_then(|c| c.get_outbox(&checkpoint_key));
+    let checkpoint_matches_resolved_outbox =
+        checkpoint_outbox.as_deref() == Some(resolved.address.to_string().as_str());
+
+    let mut last_seen = if let (Some(block), true) =
+        (checkpoint_block, checkpoint_matches_resolved_outbox)
+    {
+        let resume = block.saturating_sub(scan_lookback_blocks);
+        info!(
+            chain_key,
+            checkpoint = block,
+            resume_from = resume + 1,
+            "↩️ resuming Outbox scan from checkpoint (rewound by lookback)"
+        );
+        resume
+    } else {
+        if let Some(block) = checkpoint_block {
             info!(
                 chain_key,
                 checkpoint = block,
-                resume_from = resume + 1,
-                "↩️ resuming Outbox scan from checkpoint (rewound by lookback)"
+                recorded_outbox = ?checkpoint_outbox,
+                resolved_outbox = %resolved.address,
+                "↩️ checkpoint is for a different (or pre-migration, untracked) Outbox address; \
+                 not reusing it as a resume point"
             );
-            resume
         }
-        None => {
-            if let Some(since) = resolved.current_since_block {
-                info!(
-                    chain_key,
-                    since_block = since,
-                    "⏮️ no Outbox checkpoint; starting scan from the resolved Outbox's discovery block"
-                );
-                since.saturating_sub(1)
-            } else if let Some(start) = route.start_block {
-                info!(
-                    chain_key,
-                    start_block = start,
-                    "⏮️ no Outbox checkpoint; starting initial scan from configured block"
-                );
-                start.saturating_sub(1)
-            } else {
-                provider
-                    .get_block_number()
-                    .await
-                    .with_context(|| format!("chain_key {chain_key}: failed to read chain head"))?
-            }
+        if let Some(since) = resolved.current_since_block {
+            info!(
+                chain_key,
+                since_block = since,
+                "⏮️ starting scan from the resolved Outbox's discovery block"
+            );
+            since.saturating_sub(1)
+        } else if let Some(start) = route.start_block {
+            info!(
+                chain_key,
+                start_block = start,
+                "⏮️ no Outbox checkpoint; starting initial scan from configured block"
+            );
+            start.saturating_sub(1)
+        } else {
+            provider
+                .get_block_number()
+                .await
+                .with_context(|| format!("chain_key {chain_key}: failed to read chain head"))?
         }
     };
 
@@ -258,8 +270,14 @@ pub async fn watch_outbox(
                             // unfinished message no matter how long it has been stalled. The
                             // in-memory cursor keeps advancing; re-indexing is idempotent
                             // (duplicate slots kept, delivery resolves AlreadyValidated).
+                            // Recording which Outbox this cursor was scanned against (not just a
+                            // plain `set`) is what lets a future restart's resume logic above tell
+                            // a valid long-running checkpoint apart from a stale one left over
+                            // from a since-rotated-away Outbox.
                             let persist = holdback.clamp(chain_key, last_seen);
-                            if let Err(err) = cp.set(&checkpoint_key, persist) {
+                            if let Err(err) =
+                                cp.set_with_outbox(&checkpoint_key, persist, &outbox.to_string())
+                            {
                                 warn!(chain_key, %err, "failed to persist Outbox checkpoint");
                             }
                         }

@@ -47,6 +47,7 @@
 //! call. A transaction whose block is not yet attested returns HTTP 422 (`BlockNotReady`) from the
 //! proof-gen API and is retried on the next tick.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -288,6 +289,14 @@ pub async fn run(
     let mut pending = PendingTxs::new(MAX_PENDING_ACKS);
     // Tx hashes already acknowledged (or terminally skipped) — never re-submitted (bounded).
     let mut done = BoundedSeen::new(MAX_DONE_TRACKED);
+    // The source Outbox address that was resolved at the moment each pending tx was FIRST
+    // discovered — captured once and never updated again for that entry, even if `outbox` later
+    // rotates. This is what `acknowledge_tx`'s canAck pre-check is actually checked against: using
+    // whatever `outbox` happens to be *now* would ask a message's `messageCanAck`/`isAcknowledged`
+    // state from a contract it was never published on after a rotation (unknown id defaults to
+    // `false` there), turning a real unsettled ack into a false "nothing to do" — see the PR #39
+    // review this closes. Kept in lockstep with `pending`/`done`: removed wherever they are.
+    let mut pending_outbox: HashMap<B256, Address> = HashMap::new();
 
     let mut tick = tokio::time::interval(Duration::from_secs(crate::config::poll_secs_override(
         "RELAYER_ACK_POLL_SECS",
@@ -341,6 +350,8 @@ pub async fn run(
                     &mut last_seen,
                     &mut pending,
                     &done,
+                    outbox,
+                    &mut pending_outbox,
                 ).await {
                     Ok(()) => {
                         // Successful destination scan = loop progress (C2r).
@@ -370,7 +381,7 @@ pub async fn run(
                     chain_key,
                     &ack,
                     &mode,
-                    outbox,
+                    &mut pending_outbox,
                     &client,
                     &source_provider,
                     submitter_address,
@@ -402,6 +413,12 @@ pub async fn run(
 ///
 /// Scans only up to `tip - confirmation_depth` so a destination reorg on the unsafe head cannot
 /// enqueue an ack for a delivery that later disappears.
+///
+/// `outbox`, if known, is recorded in `pending_outbox` for every *newly* discovered tx — captured
+/// once, at first sight, and never touched again for that entry regardless of later resolver
+/// rotations (see the field's doc in [`run`]). `None` records nothing, leaving that tx's pre-check
+/// to fail open exactly as it always has for a route with no resolved Outbox yet.
+#[allow(clippy::too_many_arguments)]
 async fn discover_delivered<P: Provider>(
     chain_key: u64,
     inbox: alloy::primitives::Address,
@@ -410,6 +427,8 @@ async fn discover_delivered<P: Provider>(
     last_seen: &mut u64,
     pending: &mut PendingTxs,
     done: &BoundedSeen,
+    outbox: Option<Address>,
+    pending_outbox: &mut HashMap<B256, Address>,
 ) -> Result<()> {
     let tip = provider.get_block_number().await?;
     let confirmed = tip.saturating_sub(confirmation_depth);
@@ -474,11 +493,15 @@ async fn discover_delivered<P: Provider>(
             continue;
         }
         if let Some(evicted) = pending.insert(tx_hash, Instant::now(), block, vec![message_id]) {
+            pending_outbox.remove(&evicted);
             warn!(
                 chain_key,
                 %evicted,
                 "ack pending queue at capacity; giving up on oldest un-acknowledged delivery"
             );
+        }
+        if let Some(addr) = outbox {
+            pending_outbox.insert(tx_hash, addr);
         }
         debug!(chain_key, %tx_hash, %message_id, event_name, "🧾 observed delivery event; queued for settlement");
     }
@@ -518,7 +541,7 @@ async fn process_pending<P: Provider>(
     chain_key: u64,
     ack: &AckConfig,
     mode: &SettlementMode,
-    outbox: Option<alloy::primitives::Address>,
+    pending_outbox: &mut HashMap<B256, Address>,
     client: &ProofGenClient,
     source_provider: &P,
     submitter_address: alloy::primitives::Address,
@@ -538,21 +561,28 @@ async fn process_pending<P: Provider>(
     // is independent and dominated by network latency. Mutations to `pending`/`done` are applied
     // afterwards, on this task, so no shared-state synchronization is needed.
     let results: Vec<(B256, Result<AckOutcome>)> = futures::stream::iter(batch)
-        .map(|(tx_hash, message_ids)| async move {
-            let outcome = acknowledge_tx(
-                chain_key,
-                ack,
-                mode,
-                outbox,
-                &message_ids,
-                client,
-                source_provider,
-                submitter_address,
-                broadcast_locks,
-                tx_hash,
-            )
-            .await;
-            (tx_hash, outcome)
+        .map(|(tx_hash, message_ids)| {
+            // The Outbox this specific tx was tagged with at discovery time — NOT whatever the
+            // resolver currently reports. A later rotation must not retroactively change which
+            // contract an already-queued entry's canAck pre-check is asked against; see the field
+            // doc on `pending_outbox` in `run`.
+            let outbox = pending_outbox.get(&tx_hash).copied();
+            async move {
+                let outcome = acknowledge_tx(
+                    chain_key,
+                    ack,
+                    mode,
+                    outbox,
+                    &message_ids,
+                    client,
+                    source_provider,
+                    submitter_address,
+                    broadcast_locks,
+                    tx_hash,
+                )
+                .await;
+                (tx_hash, outcome)
+            }
         })
         .buffer_unordered(MAX_ACK_CONCURRENCY)
         .collect()
@@ -564,11 +594,13 @@ async fn process_pending<P: Provider>(
             Ok(AckOutcome::Acknowledged) => {
                 info!(chain_key, %tx_hash, "✅ delivery settled on source chain");
                 pending.remove(&tx_hash);
+                pending_outbox.remove(&tx_hash);
                 done.insert(tx_hash);
             }
             Ok(AckOutcome::Terminal(reason)) => {
                 info!(chain_key, %tx_hash, %reason, "ack skipped (terminal); will not retry");
                 pending.remove(&tx_hash);
+                pending_outbox.remove(&tx_hash);
                 done.insert(tx_hash);
             }
             Ok(AckOutcome::NotReady) => {
@@ -582,6 +614,7 @@ async fn process_pending<P: Provider>(
                         "proof never became ready within {MAX_ACK_AGE:?}; giving up on this ack"
                     );
                     pending.remove(&tx_hash);
+                    pending_outbox.remove(&tx_hash);
                     done.insert(tx_hash);
                 } else {
                     debug!(chain_key, %tx_hash, "proof not ready yet; deferred");
