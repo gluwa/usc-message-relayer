@@ -363,10 +363,17 @@ impl State {
         let hash = B256::from(vote.message_hash);
         let Some(slot) = route.by_message.get_mut(&hash) else {
             // PoC §6.2: chain-first allowlist — drop votes for messages we have not indexed.
+            // debug, not warn: this fires routinely (every message's first gossip round tends to
+            // arrive before the Outbox watcher has indexed it — see the ops-gotchas memory) and
+            // self-heals via re-gossip. Previously silent but for the `outcome` metric label —
+            // logged here so a triage pass has something to grep besides the counter.
+            debug!(chain_key, %hash, "vote for unindexed message dropped (chain-first allowlist)");
             metrics.inc_vote(chain_key, VoteOutcome::Ignore);
             return None;
         };
         if slot.delivered || slot.terminal {
+            debug!(chain_key, %hash, delivered = slot.delivered, terminal = slot.terminal,
+                "vote for already-resolved message ignored");
             metrics.inc_vote(chain_key, VoteOutcome::Ignore);
             return None;
         }
@@ -375,6 +382,10 @@ impl State {
 
         // Allowlist check — cheap, do before `ecrecover`.
         if !route.attestors.contains(&claimed_signer) {
+            // warn, not debug: a claimed signer outside the current allowlist is either a stale
+            // attestor set (rotation not yet applied here) or a misbehaving/unauthorized voter —
+            // unlike the routine drops above, this does not self-heal and is worth a human seeing.
+            warn!(chain_key, %hash, %claimed_signer, "vote rejected: signer not in attestor allowlist");
             metrics.inc_vote(chain_key, VoteOutcome::Reject);
             return None;
         }
@@ -383,18 +394,21 @@ impl State {
         let recovered = match recover_signer(&hash, &vote.signature) {
             Ok(addr) => addr,
             Err(err) => {
-                debug!(%err, %claimed_signer, "ecrecover failed");
+                warn!(chain_key, %hash, %err, %claimed_signer, "vote rejected: signature did not recover");
                 metrics.inc_vote(chain_key, VoteOutcome::Reject);
                 return None;
             }
         };
         if recovered != claimed_signer {
+            warn!(chain_key, %hash, %claimed_signer, %recovered,
+                "vote rejected: recovered signer does not match claimed signer");
             metrics.inc_vote(chain_key, VoteOutcome::Reject);
             return None;
         }
 
         // Dedup.
         if slot.signers.contains_key(&recovered) {
+            debug!(chain_key, %hash, %recovered, "duplicate vote from signer ignored");
             metrics.inc_vote(chain_key, VoteOutcome::Ignore);
             return None;
         }
