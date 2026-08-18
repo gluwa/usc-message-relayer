@@ -218,9 +218,15 @@ impl Server {
             ),
         );
 
-        // Outbox watchers (per route).
-        let resolver: Arc<dyn OutboxResolver> = Arc::new(ConfigOverrideResolver);
+        // Outbox watchers (per route). A route with an explicit `outbox_address` keeps that
+        // static override (`ConfigOverrideResolver`); one without resolves its Outbox
+        // automatically from the chain key via `FactoryResolver` (see `events::factory`).
         for route in &self.config.routes {
+            let resolver: Arc<dyn OutboxResolver> = if route.outbox_address.is_some() {
+                Arc::new(ConfigOverrideResolver)
+            } else {
+                Arc::new(FactoryResolver::new())
+            };
             spawn_worker(
                 &mut tasks,
                 format!("outbox watcher (chain_key {})", route.chain_key),
@@ -229,7 +235,7 @@ impl Server {
                     self.config.creditcoin_eth_rpc_url.clone(),
                     indexed_tx.clone(),
                     metrics.clone(),
-                    resolver.clone(),
+                    resolver,
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
                     health.clone(),

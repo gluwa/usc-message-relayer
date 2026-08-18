@@ -26,7 +26,18 @@ use write_ability::protocol::chain_key_to_bytes32;
 
 pub mod factory;
 
-pub use factory::{ConfigOverrideResolver, FactoryResolver, OutboxResolver};
+pub use factory::{ConfigOverrideResolver, FactoryResolver, OutboxResolver, ResolvedOutbox};
+
+/// Default poll cadence for re-checking whether [`OutboxResolver::resolve`] now returns a
+/// different address (an Outbox rotation). Independent of, and much slower than,
+/// [`DEFAULT_POLL_INTERVAL_SECS`]'s `MessagePublished` scan — a rotation is rare, and
+/// `FactoryResolver::resolve` costs a precompile call plus at least one `eth_getLogs` round trip.
+pub const DEFAULT_RESOLVE_POLL_INTERVAL_SECS: u64 = 60;
+
+/// Retry cadence for the startup resolution bootstrap while [`OutboxResolver::resolve`] has not
+/// yet produced an address (e.g. `FactoryResolver` still catching up on a long backlog — see
+/// `MAX_SCAN_CHUNKS_PER_CALL`). Short: this only blocks the very first scan, not the running loop.
+const RESOLVE_BOOTSTRAP_RETRY: Duration = Duration::from_secs(5);
 
 /// Default poll cadence for `eth_getLogs`. WS subscription would be lower-latency but adds an
 /// extra failure mode (silent stream stalls) we don't want in PoC scope.
@@ -88,10 +99,31 @@ pub async fn watch_outbox(
             )
         })?;
 
-    let outbox = resolver
-        .resolve(&route)
-        .await
-        .with_context(|| format!("chain_key {chain_key}: outbox resolution failed"))?;
+    // `resolve()` needs a type-erased provider so it can be called through the `dyn OutboxResolver`
+    // trait object; cloning the concrete provider is cheap (Arc-backed transport) and leaves
+    // `provider` itself free for the rest of this function's direct, generic-typed calls.
+    let dyn_provider = provider.clone().erased();
+
+    // Startup bootstrap: retry until `resolve()` produces an address. `ConfigOverrideResolver`
+    // resolves on the first try or not at all (nothing to wait for); `FactoryResolver` may need
+    // several tries on a cold start against a long block-range backlog (see
+    // `MAX_SCAN_CHUNKS_PER_CALL`) — each retry resumes its cursor rather than rescanning.
+    let resolved = loop {
+        match resolver.resolve(&route, &dyn_provider).await {
+            Ok(resolved) => break resolved,
+            Err(err) => {
+                warn!(chain_key, %err, "outbox resolution not ready yet; retrying");
+                tokio::select! {
+                    () = tokio::time::sleep(RESOLVE_BOOTSTRAP_RETRY) => {}
+                    () = cancel.cancelled() => {
+                        info!(chain_key, "🛑 Outbox watcher exiting on cancel during resolution");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    };
+    let mut outbox = resolved.address;
 
     // The destination chain_key is known locally — derived from the route's `u64` chain_key — and
     // bound into messageHash for every event seen on this outbox (see PoC §5.1). It is not read
@@ -129,7 +161,14 @@ pub async fn watch_outbox(
             resume
         }
         None => {
-            if let Some(start) = route.start_block {
+            if let Some(since) = resolved.current_since_block {
+                info!(
+                    chain_key,
+                    since_block = since,
+                    "⏮️ no Outbox checkpoint; starting scan from the resolved Outbox's discovery block"
+                );
+                since.saturating_sub(1)
+            } else if let Some(start) = route.start_block {
                 info!(
                     chain_key,
                     start_block = start,
@@ -148,11 +187,43 @@ pub async fn watch_outbox(
     let mut tick = tokio::time::interval(Duration::from_secs(DEFAULT_POLL_INTERVAL_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let mut resolve_tick =
+        tokio::time::interval(Duration::from_secs(crate::config::poll_secs_override(
+            "RELAYER_OUTBOX_RESOLVE_POLL_SECS",
+            DEFAULT_RESOLVE_POLL_INTERVAL_SECS,
+        )));
+    resolve_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
                 info!(chain_key, "🛑 Outbox watcher exiting on cancel");
                 return Ok(());
+            }
+            _ = resolve_tick.tick() => {
+                match resolver.resolve(&route, &dyn_provider).await {
+                    Ok(fresh) => {
+                        if fresh.address != outbox {
+                            // In-flight/already-indexed messages are unaffected — the pool tracks
+                            // them independently of which Outbox they came from. Only the
+                            // MessagePublished scan below switches: new discovery moves to the new
+                            // address, resuming at its earliest known block so nothing published
+                            // between deployment and this check is missed.
+                            info!(
+                                chain_key,
+                                old = %outbox,
+                                new = %fresh.address,
+                                "🔁 Outbox rotation detected; switching discovery to the new address"
+                            );
+                            outbox = fresh.address;
+                            last_seen = fresh
+                                .current_since_block
+                                .map(|b| b.saturating_sub(1))
+                                .unwrap_or(last_seen);
+                        }
+                    }
+                    Err(err) => warn!(chain_key, %err, "outbox re-resolution failed; keeping current address"),
+                }
             }
             _ = tick.tick() => {
                 match poll_once(
