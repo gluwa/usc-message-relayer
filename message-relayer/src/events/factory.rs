@@ -6,6 +6,7 @@
 //! one-impl change rather than a refactor across modules.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use alloy::primitives::{address, Address};
 use alloy::providers::{DynProvider, Provider};
@@ -96,6 +97,14 @@ const MAX_BLOCKS_PER_SCAN: u64 = 5_000;
 /// where this one stopped instead of rescanning.
 const MAX_SCAN_CHUNKS_PER_CALL: usize = 20;
 
+/// Bounds every individual RPC/precompile call this resolver makes (mirrors
+/// `delivery::FUNDED_GAS_READ_TIMEOUT` — a single chain read, not a tx wait). Without it a
+/// black-holed provider would hang `resolve()` forever while it holds `state`'s lock, wedging
+/// every other caller sharing this resolver (`events::watch_outbox` and `ack::run` share one
+/// `FactoryResolver` per route). Applied per call rather than once around the whole function so a
+/// slow-but-alive provider can still make multiple chunks of progress in one `resolve()` call.
+const RESOLVE_CALL_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Per-`chain_key` scan progress, cached across [`FactoryResolver::resolve`] calls.
 #[derive(Debug, Clone, Copy, Default)]
 struct ScanState {
@@ -144,6 +153,11 @@ impl ScanState {
 /// `route.start_block` is deliberately not reused here: it backfills `MessagePublished` on the
 /// Outbox, a different contract's history, and could seed the scan after the very `OutboxCreated`
 /// it needs to find.
+///
+/// `state`'s lock is held across every RPC call in a `resolve()` invocation (simplest way to keep
+/// a chain_key's scan progress consistent across its chunk loop) — a caller sharing this resolver
+/// with another route worker (see `lib.rs`'s resolver selection) waits behind it. Bounded by
+/// [`RESOLVE_CALL_TIMEOUT`] on every call, so that wait is minutes at worst, never indefinite.
 #[derive(Debug, Default)]
 pub struct FactoryResolver {
     state: Mutex<HashMap<u64, ScanState>>,
@@ -161,13 +175,20 @@ impl OutboxResolver for FactoryResolver {
         let chain_key = route.chain_key;
 
         let chain_info = IChainInfo::new(CHAIN_INFO_PRECOMPILE, provider);
-        let factory_result = chain_info
-            .get_outbox_factory_address(chain_key)
-            .call()
-            .await
-            .with_context(|| {
-                format!("chain_key {chain_key}: get_outbox_factory_address precompile call failed")
-            })?;
+        let factory_result = tokio::time::timeout(
+            RESOLVE_CALL_TIMEOUT,
+            chain_info.get_outbox_factory_address(chain_key).call(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "chain_key {chain_key}: get_outbox_factory_address precompile call timed out \
+                 after {RESOLVE_CALL_TIMEOUT:?}"
+            )
+        })?
+        .with_context(|| {
+            format!("chain_key {chain_key}: get_outbox_factory_address precompile call failed")
+        })?;
         if !factory_result.exists || factory_result.factoryAddr.is_zero() {
             anyhow::bail!(
                 "chain_key {chain_key} has no OutboxFactory registered on-chain \
@@ -187,9 +208,14 @@ impl OutboxResolver for FactoryResolver {
             };
         }
 
-        let tip = provider
-            .get_block_number()
+        let tip = tokio::time::timeout(RESOLVE_CALL_TIMEOUT, provider.get_block_number())
             .await
+            .with_context(|| {
+                format!(
+                    "chain_key {chain_key}: reading chain head timed out after \
+                     {RESOLVE_CALL_TIMEOUT:?}"
+                )
+            })?
             .with_context(|| format!("chain_key {chain_key}: failed to read chain head"))?;
         let confirmed = tip.saturating_sub(route.block_confirmation_depth);
 
@@ -205,12 +231,20 @@ impl OutboxResolver for FactoryResolver {
                 .from_block(from_block)
                 .to_block(to_block);
 
-            let logs = provider.get_logs(&filter).await.with_context(|| {
-                format!(
-                    "chain_key {chain_key}: eth_getLogs OutboxCreated on factory {factory} from \
-                     {from_block} to {to_block} failed"
-                )
-            })?;
+            let logs = tokio::time::timeout(RESOLVE_CALL_TIMEOUT, provider.get_logs(&filter))
+                .await
+                .with_context(|| {
+                    format!(
+                        "chain_key {chain_key}: eth_getLogs OutboxCreated on factory {factory} \
+                         from {from_block} to {to_block} timed out after {RESOLVE_CALL_TIMEOUT:?}"
+                    )
+                })?
+                .with_context(|| {
+                    format!(
+                        "chain_key {chain_key}: eth_getLogs OutboxCreated on factory {factory} \
+                         from {from_block} to {to_block} failed"
+                    )
+                })?;
 
             for log in logs {
                 let (Some(block), Some(log_index)) = (log.block_number, log.log_index) else {
