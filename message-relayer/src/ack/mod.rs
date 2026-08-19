@@ -96,7 +96,7 @@ const MAX_ACK_CONCURRENCY: usize = 8;
 /// Maximum block span per `eth_getLogs` scan. Public RPCs cap the queryable range; an over-large
 /// resume range (long downtime, deep `start_block` backfill) would error on every tick and wedge
 /// discovery forever. Bounded chunks advance the cursor incrementally — the 6s tick catches up.
-const MAX_BLOCKS_PER_SCAN: u64 = 5_000;
+const MAX_BLOCKS_PER_SCAN: u64 = 2_000;
 
 /// Upper bound on waiting for the submitAcknowledgment receipt, so one stuck tx cannot wedge the
 /// per-tick pipeline. On timeout the tx stays pending and is retried on a later tick (idempotent:

@@ -89,7 +89,7 @@ const CHAIN_INFO_PRECOMPILE: Address = address!("0000000000000000000000000000000
 /// Maximum block span per `eth_getLogs` chunk — mirrors `events::MAX_BLOCKS_PER_SCAN` /
 /// `ack::MAX_BLOCKS_PER_SCAN`; bounded chunks advance the cursor incrementally instead of asking
 /// an RPC for a range larger than it will serve.
-const MAX_BLOCKS_PER_SCAN: u64 = 5_000;
+const MAX_BLOCKS_PER_SCAN: u64 = 2_000;
 
 /// Chunks processed per [`FactoryResolver::resolve`] call. Bounds one call's latency on a cold
 /// start against a long block-range backlog; progress persists in `state`, so the next call (the

@@ -47,7 +47,7 @@ pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 6;
 /// resume range (long downtime, deep `start_block` backfill) would error on every tick and wedge
 /// the watcher forever on the same oversized query. Bounded chunks advance the checkpoint
 /// incrementally — at one chunk per 6s tick the watcher catches up quickly.
-const MAX_BLOCKS_PER_SCAN: u64 = 5_000;
+const MAX_BLOCKS_PER_SCAN: u64 = 2_000;
 
 /// A finalized message that the relayer has discovered on the Creditcoin Outbox. The vote pool
 /// keys on `message_hash`; the rest of the fields are needed to recompute the calldata for

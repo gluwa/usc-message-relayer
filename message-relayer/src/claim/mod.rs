@@ -63,7 +63,7 @@ const MAX_CLAIMS_PER_TICK: usize = 256;
 /// Maximum concurrent proof-fetch + submit attempts within a tick.
 const MAX_CLAIM_CONCURRENCY: usize = 8;
 /// Maximum block span per `eth_getLogs` scan (public RPCs cap the queryable range).
-const MAX_BLOCKS_PER_SCAN: u64 = 5_000;
+const MAX_BLOCKS_PER_SCAN: u64 = 2_000;
 /// Upper bound on waiting for the claim receipt so one stuck tx cannot wedge the pipeline.
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Upper bound on a single `claim` broadcast (gas/fee/nonce reads plus `eth_sendRawTransaction`).
