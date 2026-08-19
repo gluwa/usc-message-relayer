@@ -113,6 +113,11 @@ pub async fn watch_outbox(
             Ok(resolved) => break resolved,
             Err(err) => {
                 warn!(chain_key, %err, "outbox resolution not ready yet; retrying");
+                // A returned Err (unlike a hung RPC call, which never gets here) means the
+                // resolver is actively working — e.g. FactoryResolver churning through a long
+                // OutboxCreated backlog. Heartbeat so a slow-but-converging resolution does not
+                // trip /health's PROGRESS_DEADLINE and get killed mid-scan.
+                health.heartbeat(&health_key);
                 tokio::select! {
                     () = tokio::time::sleep(RESOLVE_BOOTSTRAP_RETRY) => {}
                     () = cancel.cancelled() => {
