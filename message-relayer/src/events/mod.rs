@@ -226,20 +226,36 @@ pub async fn watch_outbox(
                 match resolver.resolve(&route, &dyn_provider).await {
                     Ok(fresh) => {
                         if fresh.address != outbox {
-                            // In-flight/already-indexed messages are unaffected (the pool tracks
-                            // them independently of the Outbox); only new discovery moves to the
-                            // new address, resuming at its earliest known block.
-                            info!(
-                                chain_key,
-                                old = %outbox,
-                                new = %fresh.address,
-                                "🔁 Outbox rotation detected; switching discovery to the new address"
-                            );
-                            outbox = fresh.address;
-                            last_seen = fresh
-                                .current_since_block
-                                .map(|b| b.saturating_sub(1))
-                                .unwrap_or(last_seen);
+                            // Switching now would abandon any not-yet-scanned MessagePublished
+                            // range on the old address (poll_once only ever tracks one
+                            // (address, last_seen) pair) — safe only once `last_seen` has already
+                            // reached the new Outbox's creation block, so the old address has
+                            // nothing left unscanned up to that point. Until then, keep discovering
+                            // on the old address (poll_once's regular ticks are already advancing
+                            // it) and re-check next resolve_tick; the switch is deferred, not lost.
+                            if outbox_rotation_is_safe(last_seen, fresh.current_since_block) {
+                                info!(
+                                    chain_key,
+                                    old = %outbox,
+                                    new = %fresh.address,
+                                    "🔁 Outbox rotation detected; switching discovery to the new address"
+                                );
+                                outbox = fresh.address;
+                                last_seen = fresh
+                                    .current_since_block
+                                    .map(|b| b.saturating_sub(1))
+                                    .unwrap_or(last_seen);
+                            } else {
+                                debug!(
+                                    chain_key,
+                                    old = %outbox,
+                                    new = %fresh.address,
+                                    last_seen,
+                                    since_block = ?fresh.current_since_block,
+                                    "🔁 Outbox rotation detected but old address still has an \
+                                     unscanned backlog; deferring the switch"
+                                );
+                            }
                         }
                     }
                     Err(err) => warn!(chain_key, %err, "outbox re-resolution failed; keeping current address"),
@@ -401,6 +417,17 @@ fn checkpoint_contradicts_resolved_outbox(recorded: Option<&str>, resolved: Addr
     recorded.is_some_and(|recorded| recorded != resolved.to_string())
 }
 
+/// Whether discovery can switch to a newly-resolved Outbox address right now without abandoning
+/// an unscanned range on the old one. Safe only once `last_seen` has already reached (or passed)
+/// the new Outbox's creation block — i.e. the old address has nothing left unscanned up to that
+/// point. An unknown creation block (no boundary to wait for) is always safe.
+fn outbox_rotation_is_safe(last_seen: u64, new_current_since_block: Option<u64>) -> bool {
+    match new_current_since_block {
+        Some(since) => last_seen >= since.saturating_sub(1),
+        None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,5 +457,24 @@ mod tests {
             Some(&other.to_string()),
             resolved
         ));
+    }
+
+    #[test]
+    fn rotation_deferred_while_old_address_still_has_unscanned_backlog() {
+        // last_seen is far behind the new Outbox's creation block: switching now would abandon
+        // the unscanned range on the old address.
+        assert!(!outbox_rotation_is_safe(100, Some(10_000)));
+    }
+
+    #[test]
+    fn rotation_safe_once_caught_up_to_new_outbox_creation_block() {
+        assert!(outbox_rotation_is_safe(9_999, Some(10_000)));
+        assert!(outbox_rotation_is_safe(10_000, Some(10_000)));
+        assert!(outbox_rotation_is_safe(50_000, Some(10_000)));
+    }
+
+    #[test]
+    fn rotation_safe_when_new_outbox_creation_block_is_unknown() {
+        assert!(outbox_rotation_is_safe(0, None));
     }
 }
