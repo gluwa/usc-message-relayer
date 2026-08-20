@@ -26,7 +26,18 @@ use write_ability::protocol::chain_key_to_bytes32;
 
 pub mod factory;
 
-pub use factory::{ConfigOverrideResolver, FactoryResolver, OutboxResolver};
+pub use factory::{ConfigOverrideResolver, FactoryResolver, OutboxResolver, ResolvedOutbox};
+
+/// Default poll cadence for re-checking whether [`OutboxResolver::resolve`] now returns a
+/// different address (an Outbox rotation). Independent of, and much slower than,
+/// [`DEFAULT_POLL_INTERVAL_SECS`]'s `MessagePublished` scan — a rotation is rare, and
+/// `FactoryResolver::resolve` costs a precompile call plus at least one `eth_getLogs` round trip.
+pub const DEFAULT_RESOLVE_POLL_INTERVAL_SECS: u64 = 60;
+
+/// Retry cadence for the startup resolution bootstrap while [`OutboxResolver::resolve`] has not
+/// yet produced an address (e.g. `FactoryResolver` still catching up on a long backlog — see
+/// `MAX_SCAN_CHUNKS_PER_CALL`). Short: this only blocks the very first scan, not the running loop.
+const RESOLVE_BOOTSTRAP_RETRY: Duration = Duration::from_secs(5);
 
 /// Default poll cadence for `eth_getLogs`. WS subscription would be lower-latency but adds an
 /// extra failure mode (silent stream stalls) we don't want in PoC scope.
@@ -36,7 +47,7 @@ pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 6;
 /// resume range (long downtime, deep `start_block` backfill) would error on every tick and wedge
 /// the watcher forever on the same oversized query. Bounded chunks advance the checkpoint
 /// incrementally — at one chunk per 6s tick the watcher catches up quickly.
-const MAX_BLOCKS_PER_SCAN: u64 = 5_000;
+const MAX_BLOCKS_PER_SCAN: u64 = 2_000;
 
 /// A finalized message that the relayer has discovered on the Creditcoin Outbox. The vote pool
 /// keys on `message_hash`; the rest of the fields are needed to recompute the calldata for
@@ -88,10 +99,36 @@ pub async fn watch_outbox(
             )
         })?;
 
-    let outbox = resolver
-        .resolve(&route)
-        .await
-        .with_context(|| format!("chain_key {chain_key}: outbox resolution failed"))?;
+    // `resolve()` needs a type-erased provider so it can be called through the `dyn OutboxResolver`
+    // trait object; cloning the concrete provider is cheap (Arc-backed transport) and leaves
+    // `provider` itself free for the rest of this function's direct, generic-typed calls.
+    let dyn_provider = provider.clone().erased();
+
+    // Startup bootstrap: retry until `resolve()` produces an address. `ConfigOverrideResolver`
+    // resolves on the first try or not at all (nothing to wait for); `FactoryResolver` may need
+    // several tries on a cold start against a long block-range backlog (see
+    // `MAX_SCAN_CHUNKS_PER_CALL`) — each retry resumes its cursor rather than rescanning.
+    let resolved = loop {
+        match resolver.resolve(&route, &dyn_provider).await {
+            Ok(resolved) => break resolved,
+            Err(err) => {
+                warn!(chain_key, %err, "outbox resolution not ready yet; retrying");
+                // A returned Err (unlike a hung RPC call, which never gets here) means the
+                // resolver is actively working — e.g. FactoryResolver churning through a long
+                // OutboxCreated backlog. Heartbeat so a slow-but-converging resolution does not
+                // trip /health's PROGRESS_DEADLINE and get killed mid-scan.
+                health.heartbeat(&health_key);
+                tokio::select! {
+                    () = tokio::time::sleep(RESOLVE_BOOTSTRAP_RETRY) => {}
+                    () = cancel.cancelled() => {
+                        info!(chain_key, "🛑 Outbox watcher exiting on cancel during resolution");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    };
+    let mut outbox = resolved.address;
 
     // The destination chain_key is known locally — derived from the route's `u64` chain_key — and
     // bound into messageHash for every event seen on this outbox (see PoC §5.1). It is not read
@@ -117,42 +154,112 @@ pub async fn watch_outbox(
     // past it and stray votes are dropped by the chain-first allowlist). Re-indexing the recent
     // window is idempotent — already-delivered messages re-collect votes via reobservation and
     // resolve as "Already validated" at simulate.
-    let mut last_seen = match checkpoint.as_ref().and_then(|c| c.get(&checkpoint_key)) {
-        Some(block) => {
-            let resume = block.saturating_sub(scan_lookback_blocks);
+    // A checkpoint recorded against a different, known Outbox address is not a valid resume point
+    // for the one just resolved — see `checkpoint_contradicts_resolved_outbox` for why "unknown"
+    // must not be treated the same as "different".
+    let checkpoint_block = checkpoint.as_ref().and_then(|c| c.get(&checkpoint_key));
+    let checkpoint_outbox = checkpoint
+        .as_ref()
+        .and_then(|c| c.get_outbox(&checkpoint_key));
+    let checkpoint_is_stale =
+        checkpoint_contradicts_resolved_outbox(checkpoint_outbox.as_deref(), resolved.address);
+
+    let mut last_seen = if let (Some(block), false) = (checkpoint_block, checkpoint_is_stale) {
+        let resume = block.saturating_sub(scan_lookback_blocks);
+        info!(
+            chain_key,
+            checkpoint = block,
+            resume_from = resume + 1,
+            "↩️ resuming Outbox scan from checkpoint (rewound by lookback)"
+        );
+        resume
+    } else {
+        if let Some(block) = checkpoint_block {
             info!(
                 chain_key,
                 checkpoint = block,
-                resume_from = resume + 1,
-                "↩️ resuming Outbox scan from checkpoint (rewound by lookback)"
+                recorded_outbox = ?checkpoint_outbox,
+                resolved_outbox = %resolved.address,
+                "↩️ checkpoint is recorded against a different Outbox address; not reusing it as \
+                 a resume point"
             );
-            resume
         }
-        None => {
-            if let Some(start) = route.start_block {
-                info!(
-                    chain_key,
-                    start_block = start,
-                    "⏮️ no Outbox checkpoint; starting initial scan from configured block"
-                );
-                start.saturating_sub(1)
-            } else {
-                provider
-                    .get_block_number()
-                    .await
-                    .with_context(|| format!("chain_key {chain_key}: failed to read chain head"))?
-            }
+        if let Some(since) = resolved.current_since_block {
+            info!(
+                chain_key,
+                since_block = since,
+                "⏮️ starting scan from the resolved Outbox's discovery block"
+            );
+            since.saturating_sub(1)
+        } else if let Some(start) = route.start_block {
+            info!(
+                chain_key,
+                start_block = start,
+                "⏮️ no Outbox checkpoint; starting initial scan from configured block"
+            );
+            start.saturating_sub(1)
+        } else {
+            provider
+                .get_block_number()
+                .await
+                .with_context(|| format!("chain_key {chain_key}: failed to read chain head"))?
         }
     };
 
     let mut tick = tokio::time::interval(Duration::from_secs(DEFAULT_POLL_INTERVAL_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let mut resolve_tick =
+        tokio::time::interval(Duration::from_secs(crate::config::poll_secs_override(
+            "RELAYER_OUTBOX_RESOLVE_POLL_SECS",
+            DEFAULT_RESOLVE_POLL_INTERVAL_SECS,
+        )));
+    resolve_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
                 info!(chain_key, "🛑 Outbox watcher exiting on cancel");
                 return Ok(());
+            }
+            _ = resolve_tick.tick() => {
+                match resolver.resolve(&route, &dyn_provider).await {
+                    Ok(fresh) => {
+                        if fresh.address != outbox {
+                            // Switching now would abandon any not-yet-scanned MessagePublished
+                            // range on the old address (poll_once only ever tracks one
+                            // (address, last_seen) pair) — safe only once `last_seen` has already
+                            // reached the new Outbox's creation block, so the old address has
+                            // nothing left unscanned up to that point. Until then, keep discovering
+                            // on the old address (poll_once's regular ticks are already advancing
+                            // it) and re-check next resolve_tick; the switch is deferred, not lost.
+                            if outbox_rotation_is_safe(last_seen, fresh.current_since_block) {
+                                info!(
+                                    chain_key,
+                                    old = %outbox,
+                                    new = %fresh.address,
+                                    "🔁 Outbox rotation detected; switching discovery to the new address"
+                                );
+                                outbox = fresh.address;
+                                last_seen = fresh
+                                    .current_since_block
+                                    .map(|b| b.saturating_sub(1))
+                                    .unwrap_or(last_seen);
+                            } else {
+                                debug!(
+                                    chain_key,
+                                    old = %outbox,
+                                    new = %fresh.address,
+                                    last_seen,
+                                    since_block = ?fresh.current_since_block,
+                                    "🔁 Outbox rotation detected but old address still has an \
+                                     unscanned backlog; deferring the switch"
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => warn!(chain_key, %err, "outbox re-resolution failed; keeping current address"),
+                }
             }
             _ = tick.tick() => {
                 match poll_once(
@@ -177,8 +284,12 @@ pub async fn watch_outbox(
                             // unfinished message no matter how long it has been stalled. The
                             // in-memory cursor keeps advancing; re-indexing is idempotent
                             // (duplicate slots kept, delivery resolves AlreadyValidated).
+                            // Recording the Outbox address (not just a plain `set`) is what lets
+                            // the resume logic above tell a valid checkpoint from a stale one.
                             let persist = holdback.clamp(chain_key, last_seen);
-                            if let Err(err) = cp.set(&checkpoint_key, persist) {
+                            if let Err(err) =
+                                cp.set_with_outbox(&checkpoint_key, persist, &outbox.to_string())
+                            {
                                 warn!(chain_key, %err, "failed to persist Outbox checkpoint");
                             }
                         }
@@ -296,4 +407,74 @@ async fn poll_once<P: Provider>(
 
     *last_seen = to_block;
     Ok(())
+}
+
+/// Whether a checkpoint's recorded Outbox address (if any) positively contradicts the currently
+/// resolved one. `None` — no address was ever recorded, whether a pre-migration checkpoint file
+/// or a resolver (e.g. `ConfigOverrideResolver`) that never needed to — is deliberately NOT a
+/// contradiction: only a recorded address that actually differs counts.
+fn checkpoint_contradicts_resolved_outbox(recorded: Option<&str>, resolved: Address) -> bool {
+    recorded.is_some_and(|recorded| recorded != resolved.to_string())
+}
+
+/// Whether discovery can switch to a newly-resolved Outbox address right now without abandoning
+/// an unscanned range on the old one. Safe only once `last_seen` has already reached (or passed)
+/// the new Outbox's creation block — i.e. the old address has nothing left unscanned up to that
+/// point. An unknown creation block (no boundary to wait for) is always safe.
+fn outbox_rotation_is_safe(last_seen: u64, new_current_since_block: Option<u64>) -> bool {
+    match new_current_since_block {
+        Some(since) => last_seen >= since.saturating_sub(1),
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_recorded_outbox_is_not_a_contradiction() {
+        let resolved = Address::from([1u8; 20]);
+        // Pre-migration checkpoint file, or a resolver that never records one — either way,
+        // "unknown" must trust the checkpoint exactly as it did before this tracking existed.
+        assert!(!checkpoint_contradicts_resolved_outbox(None, resolved));
+    }
+
+    #[test]
+    fn matching_recorded_outbox_is_not_a_contradiction() {
+        let resolved = Address::from([1u8; 20]);
+        assert!(!checkpoint_contradicts_resolved_outbox(
+            Some(&resolved.to_string()),
+            resolved
+        ));
+    }
+
+    #[test]
+    fn different_recorded_outbox_is_a_contradiction() {
+        let resolved = Address::from([1u8; 20]);
+        let other = Address::from([2u8; 20]);
+        assert!(checkpoint_contradicts_resolved_outbox(
+            Some(&other.to_string()),
+            resolved
+        ));
+    }
+
+    #[test]
+    fn rotation_deferred_while_old_address_still_has_unscanned_backlog() {
+        // last_seen is far behind the new Outbox's creation block: switching now would abandon
+        // the unscanned range on the old address.
+        assert!(!outbox_rotation_is_safe(100, Some(10_000)));
+    }
+
+    #[test]
+    fn rotation_safe_once_caught_up_to_new_outbox_creation_block() {
+        assert!(outbox_rotation_is_safe(9_999, Some(10_000)));
+        assert!(outbox_rotation_is_safe(10_000, Some(10_000)));
+        assert!(outbox_rotation_is_safe(50_000, Some(10_000)));
+    }
+
+    #[test]
+    fn rotation_safe_when_new_outbox_creation_block_is_unknown() {
+        assert!(outbox_rotation_is_safe(0, None));
+    }
 }

@@ -218,9 +218,27 @@ impl Server {
             ),
         );
 
+        // One resolver per route, shared between its Outbox watcher and ack submitter below — both
+        // need to agree on the same live Outbox address, and sharing keeps the on-chain scan
+        // progress in one place. An explicit `outbox_address` keeps that static override; a route
+        // without one resolves automatically via `FactoryResolver`.
+        let resolvers: HashMap<u64, Arc<dyn OutboxResolver>> = self
+            .config
+            .routes
+            .iter()
+            .map(|route| {
+                let resolver: Arc<dyn OutboxResolver> = if route.outbox_address.is_some() {
+                    Arc::new(ConfigOverrideResolver)
+                } else {
+                    Arc::new(FactoryResolver::new())
+                };
+                (route.chain_key, resolver)
+            })
+            .collect();
+
         // Outbox watchers (per route).
-        let resolver: Arc<dyn OutboxResolver> = Arc::new(ConfigOverrideResolver);
         for route in &self.config.routes {
+            let resolver = resolvers[&route.chain_key].clone();
             spawn_worker(
                 &mut tasks,
                 format!("outbox watcher (chain_key {})", route.chain_key),
@@ -229,7 +247,7 @@ impl Server {
                     self.config.creditcoin_eth_rpc_url.clone(),
                     indexed_tx.clone(),
                     metrics.clone(),
-                    resolver.clone(),
+                    resolver,
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
                     health.clone(),
@@ -262,12 +280,14 @@ impl Server {
             );
         }
         for route in self.config.routes.iter().filter(|r| r.ack.is_some()) {
+            let resolver = resolvers[&route.chain_key].clone();
             spawn_worker(
                 &mut tasks,
                 format!("ack submitter (chain_key {})", route.chain_key),
                 ack::run(
                     route.clone(),
                     self.config.creditcoin_eth_rpc_url.clone(),
+                    resolver,
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
                     health.clone(),

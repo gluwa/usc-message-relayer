@@ -20,6 +20,15 @@
 //! `RelayerContract.claimDelivery(messageId, ..)` per delivered message, which pays the relay fee
 //! (+ any unexpired tip) to the relayer proven in the destination `MessageDelivered` event.
 //!
+//! The discovery scan also watches `MessagePending` (dApp callback reverted; message stored for
+//! `retryPendingMessage`): `EVMDeliveryDecoder` accepts a proof over a `MessagePending`-emitting
+//! tx as payable, but only from the *original* `deliverMessage` tx — a later `retryPendingMessage`
+//! tx carries the wrong call selector and the decoder rejects it. Without this, a message that
+//! ever goes pending strands its relay fee forever: the originating tx is never enqueued, and a
+//! successful retry's tx is unusable as a claim proof. A `MessagePending` tx has no
+//! `submitAcknowledgment` proof to offer — `acknowledge_tx`'s existing terminal classification
+//! already handles that, skipping straight to the claim.
+//!
 //! Since usc-contracts #23 the claim does NOT acknowledge — ack settlement lives solely on the
 //! `AcknowledgmentValidator` — so the two submissions are independent and BOTH run here, ack first:
 //! the message's user-set ackFee is an open bounty paid to the first successful `submitAcknowledgment`
@@ -33,6 +42,7 @@
 //! call. A transaction whose block is not yet attested returns HTTP 422 (`BlockNotReady`) from the
 //! proof-gen API and is retried on the next tick.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -50,6 +60,7 @@ use tracing::{debug, info, warn};
 use crate::abi::{IInbox, IOutbox};
 use crate::checkpoint::CheckpointStore;
 use crate::config::{AckConfig, ChainRoute};
+use crate::events::{OutboxResolver, DEFAULT_RESOLVE_POLL_INTERVAL_SECS};
 use crate::pending::{BoundedSeen, PendingTxs};
 use crate::proofgen::{ProofFetch, ProofGenClient};
 
@@ -85,7 +96,7 @@ const MAX_ACK_CONCURRENCY: usize = 8;
 /// Maximum block span per `eth_getLogs` scan. Public RPCs cap the queryable range; an over-large
 /// resume range (long downtime, deep `start_block` backfill) would error on every tick and wedge
 /// discovery forever. Bounded chunks advance the cursor incrementally — the 6s tick catches up.
-const MAX_BLOCKS_PER_SCAN: u64 = 5_000;
+const MAX_BLOCKS_PER_SCAN: u64 = 2_000;
 
 /// Upper bound on waiting for the submitAcknowledgment receipt, so one stuck tx cannot wedge the
 /// per-tick pipeline. On timeout the tx stays pending and is retried on a later tick (idempotent:
@@ -117,9 +128,11 @@ const MAX_ACK_TRANSIENT_ATTEMPTS: u32 = 20;
 /// `ack` config; otherwise loops until `cancel` fires or an unrecoverable error occurs.
 /// `scan_lookback_blocks` rewinds the persisted cursor on startup so acks that were pending when
 /// the process died are re-discovered (see [`crate::config::DEFAULT_SCAN_LOOKBACK_BLOCKS`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     route: ChainRoute,
     creditcoin_eth_rpc_url: String,
+    resolver: Arc<dyn OutboxResolver>,
     checkpoint: Option<Arc<CheckpointStore>>,
     scan_lookback_blocks: u64,
     health: Arc<crate::health::Health>,
@@ -193,6 +206,22 @@ pub async fn run(
 
     let client = ProofGenClient::new(&ack.proof_gen_url)?;
 
+    // Best-effort source Outbox address for `acknowledge_tx`'s `canAck`/already-acked pre-check —
+    // a pure cost-saving shortcut, so failure to resolve here is not fatal: the pre-check just
+    // fails open until a resolution succeeds.
+    let dyn_provider = source_provider.clone().erased();
+    let mut outbox = match resolver.resolve(&route, &dyn_provider).await {
+        Ok(resolved) => Some(resolved.address),
+        Err(err) => {
+            debug!(
+                chain_key,
+                %err,
+                "source Outbox not resolved yet; canAck pre-check fails open until it is"
+            );
+            None
+        }
+    };
+
     match &mode {
         SettlementMode::Ack => info!(
             chain_key,
@@ -252,6 +281,12 @@ pub async fn run(
     let mut pending = PendingTxs::new(MAX_PENDING_ACKS);
     // Tx hashes already acknowledged (or terminally skipped) — never re-submitted (bounded).
     let mut done = BoundedSeen::new(MAX_DONE_TRACKED);
+    // The source Outbox each pending tx was tagged with at first discovery — captured once and
+    // never updated again for that entry, even if `outbox` later rotates. Using whatever `outbox`
+    // is *now* would ask a message's canAck state from a contract it was never published on after
+    // a rotation (unknown id defaults to `false`), turning a real unsettled ack into a false
+    // "nothing to do". Kept in lockstep with `pending`/`done`: removed wherever they are.
+    let mut pending_outbox: HashMap<B256, Address> = HashMap::new();
 
     let mut tick = tokio::time::interval(Duration::from_secs(crate::config::poll_secs_override(
         "RELAYER_ACK_POLL_SECS",
@@ -260,11 +295,33 @@ pub async fn run(
     let mut pacer = crate::pacing::RateLimitPacer::default();
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let mut resolve_tick =
+        tokio::time::interval(Duration::from_secs(crate::config::poll_secs_override(
+            "RELAYER_OUTBOX_RESOLVE_POLL_SECS",
+            DEFAULT_RESOLVE_POLL_INTERVAL_SECS,
+        )));
+    resolve_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
                 info!(chain_key, "🛑 acknowledgment submitter exiting on cancel");
                 return Ok(());
+            }
+            _ = resolve_tick.tick() => {
+                match resolver.resolve(&route, &dyn_provider).await {
+                    Ok(resolved) => {
+                        if outbox != Some(resolved.address) {
+                            info!(
+                                chain_key,
+                                outbox = %resolved.address,
+                                "🔁 source Outbox resolved for the canAck pre-check"
+                            );
+                            outbox = Some(resolved.address);
+                        }
+                    }
+                    Err(err) => debug!(chain_key, %err, "source Outbox re-resolution failed; keeping previous state"),
+                }
             }
             _ = tick.tick() => {
                 // Rate-limit pacing: while a deferral window is active, skip the tick entirely —
@@ -283,6 +340,8 @@ pub async fn run(
                     &mut last_seen,
                     &mut pending,
                     &done,
+                    outbox,
+                    &mut pending_outbox,
                 ).await {
                     Ok(()) => {
                         // Successful destination scan = loop progress (C2r).
@@ -312,7 +371,7 @@ pub async fn run(
                     chain_key,
                     &ack,
                     &mode,
-                    route.outbox_address,
+                    &mut pending_outbox,
                     &client,
                     &source_provider,
                     submitter_address,
@@ -335,10 +394,16 @@ pub async fn run(
     }
 }
 
-/// Poll the destination Inbox for new `MessageDelivered` events and enqueue their tx hashes.
+/// Poll the destination Inbox for new `MessageDelivered` AND `MessagePending` events and enqueue
+/// their tx hashes (see the module docs' "Relay-fee claiming" section for why `MessagePending`
+/// matters here too).
 ///
 /// Scans only up to `tip - confirmation_depth` so a destination reorg on the unsafe head cannot
 /// enqueue an ack for a delivery that later disappears.
+///
+/// `outbox`, if known, is recorded in `pending_outbox` for every *newly* discovered tx (see that
+/// field's doc in [`run`]); `None` just leaves that tx's pre-check failing open.
+#[allow(clippy::too_many_arguments)]
 async fn discover_delivered<P: Provider>(
     chain_key: u64,
     inbox: alloy::primitives::Address,
@@ -347,6 +412,8 @@ async fn discover_delivered<P: Provider>(
     last_seen: &mut u64,
     pending: &mut PendingTxs,
     done: &BoundedSeen,
+    outbox: Option<Address>,
+    pending_outbox: &mut HashMap<B256, Address>,
 ) -> Result<()> {
     let tip = provider.get_block_number().await?;
     let confirmed = tip.saturating_sub(confirmation_depth);
@@ -359,39 +426,48 @@ async fn discover_delivered<P: Provider>(
 
     let filter = Filter::new()
         .address(inbox)
-        .event_signature(IInbox::MessageDelivered::SIGNATURE_HASH)
+        .event_signature(vec![
+            IInbox::MessageDelivered::SIGNATURE_HASH,
+            IInbox::MessagePending::SIGNATURE_HASH,
+        ])
         .from_block(from_block)
         .to_block(to_block);
 
     let logs = provider.get_logs(&filter).await.with_context(|| {
-        format!("eth_getLogs MessageDelivered from {from_block} to {to_block} failed")
+        format!(
+            "eth_getLogs MessageDelivered/MessagePending from {from_block} to {to_block} failed"
+        )
     })?;
 
     for log in logs {
         let Some(tx_hash) = log.transaction_hash else {
-            warn!(
-                chain_key,
-                "MessageDelivered log without transaction_hash; skipping"
-            );
+            warn!(chain_key, "delivery log without transaction_hash; skipping");
             continue;
         };
         let Some(block) = log.block_number else {
             warn!(
                 chain_key,
                 %tx_hash,
-                "MessageDelivered log without block_number; skipping"
+                "delivery log without block_number; skipping"
             );
             continue;
         };
-        // The delivered messageId feeds the canAck pre-check on the source Outbox, so bridge
-        // traffic never costs a proof fetch. A tx may carry several MessageDelivered logs.
-        let message_id = match IInbox::MessageDelivered::decode_log(&log.inner) {
-            Ok(decoded) => decoded.data.messageId,
+
+        // The delivered/pending messageId feeds the canAck and relay-claimable pre-checks, so
+        // bridge or already-settled traffic never costs a proof fetch. A tx may carry several
+        // such logs (one call, several messages).
+        let (event_name, message_id) = match decode_delivery_log(&log) {
+            Ok(Some(decoded)) => decoded,
+            Ok(None) => {
+                // Filter should prevent this, but skip rather than mis-decode if it doesn't.
+                continue;
+            }
             Err(err) => {
-                warn!(chain_key, %tx_hash, %err, "could not decode MessageDelivered log; skipping");
+                warn!(chain_key, %tx_hash, %err, "could not decode delivery log; skipping");
                 continue;
             }
         };
+
         if done.contains(&tx_hash) {
             continue;
         }
@@ -400,17 +476,41 @@ async fn discover_delivered<P: Provider>(
             continue;
         }
         if let Some(evicted) = pending.insert(tx_hash, Instant::now(), block, vec![message_id]) {
+            pending_outbox.remove(&evicted);
             warn!(
                 chain_key,
                 %evicted,
                 "ack pending queue at capacity; giving up on oldest un-acknowledged delivery"
             );
         }
-        debug!(chain_key, %tx_hash, %message_id, "🧾 observed MessageDelivered; queued for acknowledgment");
+        if let Some(addr) = outbox {
+            pending_outbox.insert(tx_hash, addr);
+        }
+        debug!(chain_key, %tx_hash, %message_id, event_name, "🧾 observed delivery event; queued for settlement");
     }
 
     *last_seen = to_block;
     Ok(())
+}
+
+/// Classify and decode one destination log by topic0: `Ok(Some((name, messageId)))` for a
+/// recognized `MessageDelivered`/`MessagePending` log, `Ok(None)` for anything else, `Err` if the
+/// topic0 matched but the log body failed to decode. Split out from [`discover_delivered`] so
+/// this dispatch is unit-testable without a live provider.
+fn decode_delivery_log(
+    log: &alloy::rpc::types::Log,
+) -> Result<Option<(&'static str, B256)>, alloy::sol_types::Error> {
+    match log.topics().first().copied() {
+        Some(sig) if sig == IInbox::MessageDelivered::SIGNATURE_HASH => {
+            IInbox::MessageDelivered::decode_log(&log.inner)
+                .map(|decoded| Some(("MessageDelivered", decoded.data.messageId)))
+        }
+        Some(sig) if sig == IInbox::MessagePending::SIGNATURE_HASH => {
+            IInbox::MessagePending::decode_log(&log.inner)
+                .map(|decoded| Some(("MessagePending", decoded.data.messageId)))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Try to fetch a proof and submit an acknowledgment for every pending destination tx that is due
@@ -422,7 +522,7 @@ async fn process_pending<P: Provider>(
     chain_key: u64,
     ack: &AckConfig,
     mode: &SettlementMode,
-    outbox: Option<alloy::primitives::Address>,
+    pending_outbox: &mut HashMap<B256, Address>,
     client: &ProofGenClient,
     source_provider: &P,
     submitter_address: alloy::primitives::Address,
@@ -442,21 +542,25 @@ async fn process_pending<P: Provider>(
     // is independent and dominated by network latency. Mutations to `pending`/`done` are applied
     // afterwards, on this task, so no shared-state synchronization is needed.
     let results: Vec<(B256, Result<AckOutcome>)> = futures::stream::iter(batch)
-        .map(|(tx_hash, message_ids)| async move {
-            let outcome = acknowledge_tx(
-                chain_key,
-                ack,
-                mode,
-                outbox,
-                &message_ids,
-                client,
-                source_provider,
-                submitter_address,
-                broadcast_locks,
-                tx_hash,
-            )
-            .await;
-            (tx_hash, outcome)
+        .map(|(tx_hash, message_ids)| {
+            // Tagged at discovery time, not whatever the resolver reports now — see `pending_outbox`.
+            let outbox = pending_outbox.get(&tx_hash).copied();
+            async move {
+                let outcome = acknowledge_tx(
+                    chain_key,
+                    ack,
+                    mode,
+                    outbox,
+                    &message_ids,
+                    client,
+                    source_provider,
+                    submitter_address,
+                    broadcast_locks,
+                    tx_hash,
+                )
+                .await;
+                (tx_hash, outcome)
+            }
         })
         .buffer_unordered(MAX_ACK_CONCURRENCY)
         .collect()
@@ -468,11 +572,13 @@ async fn process_pending<P: Provider>(
             Ok(AckOutcome::Acknowledged) => {
                 info!(chain_key, %tx_hash, "✅ delivery settled on source chain");
                 pending.remove(&tx_hash);
+                pending_outbox.remove(&tx_hash);
                 done.insert(tx_hash);
             }
             Ok(AckOutcome::Terminal(reason)) => {
                 info!(chain_key, %tx_hash, %reason, "ack skipped (terminal); will not retry");
                 pending.remove(&tx_hash);
+                pending_outbox.remove(&tx_hash);
                 done.insert(tx_hash);
             }
             Ok(AckOutcome::NotReady) => {
@@ -486,6 +592,7 @@ async fn process_pending<P: Provider>(
                         "proof never became ready within {MAX_ACK_AGE:?}; giving up on this ack"
                     );
                     pending.remove(&tx_hash);
+                    pending_outbox.remove(&tx_hash);
                     done.insert(tx_hash);
                 } else {
                     debug!(chain_key, %tx_hash, "proof not ready yet; deferred");
@@ -992,5 +1099,69 @@ mod tests {
             crate::abi::IOutbox::MessageNotFound::SELECTOR,
             [0x5d, 0x80, 0x3c, 0xca]
         );
+    }
+
+    fn rpc_log(address: Address, data: alloy::primitives::LogData) -> alloy::rpc::types::Log {
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log { address, data },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn decode_delivery_log_dispatches_on_topic0() {
+        let message_id = B256::from([7u8; 32]);
+        let addr = Address::from([1u8; 20]);
+
+        let delivered = IInbox::MessageDelivered {
+            messageId: message_id,
+            processor: addr,
+            relayer: addr,
+        };
+        let (name, id) = decode_delivery_log(&rpc_log(addr, delivered.encode_log_data()))
+            .expect("decodes")
+            .expect("recognized");
+        assert_eq!(name, "MessageDelivered");
+        assert_eq!(id, message_id);
+
+        let pending = IInbox::MessagePending {
+            messageId: message_id,
+            destinationContract: addr,
+            relayer: addr,
+        };
+        let (name, id) = decode_delivery_log(&rpc_log(addr, pending.encode_log_data()))
+            .expect("decodes")
+            .expect("recognized");
+        assert_eq!(name, "MessagePending");
+        assert_eq!(id, message_id);
+    }
+
+    #[test]
+    fn decode_delivery_log_ignores_unrelated_topic0() {
+        // The discovery filter only requests these two topic0s, but an RPC is not trusted to
+        // honor that — an unrelated event on the same Inbox (e.g. the ack validator's
+        // Acknowledged, a completely different contract in practice but same shape of concern)
+        // must be skipped, not mis-decoded as one of the two we expect.
+        let unrelated = crate::abi::IAcknowledgmentValidator::Acknowledged {
+            messageId: B256::from([9u8; 32]),
+        };
+        let log = rpc_log(Address::ZERO, unrelated.encode_log_data());
+        assert!(decode_delivery_log(&log)
+            .expect("no decode error")
+            .is_none());
+    }
+
+    #[test]
+    fn decode_delivery_log_surfaces_decode_errors_for_matching_topic0() {
+        // Right topic0, but too few topics for the event's three indexed fields (messageId,
+        // processor, relayer) — a malformed/truncated log must error, not silently drop the
+        // relay-fee claim by falling through as "unrecognized".
+        let malformed = alloy::primitives::LogData::new(
+            vec![IInbox::MessageDelivered::SIGNATURE_HASH],
+            Default::default(),
+        )
+        .expect("valid LogData");
+        let log = rpc_log(Address::ZERO, malformed);
+        assert!(decode_delivery_log(&log).is_err());
     }
 }

@@ -72,6 +72,23 @@ sol! {
 
     #[sol(rpc)]
     #[derive(Debug)]
+    contract IOutboxFactory {
+        /// Emitted when a new Outbox is deployed for `chainKey` on this factory.
+        /// `deployOutbox` is intentionally permissionless (see `OutboxFactory.sol`), so more than
+        /// one `OutboxCreated` can exist for the same `chainKey` over time — `FactoryResolver`
+        /// (`message-relayer::events::factory`) takes the latest by block order as the current
+        /// Outbox, never the first.
+        event OutboxCreated(
+            address indexed outbox,
+            uint32 indexed chainKey,
+            address indexed owner,
+            address validator,
+            string version
+        );
+    }
+
+    #[sol(rpc)]
+    #[derive(Debug)]
     contract IInbox {
         /// Submit an aggregated set of attestor votes that prove `messageId` was finalized
         /// on Creditcoin. Calldata is byte-identical to what attestors signed.
