@@ -22,6 +22,12 @@
 //! Note: this covers durable *on-chain* events. Attestor votes travel over gossip (ephemeral) and
 //! are out of scope here — a relayer that was down while votes were gossiped relies on the votes
 //! being re-observed, not on this cursor.
+//!
+//! The same file also backs [`FactoryResolver`](crate::events::factory::FactoryResolver)'s
+//! `OutboxCreated` discovery cursor, under the `factory:{chain_key}` key — see [`FactoryScan`].
+//! Without it, every restart (and every Outbox rotation, which invalidates the in-memory cursor
+//! too) rescans that factory's full log history from genesis before the relayer can resolve the
+//! live Outbox address at all.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,12 +37,22 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// One watcher's persisted state: the last fully-processed block, and (for the Outbox watcher
-/// only) which Outbox address it was scanned against.
+/// only) which Outbox address it was scanned against. The `factory`/`winner*` fields are the
+/// [`FactoryResolver`](crate::events::factory::FactoryResolver)-only counterpart — see
+/// [`FactoryScan`] — and are always absent on Outbox/ack/claim keys.
 #[derive(Debug, Clone, Default, Serialize)]
 struct Entry {
     block: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     outbox: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    factory: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    winner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    winner_block: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    winner_log_index: Option<u64>,
 }
 
 /// Deserialization-only shape: a bare JSON number is a checkpoint file written before per-entry
@@ -50,6 +66,14 @@ enum RawEntry {
         block: u64,
         #[serde(default)]
         outbox: Option<String>,
+        #[serde(default)]
+        factory: Option<String>,
+        #[serde(default)]
+        winner: Option<String>,
+        #[serde(default)]
+        winner_block: Option<u64>,
+        #[serde(default)]
+        winner_log_index: Option<u64>,
     },
 }
 
@@ -58,11 +82,45 @@ impl From<RawEntry> for Entry {
         match raw {
             RawEntry::Legacy(block) => Entry {
                 block,
-                outbox: None,
+                ..Entry::default()
             },
-            RawEntry::Full { block, outbox } => Entry { block, outbox },
+            RawEntry::Full {
+                block,
+                outbox,
+                factory,
+                winner,
+                winner_block,
+                winner_log_index,
+            } => Entry {
+                block,
+                outbox,
+                factory,
+                winner,
+                winner_block,
+                winner_log_index,
+            },
         }
     }
+}
+
+/// Persisted [`FactoryResolver`](crate::events::factory::FactoryResolver) scan state for one
+/// `chain_key`, stored under key `factory:{chain_key}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactoryScan {
+    /// Factory address this scan was performed against. A mismatch against the freshly-resolved
+    /// factory (a rotation while the relayer was down) means this progress is for a different log
+    /// stream and must be discarded — exactly like the Outbox-watcher's `outbox` field above, but
+    /// for `OutboxCreated` scans on the factory contract instead of `MessagePublished` scans on
+    /// the Outbox.
+    pub factory: String,
+    /// Highest block scanned so far (inclusive) against `factory`; resuming continues at
+    /// `scanned_to + 1`.
+    pub scanned_to: u64,
+    /// The latest `OutboxCreated` match found in the scanned range, if any: its Outbox address
+    /// and `(block, log_index)` tie-break key (`deployOutbox` is permissionless, so more than one
+    /// match can exist over time — see `ScanState::record_if_latest`). `None` means no match has
+    /// been found yet.
+    pub winner: Option<(String, u64, u64)>,
 }
 
 /// A JSON-file-backed map of `watcher key -> last fully-processed block` (+ optional Outbox
@@ -141,7 +199,14 @@ impl CheckpointStore {
     pub fn set(&self, key: &str, block: u64) -> Result<()> {
         let mut guard = self.inner.lock().expect("checkpoint mutex");
         let outbox = guard.get(key).and_then(|e| e.outbox.clone());
-        guard.insert(key.to_string(), Entry { block, outbox });
+        guard.insert(
+            key.to_string(),
+            Entry {
+                block,
+                outbox,
+                ..Entry::default()
+            },
+        );
         Self::persist(&self.path, &guard)
     }
 
@@ -156,6 +221,51 @@ impl CheckpointStore {
             Entry {
                 block,
                 outbox: Some(outbox.to_string()),
+                ..Entry::default()
+            },
+        );
+        Self::persist(&self.path, &guard)
+    }
+
+    /// The persisted [`FactoryScan`] for `key` (`factory:{chain_key}`), if one has been recorded.
+    pub fn get_factory_scan(&self, key: &str) -> Option<FactoryScan> {
+        let guard = self.inner.lock().expect("checkpoint mutex");
+        let entry = guard.get(key)?;
+        let factory = entry.factory.clone()?;
+        let winner = match (&entry.winner, entry.winner_block, entry.winner_log_index) {
+            (Some(address), Some(block), Some(log_index)) => {
+                Some((address.clone(), block, log_index))
+            }
+            _ => None,
+        };
+        Some(FactoryScan {
+            factory,
+            scanned_to: entry.block,
+            winner,
+        })
+    }
+
+    /// Record `scan` as `key`'s factory-resolver progress and persist the whole store. Overwrites
+    /// whatever was previously recorded for `key` outright (unlike [`Self::set`], there is no
+    /// "ordinary tick" that should preserve older fields — every call from `FactoryResolver`
+    /// carries its full current progress).
+    pub fn set_factory_scan(&self, key: &str, scan: &FactoryScan) -> Result<()> {
+        let mut guard = self.inner.lock().expect("checkpoint mutex");
+        let (winner, winner_block, winner_log_index) = match &scan.winner {
+            Some((address, block, log_index)) => {
+                (Some(address.clone()), Some(*block), Some(*log_index))
+            }
+            None => (None, None, None),
+        };
+        guard.insert(
+            key.to_string(),
+            Entry {
+                block: scan.scanned_to,
+                outbox: None,
+                factory: Some(scan.factory.clone()),
+                winner,
+                winner_block,
+                winner_log_index,
             },
         );
         Self::persist(&self.path, &guard)
@@ -349,6 +459,107 @@ mod tests {
         // Clearing (all delivered/terminal) releases the cursor.
         hb.update(2, None);
         assert_eq!(hb.clamp(2, 1000), 1000);
+    }
+
+    /// A factory scan round-trips its cursor and winner across a reload, and is independent of
+    /// the ordinary `block`/`outbox` entries used by the Outbox/ack/claim watchers.
+    #[test]
+    fn factory_scan_round_trips_and_persists_across_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        let store = CheckpointStore::load(&path).unwrap();
+
+        assert_eq!(store.get_factory_scan("factory:2"), None);
+
+        let scan = FactoryScan {
+            factory: "0xaaa".to_string(),
+            scanned_to: 5_000,
+            winner: Some(("0xbbb".to_string(), 100, 3)),
+        };
+        store.set_factory_scan("factory:2", &scan).unwrap();
+        assert_eq!(store.get_factory_scan("factory:2"), Some(scan.clone()));
+
+        // An ordinary outbox-watcher entry under a different key is unaffected.
+        store.set_with_outbox("outbox:2", 1_234, "0xccc").unwrap();
+        assert_eq!(store.get("outbox:2"), Some(1_234));
+        assert_eq!(store.get_factory_scan("outbox:2"), None);
+
+        let reloaded = CheckpointStore::load(&path).unwrap();
+        assert_eq!(reloaded.get_factory_scan("factory:2"), Some(scan));
+        assert_eq!(reloaded.get("outbox:2"), Some(1_234));
+    }
+
+    /// A factory scan with no winner yet (scanned some of the range, found nothing) round-trips
+    /// with `winner: None` rather than a partially-populated triple.
+    #[test]
+    fn factory_scan_with_no_winner_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        let store = CheckpointStore::load(&path).unwrap();
+
+        let scan = FactoryScan {
+            factory: "0xaaa".to_string(),
+            scanned_to: 2_000,
+            winner: None,
+        };
+        store.set_factory_scan("factory:2", &scan).unwrap();
+        assert_eq!(
+            CheckpointStore::load(&path)
+                .unwrap()
+                .get_factory_scan("factory:2"),
+            Some(scan)
+        );
+    }
+
+    /// Rotating to a new factory overwrites the previously recorded scan outright — no stale
+    /// winner/cursor from the old factory's log stream survives.
+    #[test]
+    fn factory_scan_set_overwrites_previous_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        let store = CheckpointStore::load(&path).unwrap();
+
+        store
+            .set_factory_scan(
+                "factory:2",
+                &FactoryScan {
+                    factory: "0xaaa".to_string(),
+                    scanned_to: 5_000,
+                    winner: Some(("0xbbb".to_string(), 100, 3)),
+                },
+            )
+            .unwrap();
+        store
+            .set_factory_scan(
+                "factory:2",
+                &FactoryScan {
+                    factory: "0xddd".to_string(),
+                    scanned_to: 10,
+                    winner: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.get_factory_scan("factory:2"),
+            Some(FactoryScan {
+                factory: "0xddd".to_string(),
+                scanned_to: 10,
+                winner: None,
+            })
+        );
+    }
+
+    /// A legacy bare-number checkpoint file (written before factory-scan fields existed) has no
+    /// factory scan recorded for any of its keys.
+    #[test]
+    fn legacy_file_has_no_factory_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        std::fs::write(&path, r#"{"outbox:2": 1234}"#).unwrap();
+
+        let store = CheckpointStore::load(&path).unwrap();
+        assert_eq!(store.get_factory_scan("outbox:2"), None);
     }
 
     #[test]
