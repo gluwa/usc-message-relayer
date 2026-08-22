@@ -129,7 +129,11 @@ retry silently forever:
   already-finished work resolves idempotently (delivered → `Already validated` at simulate,
   acked → skipped by the pre-check). The Outbox watcher's checkpoint additionally records which
   Outbox address it was scanned against, so a restart can tell a valid long-running cursor apart
-  from one left over from a since-rotated-away Outbox.
+  from one left over from a since-rotated-away Outbox. `FactoryResolver`'s own `OutboxCreated`
+  discovery scan (against the factory contract, not the Outbox) persists the same way, under the
+  same checkpoint file: a restart resumes that scan instead of rescanning the factory's full log
+  history from genesis, and a checkpoint recorded against a factory since rotated away from is
+  discarded rather than reused.
 - **Bounded everything** — vote cache (TTL + LRU cap), pending-ack queue (cap 10 000, oldest
   evicted), per-tick ack batch (256) and concurrency (8), 5 000-block `eth_getLogs` chunks (an
   over-large resume range would error on every tick forever on range-capped RPCs), 120 s receipt
@@ -266,6 +270,3 @@ Dockerfile               two-stage image build
   `FactoryResolver` calls a chain-info precompile (`get_outbox_factory_address`) that only exists
   on `writeability-off-usc-dev`, not yet on `main`/`usc-dev`. Until it merges, routes need an
   explicit `outbox_address` on any network where the precompile isn't deployed.
-- **`FactoryResolver`'s scan cursor is in-memory only** — a process restart re-scans the factory's
-  full `OutboxCreated` history from genesis rather than resuming a persisted position. Slower cold
-  start, not a correctness issue.

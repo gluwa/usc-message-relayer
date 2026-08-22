@@ -6,6 +6,7 @@
 //! one-impl change rather than a refactor across modules.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::{address, Address};
@@ -16,9 +17,10 @@ use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::abi::IOutboxFactory;
+use crate::checkpoint::{CheckpointStore, FactoryScan};
 use crate::config::ChainRoute;
 use write_ability::protocol::chain_key_to_bytes32;
 
@@ -153,11 +155,18 @@ impl ScanState {
 /// `state`. Only returns `Ok` once fully caught up to that call's confirmed tip, never an
 /// early/not-yet-final match — a more recent `OutboxCreated` could still be sitting unscanned.
 ///
-/// **Known limitation:** `state` is in-memory only and always starts from genesis — a restart
-/// re-scans full history rather than resuming a persisted cursor (slower, not incorrect).
-/// `route.start_block` is deliberately not reused here: it backfills `MessagePublished` on the
-/// Outbox, a different contract's history, and could seed the scan after the very `OutboxCreated`
-/// it needs to find.
+/// `route.start_block` is deliberately not reused to seed a fresh scan: it backfills
+/// `MessagePublished` on the Outbox, a different contract's history, and could start the scan
+/// after the very `OutboxCreated` it needs to find.
+///
+/// When `checkpoint` is `Some`, a chain_key's scan progress (cursor + winner found so far, see
+/// [`FactoryScan`]) is persisted after every call and reloaded the first time that chain_key is
+/// seen in this process — so a restart resumes the scan instead of rescanning from genesis. A
+/// persisted scan recorded against a factory other than the one freshly resolved (a rotation
+/// while the relayer was down) is discarded, exactly like the in-memory `scan.factory != factory`
+/// check below discards it for a rotation observed while running. `checkpoint: None` keeps the
+/// old in-memory-only, always-from-genesis behaviour (used in tests and when persistence is
+/// disabled entirely).
 ///
 /// `state`'s lock is held across every RPC call in a `resolve()` invocation (simplest way to keep
 /// a chain_key's scan progress consistent across its chunk loop) — a caller sharing this resolver
@@ -167,11 +176,52 @@ impl ScanState {
 #[derive(Debug, Default)]
 pub struct FactoryResolver {
     state: Mutex<HashMap<u64, ScanState>>,
+    checkpoint: Option<Arc<CheckpointStore>>,
 }
 
 impl FactoryResolver {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(checkpoint: Option<Arc<CheckpointStore>>) -> Self {
+        Self {
+            state: Mutex::new(HashMap::new()),
+            checkpoint,
+        }
+    }
+
+    /// The checkpoint-store key this resolver persists `chain_key`'s scan progress under.
+    fn checkpoint_key(chain_key: u64) -> String {
+        format!("factory:{chain_key}")
+    }
+
+    /// The [`ScanState`] to start a fresh-in-this-process scan of `factory` with, given whatever
+    /// was previously persisted for this chain_key (if anything). Pulled out of `resolve` as a
+    /// pure function so the resume-vs-discard decision is unit-testable without a live provider.
+    ///
+    /// `persisted` is reused verbatim only when it was recorded against this same `factory`; a
+    /// mismatch (an Outbox-factory rotation that happened while the relayer was down) is
+    /// indistinguishable from "nothing persisted" and always restarts from genesis — exactly like
+    /// the in-memory `scan.factory != factory` check in `resolve` does for a rotation observed
+    /// while running.
+    fn initial_scan_state(factory: Address, persisted: Option<&FactoryScan>) -> ScanState {
+        match persisted {
+            Some(persisted) if persisted.factory == factory.to_string() => ScanState {
+                factory,
+                scanned_to: persisted.scanned_to,
+                current: persisted
+                    .winner
+                    .as_ref()
+                    .and_then(|(address, block, log_index)| {
+                        address
+                            .parse::<Address>()
+                            .ok()
+                            .map(|a| (a, *block, *log_index))
+                    }),
+            },
+            _ => ScanState {
+                factory,
+                scanned_to: 0,
+                current: None,
+            },
+        }
     }
 }
 
@@ -204,9 +254,37 @@ impl OutboxResolver for FactoryResolver {
         let factory = factory_result.factoryAddr;
 
         let mut states = self.state.lock().await;
+        let first_use_in_process = !states.contains_key(&chain_key);
         let scan = states.entry(chain_key).or_default();
+
+        if first_use_in_process {
+            let persisted = self
+                .checkpoint
+                .as_ref()
+                .and_then(|cp| cp.get_factory_scan(&Self::checkpoint_key(chain_key)));
+            match &persisted {
+                Some(p) if p.factory == factory.to_string() => info!(
+                    chain_key,
+                    %factory,
+                    scanned_to = p.scanned_to,
+                    winner = ?p.winner,
+                    "↩️ resuming OutboxCreated discovery from persisted factory-scan checkpoint"
+                ),
+                Some(p) => info!(
+                    chain_key,
+                    %factory,
+                    persisted_factory = %p.factory,
+                    "factory-scan checkpoint is recorded against a different factory (rotated \
+                     while down); discarding it and scanning from genesis"
+                ),
+                None => {}
+            }
+            *scan = Self::initial_scan_state(factory, persisted.as_ref());
+        }
+
         if scan.factory != factory {
-            // New factory (or first resolution): scan its history from scratch, always genesis.
+            // Factory rotation observed mid-process (not just at startup): scan its history from
+            // scratch, always genesis.
             *scan = ScanState {
                 factory,
                 scanned_to: 0,
@@ -273,6 +351,19 @@ impl OutboxResolver for FactoryResolver {
 
             scan.scanned_to = to_block;
             chunks += 1;
+        }
+
+        if let Some(cp) = &self.checkpoint {
+            let to_persist = FactoryScan {
+                factory: factory.to_string(),
+                scanned_to: scan.scanned_to,
+                winner: scan
+                    .current
+                    .map(|(address, block, log_index)| (address.to_string(), block, log_index)),
+            };
+            if let Err(err) = cp.set_factory_scan(&Self::checkpoint_key(chain_key), &to_persist) {
+                warn!(chain_key, %err, "failed to persist factory-resolver scan checkpoint");
+            }
         }
 
         if scan.scanned_to < confirmed {
@@ -389,5 +480,71 @@ mod tests {
         // An earlier (block, log_index) than the current winner must not overwrite it.
         scan.record_if_latest(b, 10, 5);
         assert_eq!(scan.current, Some((a, 11, 0)));
+    }
+
+    /// No persisted checkpoint at all (first boot, or persistence disabled): start from genesis.
+    #[test]
+    fn initial_scan_state_with_nothing_persisted_starts_from_genesis() {
+        let factory = address!("0000000000000000000000000000000000000001");
+        let scan = FactoryResolver::initial_scan_state(factory, None);
+        assert_eq!(scan.factory, factory);
+        assert_eq!(scan.scanned_to, 0);
+        assert_eq!(scan.current, None);
+    }
+
+    /// A checkpoint persisted against this same factory resumes exactly where it left off,
+    /// winner included — the entire point of persisting it.
+    #[test]
+    fn initial_scan_state_resumes_when_factory_matches() {
+        let factory = address!("0000000000000000000000000000000000000001");
+        let winner = address!("0000000000000000000000000000000000000002");
+        let persisted = FactoryScan {
+            factory: factory.to_string(),
+            scanned_to: 12_345,
+            winner: Some((winner.to_string(), 100, 3)),
+        };
+        let scan = FactoryResolver::initial_scan_state(factory, Some(&persisted));
+        assert_eq!(scan.factory, factory);
+        assert_eq!(scan.scanned_to, 12_345);
+        assert_eq!(scan.current, Some((winner, 100, 3)));
+    }
+
+    /// A checkpoint persisted against a *different* factory (rotation while the relayer was down)
+    /// must not be reused — reusing it would mix one contract's log-scan progress with another's,
+    /// silently corrupting the resolved Outbox. Discard and restart from genesis, same as no
+    /// checkpoint at all.
+    #[test]
+    fn initial_scan_state_discards_checkpoint_for_a_different_factory() {
+        let old_factory = address!("0000000000000000000000000000000000000001");
+        let new_factory = address!("0000000000000000000000000000000000000002");
+        let persisted = FactoryScan {
+            factory: old_factory.to_string(),
+            scanned_to: 12_345,
+            winner: Some((
+                address!("0000000000000000000000000000000000000003").to_string(),
+                100,
+                3,
+            )),
+        };
+        let scan = FactoryResolver::initial_scan_state(new_factory, Some(&persisted));
+        assert_eq!(scan.factory, new_factory);
+        assert_eq!(scan.scanned_to, 0);
+        assert_eq!(scan.current, None);
+    }
+
+    /// A checkpoint persisted with no winner yet (scanned some of the range, found nothing) still
+    /// resumes the cursor — there is nothing to carry forward as `current`, but the scanned range
+    /// itself must not be rescanned.
+    #[test]
+    fn initial_scan_state_resumes_cursor_with_no_winner_yet() {
+        let factory = address!("0000000000000000000000000000000000000001");
+        let persisted = FactoryScan {
+            factory: factory.to_string(),
+            scanned_to: 2_000,
+            winner: None,
+        };
+        let scan = FactoryResolver::initial_scan_state(factory, Some(&persisted));
+        assert_eq!(scan.scanned_to, 2_000);
+        assert_eq!(scan.current, None);
     }
 }

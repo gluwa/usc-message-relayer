@@ -230,7 +230,7 @@ impl Server {
                 let resolver: Arc<dyn OutboxResolver> = if route.outbox_address.is_some() {
                     Arc::new(ConfigOverrideResolver)
                 } else {
-                    Arc::new(FactoryResolver::new())
+                    Arc::new(FactoryResolver::new(checkpoint.clone()))
                 };
                 (route.chain_key, resolver)
             })
