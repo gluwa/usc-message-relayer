@@ -62,6 +62,7 @@ use crate::checkpoint::CheckpointStore;
 use crate::config::{AckConfig, ChainRoute};
 use crate::events::{OutboxResolver, DEFAULT_RESOLVE_POLL_INTERVAL_SECS};
 use crate::pending::{BoundedSeen, PendingTxs};
+use crate::prom::{Metrics, SettlementOutcome};
 use crate::proofgen::{ProofFetch, ProofGenClient};
 
 /// Poll cadence for the destination `MessageDelivered` watcher and the pending-proof retry queue.
@@ -135,6 +136,7 @@ pub async fn run(
     resolver: Arc<dyn OutboxResolver>,
     checkpoint: Option<Arc<CheckpointStore>>,
     scan_lookback_blocks: u64,
+    metrics: Metrics,
     health: Arc<crate::health::Health>,
     broadcast_locks: Arc<crate::broadcast::BroadcastLocks>,
     cancel: CancellationToken,
@@ -376,6 +378,7 @@ pub async fn run(
                     &source_provider,
                     submitter_address,
                     &broadcast_locks,
+                    &metrics,
                     &mut pending,
                     &mut done,
                 ).await;
@@ -527,6 +530,7 @@ async fn process_pending<P: Provider>(
     source_provider: &P,
     submitter_address: alloy::primitives::Address,
     broadcast_locks: &Arc<crate::broadcast::BroadcastLocks>,
+    metrics: &Metrics,
     pending: &mut PendingTxs,
     done: &mut BoundedSeen,
 ) {
@@ -556,6 +560,7 @@ async fn process_pending<P: Provider>(
                     source_provider,
                     submitter_address,
                     broadcast_locks,
+                    metrics,
                     tx_hash,
                 )
                 .await;
@@ -754,6 +759,7 @@ async fn acknowledge_tx<P: Provider>(
     source_provider: &P,
     submitter_address: alloy::primitives::Address,
     broadcast_locks: &Arc<crate::broadcast::BroadcastLocks>,
+    metrics: &Metrics,
     tx_hash: B256,
 ) -> Result<AckOutcome> {
     // Pre-checks: skip the proof fetch entirely when nothing is left to do. Both checks fail
@@ -796,9 +802,22 @@ async fn acknowledge_tx<P: Provider>(
         ));
     }
 
-    let proof = match client.proof_by_tx(chain_key, tx_hash).await? {
-        ProofFetch::Ready(p) => p,
-        ProofFetch::NotReady => return Ok(AckOutcome::NotReady),
+    let proof = match client.proof_by_tx(chain_key, tx_hash).await {
+        Ok(ProofFetch::Ready(p)) => p,
+        Ok(ProofFetch::NotReady) => return Ok(AckOutcome::NotReady),
+        Err(err) => {
+            // Whichever settlement(s) this poll needed failed to even get a proof — this is
+            // exactly the shape that hid a two-day settlement outage behind a WARN nobody read
+            // (proof-gen's archiver silently unable to build continuity proofs): delivery kept
+            // working while every ack/claim attempt died right here.
+            if needs_ack {
+                metrics.inc_ack_submission(chain_key, SettlementOutcome::Failed);
+            }
+            if !claim_ids.is_empty() {
+                metrics.inc_claim_submission(chain_key, SettlementOutcome::Failed);
+            }
+            return Err(err);
+        }
     };
 
     let encoded_tx = proof.encoded_transaction()?;
@@ -844,15 +863,19 @@ async fn acknowledge_tx<P: Provider>(
             .await
         {
             Ok(res) => res,
-            Err(stalled) => return Err(anyhow!("submitAcknowledgment {stalled}")),
+            Err(stalled) => {
+                metrics.inc_ack_submission(chain_key, SettlementOutcome::Failed);
+                return Err(anyhow!("submitAcknowledgment {stalled}"));
+            }
         };
-        match classify_submit(pending_tx, "submitAcknowledgment").await? {
-            SubmitOutcome::Confirmed {
+        match classify_submit(pending_tx, "submitAcknowledgment").await {
+            Ok(SubmitOutcome::Confirmed {
                 gas_used,
                 effective_gas_price,
                 gas_cost_wei,
                 tx_hash: settle_tx,
-            } => {
+            }) => {
+                metrics.inc_ack_submission(chain_key, SettlementOutcome::Confirmed);
                 info!(
                     chain_key,
                     %tx_hash,
@@ -866,8 +889,13 @@ async fn acknowledge_tx<P: Provider>(
             // Terminal here (e.g. NoMessageDeliveredLogs because another submitter front-ran the
             // bounty and every log is now already-acked) must not block the relay-fee claim below —
             // the claim pays the proven relayer regardless of who acknowledged.
-            SubmitOutcome::Terminal(reason) => {
+            Ok(SubmitOutcome::Terminal(reason)) => {
+                metrics.inc_ack_submission(chain_key, SettlementOutcome::Terminal);
                 info!(chain_key, %tx_hash, %reason, "submitAcknowledgment terminal; continuing to claim");
+            }
+            Err(err) => {
+                metrics.inc_ack_submission(chain_key, SettlementOutcome::Failed);
+                return Err(err);
             }
         }
     }
@@ -894,31 +922,44 @@ async fn acknowledge_tx<P: Provider>(
                 .await
             {
                 Ok(res) => res,
-                Err(stalled) => return Err(anyhow!("claimDelivery {stalled}")),
+                Err(stalled) => {
+                    metrics.inc_claim_submission(chain_key, SettlementOutcome::Failed);
+                    return Err(anyhow!("claimDelivery {stalled}"));
+                }
             };
-            match classify_submit(pending_tx, "claimDelivery").await? {
-                SubmitOutcome::Confirmed {
+            match classify_submit(pending_tx, "claimDelivery").await {
+                Ok(SubmitOutcome::Confirmed {
                     gas_used,
                     effective_gas_price,
                     gas_cost_wei,
                     tx_hash: settle_tx,
-                } => info!(
-                    chain_key,
-                    %tx_hash,
-                    message_id = %id,
-                    claim_tx_hash = %settle_tx,
-                    gas_used = %gas_used,
-                    effective_gas_price_wei = %effective_gas_price,
-                    gas_cost_wei = %gas_cost_wei,
-                    "claimDelivery confirmed (relay fee settled to proven relayer)",
-                ),
-                SubmitOutcome::Terminal(reason) => info!(
-                    chain_key,
-                    %tx_hash,
-                    message_id = %id,
-                    %reason,
-                    "claimDelivery skipped for message (terminal)",
-                ),
+                }) => {
+                    metrics.inc_claim_submission(chain_key, SettlementOutcome::Confirmed);
+                    info!(
+                        chain_key,
+                        %tx_hash,
+                        message_id = %id,
+                        claim_tx_hash = %settle_tx,
+                        gas_used = %gas_used,
+                        effective_gas_price_wei = %effective_gas_price,
+                        gas_cost_wei = %gas_cost_wei,
+                        "claimDelivery confirmed (relay fee settled to proven relayer)",
+                    );
+                }
+                Ok(SubmitOutcome::Terminal(reason)) => {
+                    metrics.inc_claim_submission(chain_key, SettlementOutcome::Terminal);
+                    info!(
+                        chain_key,
+                        %tx_hash,
+                        message_id = %id,
+                        %reason,
+                        "claimDelivery skipped for message (terminal)",
+                    );
+                }
+                Err(err) => {
+                    metrics.inc_claim_submission(chain_key, SettlementOutcome::Failed);
+                    return Err(err);
+                }
             }
         }
     }

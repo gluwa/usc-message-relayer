@@ -112,6 +112,11 @@ const PRECOMPILE_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 const BLOCK_NUMBER_TIMEOUT: Duration = Duration::from_secs(10);
 const GET_LOGS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Env override for whether a detected factory rotation resumes the new factory's `OutboxCreated`
+/// scan from the old factory's already-reached cursor, instead of rescanning from genesis. See
+/// [`FactoryResolver::resolve`]'s doc for the reasoning; default `true`.
+const ROTATION_RESUME_FROM_CHECKPOINT_ENV: &str = "RELAYER_FACTORY_ROTATION_RESUME_FROM_CHECKPOINT";
+
 /// Per-`chain_key` scan progress, cached across [`FactoryResolver::resolve`] calls.
 #[derive(Debug, Clone, Copy, Default)]
 struct ScanState {
@@ -141,6 +146,32 @@ impl ScanState {
     }
 }
 
+/// The [`ScanState::scanned_to`] to assign when starting a fresh scan of a newly-detected factory:
+/// `previous_scanned_to - 1` (the block height already reached under whatever this chain_key's
+/// scan was tracking before — a persisted checkpoint recorded against a different factory, or the
+/// in-memory state just before a mid-process rotation) when `resume_from_checkpoint` is set,
+/// genesis (0) otherwise. Pure so the resume-vs-genesis decision is unit-testable without a live
+/// provider.
+///
+/// The `- 1` matters: `scanned_to` means "scanned through this block, inclusive" and the next chunk
+/// starts at `scanned_to + 1`, so assigning `previous_scanned_to` verbatim would skip that boundary
+/// block on the new factory's log stream entirely — mirrors `events::outbox_rotation_is_safe`'s
+/// identical `saturating_sub(1)` treatment of `current_since_block` for the same reason.
+///
+/// Resuming from near that height (rather than genesis) is an intentional trade: nothing strictly
+/// before it could have driven any delivery through the not-yet-current new Outbox, so a real
+/// "just rotated to" `OutboxCreated` is always at or after it. The risk is a permissionless
+/// `deployOutbox` on the new factory that predates that height (a mirror/pre-deployed Outbox, as
+/// opposed to one created as part of the rotation itself) — that event would never be found.
+/// `false` restores the original always-genesis behavior for operators who need that guarantee.
+fn rotation_scan_start(previous_scanned_to: u64, resume_from_checkpoint: bool) -> u64 {
+    if resume_from_checkpoint {
+        previous_scanned_to.saturating_sub(1)
+    } else {
+        0
+    }
+}
+
 /// Production resolver: finds the Outbox for `route.chain_key` entirely from on-chain state, no
 /// operator-supplied address — mirroring creditcoin3's own attestor-fleet resolver, which avoids a
 /// configured factory address on the same grounds ("an address supplied separately from the chain
@@ -161,12 +192,18 @@ impl ScanState {
 ///
 /// When `checkpoint` is `Some`, a chain_key's scan progress (cursor + winner found so far, see
 /// [`FactoryScan`]) is persisted after every call and reloaded the first time that chain_key is
-/// seen in this process — so a restart resumes the scan instead of rescanning from genesis. A
-/// persisted scan recorded against a factory other than the one freshly resolved (a rotation
-/// while the relayer was down) is discarded, exactly like the in-memory `scan.factory != factory`
-/// check below discards it for a rotation observed while running. `checkpoint: None` keeps the
-/// old in-memory-only, always-from-genesis behaviour (used in tests and when persistence is
-/// disabled entirely).
+/// seen in this process — so a restart resumes the scan instead of rescanning from genesis.
+///
+/// A persisted (or in-memory) scan recorded against a factory other than the one freshly resolved
+/// — an Outbox-factory rotation, observed either while the relayer was down or while it was
+/// running — resumes the *new* factory's scan from the *old* one's already-reached cursor rather
+/// than genesis, when [`ROTATION_RESUME_FROM_CHECKPOINT_ENV`] is enabled (default; see
+/// [`rotation_scan_start`]). Without that env var (or with it disabled), a rotation always
+/// rescans the new factory from genesis — safe, but a full-history `eth_getLogs` scan on both the
+/// rotate and the eventual restore, which on a long-lived chain can take minutes even though
+/// nothing before the old factory's cursor could have driven a delivery through the not-yet-current
+/// new outbox. `checkpoint: None` keeps the old in-memory-only behaviour (used in tests and when
+/// persistence is disabled entirely) but still honors the rotation-resume setting.
 ///
 /// `state`'s lock is held across every RPC call in a `resolve()` invocation (simplest way to keep
 /// a chain_key's scan progress consistent across its chunk loop) — a caller sharing this resolver
@@ -177,6 +214,9 @@ impl ScanState {
 pub struct FactoryResolver {
     state: Mutex<HashMap<u64, ScanState>>,
     checkpoint: Option<Arc<CheckpointStore>>,
+    /// Cached once at construction (see [`ROTATION_RESUME_FROM_CHECKPOINT_ENV`]) rather than
+    /// re-read on every `resolve()` call — this only needs to change with a restart.
+    resume_rotation_from_checkpoint: bool,
 }
 
 impl FactoryResolver {
@@ -184,6 +224,10 @@ impl FactoryResolver {
         Self {
             state: Mutex::new(HashMap::new()),
             checkpoint,
+            resume_rotation_from_checkpoint: crate::config::bool_env_override(
+                ROTATION_RESUME_FROM_CHECKPOINT_ENV,
+                true,
+            ),
         }
     }
 
@@ -196,12 +240,17 @@ impl FactoryResolver {
     /// was previously persisted for this chain_key (if anything). Pulled out of `resolve` as a
     /// pure function so the resume-vs-discard decision is unit-testable without a live provider.
     ///
-    /// `persisted` is reused verbatim only when it was recorded against this same `factory`; a
-    /// mismatch (an Outbox-factory rotation that happened while the relayer was down) is
-    /// indistinguishable from "nothing persisted" and always restarts from genesis — exactly like
-    /// the in-memory `scan.factory != factory` check in `resolve` does for a rotation observed
-    /// while running.
-    fn initial_scan_state(factory: Address, persisted: Option<&FactoryScan>) -> ScanState {
+    /// `persisted` is reused verbatim only when it was recorded against this same `factory`. A
+    /// mismatch (an Outbox-factory rotation that happened while the relayer was down) resumes from
+    /// the persisted cursor's height when `resume_from_checkpoint` is set (see
+    /// [`rotation_scan_start`]), exactly like the in-memory `scan.factory != factory` check in
+    /// `resolve` does for a rotation observed while running; otherwise it restarts from genesis,
+    /// same as "nothing persisted".
+    fn initial_scan_state(
+        factory: Address,
+        persisted: Option<&FactoryScan>,
+        resume_from_checkpoint: bool,
+    ) -> ScanState {
         match persisted {
             Some(persisted) if persisted.factory == factory.to_string() => ScanState {
                 factory,
@@ -216,7 +265,12 @@ impl FactoryResolver {
                             .map(|a| (a, *block, *log_index))
                     }),
             },
-            _ => ScanState {
+            Some(persisted) => ScanState {
+                factory,
+                scanned_to: rotation_scan_start(persisted.scanned_to, resume_from_checkpoint),
+                current: None,
+            },
+            None => ScanState {
                 factory,
                 scanned_to: 0,
                 current: None,
@@ -279,15 +333,31 @@ impl OutboxResolver for FactoryResolver {
                 ),
                 None => {}
             }
-            *scan = Self::initial_scan_state(factory, persisted.as_ref());
+            *scan = Self::initial_scan_state(
+                factory,
+                persisted.as_ref(),
+                self.resume_rotation_from_checkpoint,
+            );
         }
 
         if scan.factory != factory {
-            // Factory rotation observed mid-process (not just at startup): scan its history from
-            // scratch, always genesis.
+            // Factory rotation observed mid-process (not just at startup): scan the new factory's
+            // history starting from the old factory's cursor (default) or from genesis — see
+            // `rotation_scan_start` and the doc on `resolve` above.
+            let resume_from =
+                rotation_scan_start(scan.scanned_to, self.resume_rotation_from_checkpoint);
+            info!(
+                chain_key,
+                old_factory = %scan.factory,
+                new_factory = %factory,
+                resume_from,
+                resume_from_checkpoint = self.resume_rotation_from_checkpoint,
+                "🔁 factory rotation detected mid-process; restarting OutboxCreated discovery on \
+                 the new factory"
+            );
             *scan = ScanState {
                 factory,
-                scanned_to: 0,
+                scanned_to: resume_from,
                 current: None,
             };
         }
@@ -482,18 +552,22 @@ mod tests {
         assert_eq!(scan.current, Some((a, 11, 0)));
     }
 
-    /// No persisted checkpoint at all (first boot, or persistence disabled): start from genesis.
+    /// No persisted checkpoint at all (first boot, or persistence disabled): start from genesis
+    /// regardless of the rotation-resume setting — there is no cursor to resume from.
     #[test]
     fn initial_scan_state_with_nothing_persisted_starts_from_genesis() {
         let factory = address!("0000000000000000000000000000000000000001");
-        let scan = FactoryResolver::initial_scan_state(factory, None);
-        assert_eq!(scan.factory, factory);
-        assert_eq!(scan.scanned_to, 0);
-        assert_eq!(scan.current, None);
+        for resume_from_checkpoint in [true, false] {
+            let scan = FactoryResolver::initial_scan_state(factory, None, resume_from_checkpoint);
+            assert_eq!(scan.factory, factory);
+            assert_eq!(scan.scanned_to, 0);
+            assert_eq!(scan.current, None);
+        }
     }
 
     /// A checkpoint persisted against this same factory resumes exactly where it left off,
-    /// winner included — the entire point of persisting it.
+    /// winner included — the entire point of persisting it. Not a rotation, so the resume setting
+    /// is irrelevant here.
     #[test]
     fn initial_scan_state_resumes_when_factory_matches() {
         let factory = address!("0000000000000000000000000000000000000001");
@@ -503,18 +577,19 @@ mod tests {
             scanned_to: 12_345,
             winner: Some((winner.to_string(), 100, 3)),
         };
-        let scan = FactoryResolver::initial_scan_state(factory, Some(&persisted));
+        let scan = FactoryResolver::initial_scan_state(factory, Some(&persisted), true);
         assert_eq!(scan.factory, factory);
         assert_eq!(scan.scanned_to, 12_345);
         assert_eq!(scan.current, Some((winner, 100, 3)));
     }
 
-    /// A checkpoint persisted against a *different* factory (rotation while the relayer was down)
-    /// must not be reused — reusing it would mix one contract's log-scan progress with another's,
-    /// silently corrupting the resolved Outbox. Discard and restart from genesis, same as no
-    /// checkpoint at all.
+    /// A checkpoint persisted against a *different* factory (rotation while the relayer was down),
+    /// with the default resume-from-checkpoint behavior enabled: resume the new factory's scan
+    /// from just before the old one's cursor instead of genesis, so the boundary block itself is
+    /// still scanned on the new factory rather than skipped — the winner does NOT carry over (it
+    /// belongs to the old factory's log stream), but the scanned height does.
     #[test]
-    fn initial_scan_state_discards_checkpoint_for_a_different_factory() {
+    fn initial_scan_state_resumes_from_checkpoint_for_a_different_factory_by_default() {
         let old_factory = address!("0000000000000000000000000000000000000001");
         let new_factory = address!("0000000000000000000000000000000000000002");
         let persisted = FactoryScan {
@@ -526,7 +601,29 @@ mod tests {
                 3,
             )),
         };
-        let scan = FactoryResolver::initial_scan_state(new_factory, Some(&persisted));
+        let scan = FactoryResolver::initial_scan_state(new_factory, Some(&persisted), true);
+        assert_eq!(scan.factory, new_factory);
+        assert_eq!(scan.scanned_to, 12_344);
+        assert_eq!(scan.current, None);
+    }
+
+    /// Same rotation-while-down scenario, but with the resume setting disabled: restart from
+    /// genesis — the conservative behavior, for operators who need the guarantee that a
+    /// permissionless `deployOutbox` predating the old factory's cursor is still found.
+    #[test]
+    fn initial_scan_state_discards_checkpoint_for_a_different_factory_when_resume_disabled() {
+        let old_factory = address!("0000000000000000000000000000000000000001");
+        let new_factory = address!("0000000000000000000000000000000000000002");
+        let persisted = FactoryScan {
+            factory: old_factory.to_string(),
+            scanned_to: 12_345,
+            winner: Some((
+                address!("0000000000000000000000000000000000000003").to_string(),
+                100,
+                3,
+            )),
+        };
+        let scan = FactoryResolver::initial_scan_state(new_factory, Some(&persisted), false);
         assert_eq!(scan.factory, new_factory);
         assert_eq!(scan.scanned_to, 0);
         assert_eq!(scan.current, None);
@@ -543,8 +640,18 @@ mod tests {
             scanned_to: 2_000,
             winner: None,
         };
-        let scan = FactoryResolver::initial_scan_state(factory, Some(&persisted));
+        let scan = FactoryResolver::initial_scan_state(factory, Some(&persisted), true);
         assert_eq!(scan.scanned_to, 2_000);
         assert_eq!(scan.current, None);
+    }
+
+    /// `rotation_scan_start` is the pure decision `initial_scan_state` and the mid-process rotation
+    /// branch in `resolve` both delegate to: resume just before the old cursor when enabled (so the
+    /// boundary block is scanned on the new factory, not skipped), else genesis.
+    #[test]
+    fn rotation_scan_start_resumes_or_restarts_from_genesis() {
+        assert_eq!(rotation_scan_start(691_905, true), 691_904);
+        assert_eq!(rotation_scan_start(691_905, false), 0);
+        assert_eq!(rotation_scan_start(0, true), 0);
     }
 }

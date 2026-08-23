@@ -809,3 +809,45 @@ mod poll_override_tests {
         assert_eq!(super::poll_secs_override("TEST_POLL_UNSET", 6), 6);
     }
 }
+
+/// Environment override for a boolean feature flag. Accepts `1`/`0`, `true`/`false`, `yes`/`no`,
+/// `on`/`off` (case-insensitive). Returns `default` when unset, empty, or unparseable — never
+/// fails startup on a typo, matching [`poll_secs_override`]'s fail-safe shape.
+pub fn bool_env_override(var: &str, default: bool) -> bool {
+    match std::env::var(var) {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => {
+                tracing::warn!(
+                    var,
+                    raw,
+                    default,
+                    "invalid boolean override — using default"
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+#[cfg(test)]
+mod bool_override_tests {
+    #[test]
+    fn parses_overrides_and_falls_back_safely() {
+        std::env::set_var("TEST_BOOL_A", "false");
+        assert!(!super::bool_env_override("TEST_BOOL_A", true));
+        std::env::set_var("TEST_BOOL_B", "1");
+        assert!(super::bool_env_override("TEST_BOOL_B", false));
+        std::env::set_var("TEST_BOOL_C", "On");
+        assert!(super::bool_env_override("TEST_BOOL_C", false));
+        std::env::set_var("TEST_BOOL_D", "nonsense");
+        assert!(
+            super::bool_env_override("TEST_BOOL_D", true),
+            "garbage falls back to default"
+        );
+        assert!(super::bool_env_override("TEST_BOOL_UNSET", true));
+        assert!(!super::bool_env_override("TEST_BOOL_UNSET_2", false));
+    }
+}

@@ -290,6 +290,7 @@ impl Server {
                     resolver,
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
+                    metrics.clone(),
                     health.clone(),
                     broadcast_locks.clone(),
                     cancel.clone(),
