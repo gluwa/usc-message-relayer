@@ -146,21 +146,27 @@ impl ScanState {
     }
 }
 
-/// Where a newly-detected factory's `OutboxCreated` scan should start: `previous_scanned_to` (the
-/// block height already reached under whatever this chain_key's scan was tracking before — a
-/// persisted checkpoint recorded against a different factory, or the in-memory state just before a
-/// mid-process rotation) when `resume_from_checkpoint` is set, genesis otherwise. Pure so the
-/// resume-vs-genesis decision is unit-testable without a live provider.
+/// The [`ScanState::scanned_to`] to assign when starting a fresh scan of a newly-detected factory:
+/// `previous_scanned_to - 1` (the block height already reached under whatever this chain_key's
+/// scan was tracking before — a persisted checkpoint recorded against a different factory, or the
+/// in-memory state just before a mid-process rotation) when `resume_from_checkpoint` is set,
+/// genesis (0) otherwise. Pure so the resume-vs-genesis decision is unit-testable without a live
+/// provider.
 ///
-/// Resuming from that height (rather than genesis) is an intentional trade: nothing before it could
-/// have driven any delivery through the not-yet-current new Outbox, so a real "just rotated to"
-/// `OutboxCreated` is always at or after it. The risk is a permissionless `deployOutbox` on the new
-/// factory that predates that height (a mirror/pre-deployed Outbox, as opposed to one created as
-/// part of the rotation itself) — that event would never be found. `false` restores the original
-/// always-genesis behavior for operators who need that guarantee.
+/// The `- 1` matters: `scanned_to` means "scanned through this block, inclusive" and the next chunk
+/// starts at `scanned_to + 1`, so assigning `previous_scanned_to` verbatim would skip that boundary
+/// block on the new factory's log stream entirely — mirrors `events::outbox_rotation_is_safe`'s
+/// identical `saturating_sub(1)` treatment of `current_since_block` for the same reason.
+///
+/// Resuming from near that height (rather than genesis) is an intentional trade: nothing strictly
+/// before it could have driven any delivery through the not-yet-current new Outbox, so a real
+/// "just rotated to" `OutboxCreated` is always at or after it. The risk is a permissionless
+/// `deployOutbox` on the new factory that predates that height (a mirror/pre-deployed Outbox, as
+/// opposed to one created as part of the rotation itself) — that event would never be found.
+/// `false` restores the original always-genesis behavior for operators who need that guarantee.
 fn rotation_scan_start(previous_scanned_to: u64, resume_from_checkpoint: bool) -> u64 {
     if resume_from_checkpoint {
-        previous_scanned_to
+        previous_scanned_to.saturating_sub(1)
     } else {
         0
     }
@@ -579,8 +585,9 @@ mod tests {
 
     /// A checkpoint persisted against a *different* factory (rotation while the relayer was down),
     /// with the default resume-from-checkpoint behavior enabled: resume the new factory's scan
-    /// from the old one's cursor instead of genesis — the winner does NOT carry over (it belongs to
-    /// the old factory's log stream), but the scanned height does.
+    /// from just before the old one's cursor instead of genesis, so the boundary block itself is
+    /// still scanned on the new factory rather than skipped — the winner does NOT carry over (it
+    /// belongs to the old factory's log stream), but the scanned height does.
     #[test]
     fn initial_scan_state_resumes_from_checkpoint_for_a_different_factory_by_default() {
         let old_factory = address!("0000000000000000000000000000000000000001");
@@ -596,7 +603,7 @@ mod tests {
         };
         let scan = FactoryResolver::initial_scan_state(new_factory, Some(&persisted), true);
         assert_eq!(scan.factory, new_factory);
-        assert_eq!(scan.scanned_to, 12_345);
+        assert_eq!(scan.scanned_to, 12_344);
         assert_eq!(scan.current, None);
     }
 
@@ -639,10 +646,11 @@ mod tests {
     }
 
     /// `rotation_scan_start` is the pure decision `initial_scan_state` and the mid-process rotation
-    /// branch in `resolve` both delegate to: resume the old cursor when enabled, else genesis.
+    /// branch in `resolve` both delegate to: resume just before the old cursor when enabled (so the
+    /// boundary block is scanned on the new factory, not skipped), else genesis.
     #[test]
     fn rotation_scan_start_resumes_or_restarts_from_genesis() {
-        assert_eq!(rotation_scan_start(691_905, true), 691_905);
+        assert_eq!(rotation_scan_start(691_905, true), 691_904);
         assert_eq!(rotation_scan_start(691_905, false), 0);
         assert_eq!(rotation_scan_start(0, true), 0);
     }
