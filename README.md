@@ -179,7 +179,13 @@ together or not at all. `--checkpoint-path ""` disables persistence (watchers st
 `--verbose` switches `info` → `debug` logging. A few poll cadences are env-only (no CLI flag,
 sensible defaults): `RELAYER_ACK_POLL_SECS`, `RELAYER_CLAIM_POLL_SECS`,
 `RELAYER_OUTBOX_RESOLVE_POLL_SECS` (how often a factory-resolved route re-checks for an Outbox
-rotation, default 60 s).
+rotation, default 60 s). `RELAYER_FACTORY_ROTATION_RESUME_FROM_CHECKPOINT` (bool, default `true`)
+controls how a factory-resolved route reacts to a rotation: by default it resumes the newly-current
+factory's `OutboxCreated` scan from the block height the previous factory's scan had already
+reached, instead of rescanning that factory's full history from genesis — cheap because nothing
+before that height could have driven a delivery through the not-yet-current Outbox. Set to `false`
+to force the always-genesis behavior, e.g. if a factory can have a permissionless `deployOutbox`
+predating the rotation itself.
 
 ## HTTP API
 
@@ -193,7 +199,10 @@ Key metrics: `relayer_messages_indexed`, `relayer_votes_received` (by outcome),
 `relayer_votes_per_message`, `relayer_deliver_tx` (by status: submitted / succeeded /
 already-validated / pending / reverted), `relayer_time_to_threshold_seconds`,
 `relayer_time_to_deliver_seconds`, `relayer_pool_messages_pending`, `relayer_attestor_set_size` /
-`relayer_attestor_set_reloads`, `relayer_p2p_peer_count`, plus process gauges.
+`relayer_attestor_set_reloads`, `relayer_p2p_peer_count`, `relayer_ack_submissions` /
+`relayer_claim_submissions` (by outcome: confirmed / terminal / failed — `submitAcknowledgment` and
+`claimDelivery` respectively; watch `failed` for a stuck settlement path, since delivery keeps
+working independently of either), plus process gauges.
 
 ## Build, test, run
 

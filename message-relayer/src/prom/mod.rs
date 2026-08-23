@@ -35,6 +35,15 @@ pub trait MetricsTrait: Send + Sync + Debug {
     /// A hot-reload of the on-chain attestor set was applied for `chain_key` (set and/or threshold
     /// changed). Watch this for unexpected churn.
     fn inc_attestor_set_reload(&self, chain_key: u64);
+    /// One `submitAcknowledgment` settlement attempt resolved, on the source-chain
+    /// `AcknowledgmentValidator` (see `crate::ack`). Separate from delivery so a dead settlement
+    /// path (proof-gen down, signer unfunded) is visible even while messages keep delivering
+    /// normally — see the `relayer_claim_*`/`relayer_ack_*` gap write-up this closes.
+    fn inc_ack_submission(&self, chain_key: u64, outcome: SettlementOutcome);
+    /// One `claimDelivery` relay-fee-claim attempt resolved, on the source-chain `RelayerContract`
+    /// (see `crate::ack`'s `AckAndClaim` mode). Independent of `inc_ack_submission` since
+    /// usc-contracts #23 decoupled the two settlements.
+    fn inc_claim_submission(&self, chain_key: u64, outcome: SettlementOutcome);
 }
 
 /// Shared trait object — used to plumb metrics through services without leaking the concrete type.
@@ -61,6 +70,8 @@ impl MetricsTrait for NoopMetrics {
     fn set_pool_messages_pending(&self, _count: i64) {}
     fn set_attestor_set_size(&self, _chain_key: u64, _size: i64) {}
     fn inc_attestor_set_reload(&self, _chain_key: u64) {}
+    fn inc_ack_submission(&self, _chain_key: u64, _outcome: SettlementOutcome) {}
+    fn inc_claim_submission(&self, _chain_key: u64, _outcome: SettlementOutcome) {}
 }
 
 /// Concrete metrics container.
@@ -77,6 +88,8 @@ pub struct RelayerMetrics {
     pool_messages_pending: Gauge<i64, AtomicI64>,
     attestor_set_size: Family<LabelChain, Gauge<i64, AtomicI64>>,
     attestor_set_reloads: Family<LabelChain, Counter<u64, AtomicU64>>,
+    ack_submissions: Family<LabelSettlement, Counter<u64, AtomicU64>>,
+    claim_submissions: Family<LabelSettlement, Counter<u64, AtomicU64>>,
     cpu_usage_percent: Gauge<f64, AtomicU64>,
     memory_usage_bytes: Gauge<f64, AtomicU64>,
     thread_count: Gauge<i64, AtomicI64>,
@@ -158,6 +171,20 @@ impl RelayerMetrics {
             attestor_set_reloads.clone(),
         );
 
+        let ack_submissions = Family::default();
+        registry.register(
+            "relayer_ack_submissions",
+            "submitAcknowledgment settlement attempts on the AcknowledgmentValidator, by outcome",
+            ack_submissions.clone(),
+        );
+
+        let claim_submissions = Family::default();
+        registry.register(
+            "relayer_claim_submissions",
+            "claimDelivery relay-fee-claim attempts on the RelayerContract, by outcome",
+            claim_submissions.clone(),
+        );
+
         let cpu_usage_percent = Gauge::default();
         registry.register(
             "relayer_cpu_usage_percent",
@@ -215,6 +242,8 @@ impl RelayerMetrics {
             pool_messages_pending,
             attestor_set_size,
             attestor_set_reloads,
+            ack_submissions,
+            claim_submissions,
             cpu_usage_percent,
             memory_usage_bytes,
             thread_count,
@@ -347,6 +376,18 @@ impl MetricsTrait for RelayerMetrics {
             .get_or_create(&LabelChain { chain_key })
             .inc();
     }
+
+    fn inc_ack_submission(&self, chain_key: u64, outcome: SettlementOutcome) {
+        self.ack_submissions
+            .get_or_create(&LabelSettlement { chain_key, outcome })
+            .inc();
+    }
+
+    fn inc_claim_submission(&self, chain_key: u64, outcome: SettlementOutcome) {
+        self.claim_submissions
+            .get_or_create(&LabelSettlement { chain_key, outcome })
+            .inc();
+    }
 }
 
 /// Build the HTTP surface (`/metrics` + `/health` + `/votes/{message_hash}`). `query_tx` reaches the
@@ -455,6 +496,22 @@ pub enum DeliveryStatus {
     Pending,
 }
 
+/// Outcome of one settlement attempt (`submitAcknowledgment` or `claimDelivery`) — shared shape
+/// for [`RelayerMetrics::inc_ack_submission`]/`inc_claim_submission`, matching how `crate::ack`
+/// already classifies a submit (see `SubmitOutcome`/`classify_submit`).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum SettlementOutcome {
+    /// Mined and confirmed on-chain.
+    Confirmed,
+    /// A permanent on-chain condition (already settled, nothing to ack/claim, proof rejected, …) —
+    /// resolved, not an error.
+    Terminal,
+    /// The attempt did not resolve (proof-gen error, RPC failure, no receipt in time, …) and will
+    /// be retried. A sustained rise with no matching `Confirmed`/`Terminal` growth is exactly the
+    /// silent-outage shape the settlement path has no other signal for (see the module docs).
+    Failed,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct LabelChain {
     pub chain_key: u64,
@@ -470,6 +527,12 @@ pub struct LabelVote {
 pub struct LabelDelivery {
     pub chain_key: u64,
     pub status: DeliveryStatus,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct LabelSettlement {
+    pub chain_key: u64,
+    pub outcome: SettlementOutcome,
 }
 
 mod items {
@@ -491,10 +554,14 @@ mod tests {
         m.inc_messages_indexed(2);
         m.inc_vote(2, VoteOutcome::Accept);
         m.inc_deliver_tx(7, DeliveryStatus::Submitted);
+        m.inc_ack_submission(7, SettlementOutcome::Confirmed);
+        m.inc_claim_submission(7, SettlementOutcome::Failed);
         let body = m.encode();
         assert!(body.contains("relayer_messages_indexed"));
         assert!(body.contains("relayer_votes_received"));
         assert!(body.contains("relayer_deliver_tx"));
+        assert!(body.contains("relayer_ack_submissions"));
+        assert!(body.contains("relayer_claim_submissions"));
         assert!(body.contains("chain_keys=\"2,7\""));
     }
 
@@ -509,5 +576,7 @@ mod tests {
         m.observe_time_to_deliver(Duration::from_millis(200));
         m.set_p2p_peer_count(1, 4);
         m.set_pool_messages_pending(3);
+        m.inc_ack_submission(1, SettlementOutcome::Terminal);
+        m.inc_claim_submission(1, SettlementOutcome::Confirmed);
     }
 }
