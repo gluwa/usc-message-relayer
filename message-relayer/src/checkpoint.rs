@@ -53,6 +53,12 @@ struct Entry {
     winner_block: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     winner_log_index: Option<u64>,
+    /// Block this factory's scan *started* from — the floor below which it has never looked. Read
+    /// back by [`FactoryResolver`](crate::events::factory::FactoryResolver)'s genesis fallback to
+    /// tell "scanned everything, this factory has no Outbox" from "resumed above the event and
+    /// would never have seen it". `FactoryScan` keys only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scan_floor: Option<u64>,
 }
 
 /// Deserialization-only shape: a bare JSON number is a checkpoint file written before per-entry
@@ -74,6 +80,10 @@ enum RawEntry {
         winner_block: Option<u64>,
         #[serde(default)]
         winner_log_index: Option<u64>,
+        /// Absent in any file written before the genesis fallback existed; mapped to `block` on
+        /// load rather than to 0 — see [`FactoryScan::scan_floor`] for why that direction.
+        #[serde(default)]
+        scan_floor: Option<u64>,
     },
 }
 
@@ -91,6 +101,7 @@ impl From<RawEntry> for Entry {
                 winner,
                 winner_block,
                 winner_log_index,
+                scan_floor,
             } => Entry {
                 block,
                 outbox,
@@ -98,6 +109,7 @@ impl From<RawEntry> for Entry {
                 winner,
                 winner_block,
                 winner_log_index,
+                scan_floor,
             },
         }
     }
@@ -121,6 +133,13 @@ pub struct FactoryScan {
     /// match can exist over time — see `ScanState::record_if_latest`). `None` means no match has
     /// been found yet.
     pub winner: Option<(String, u64, u64)>,
+    /// Block this factory's scan started from; see [`Entry::scan_floor`].
+    ///
+    /// A record written before this field existed reads back as `scanned_to`, the conservative
+    /// reading ("assume the scan began where it currently sits"), which grants it exactly one
+    /// genesis fallback. Reading it as 0 instead would silently deny the fallback to precisely the
+    /// cursors most likely to need it — one written by a rotation on an older build.
+    pub scan_floor: u64,
 }
 
 /// A JSON-file-backed map of `watcher key -> last fully-processed block` (+ optional Outbox
@@ -242,6 +261,7 @@ impl CheckpointStore {
             factory,
             scanned_to: entry.block,
             winner,
+            scan_floor: entry.scan_floor.unwrap_or(entry.block),
         })
     }
 
@@ -266,6 +286,7 @@ impl CheckpointStore {
                 winner,
                 winner_block,
                 winner_log_index,
+                scan_floor: Some(scan.scan_floor),
             },
         );
         Self::persist(&self.path, &guard)
@@ -475,6 +496,7 @@ mod tests {
             factory: "0xaaa".to_string(),
             scanned_to: 5_000,
             winner: Some(("0xbbb".to_string(), 100, 3)),
+            scan_floor: 0,
         };
         store.set_factory_scan("factory:2", &scan).unwrap();
         assert_eq!(store.get_factory_scan("factory:2"), Some(scan.clone()));
@@ -489,6 +511,25 @@ mod tests {
         assert_eq!(reloaded.get("outbox:2"), Some(1_234));
     }
 
+    /// A checkpoint file written before `scan_floor` existed loads with the floor set to its
+    /// cursor, not to 0 — the conservative reading ("assume the scan began where it now sits"),
+    /// which grants such a record exactly one genesis fallback. Reading it as 0 would instead claim
+    /// the range below was already covered, denying the recovery to precisely the cursors most
+    /// likely to need it: one written by a rotation on a build that predates this field.
+    #[test]
+    fn factory_scan_without_a_persisted_floor_defaults_to_its_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        std::fs::write(&path, r#"{"factory:2":{"block":705600,"factory":"0xaaa"}}"#).unwrap();
+        let store = CheckpointStore::load(&path).unwrap();
+        let scan = store
+            .get_factory_scan("factory:2")
+            .expect("legacy record must still load");
+        assert_eq!(scan.scanned_to, 705_600);
+        assert_eq!(scan.scan_floor, 705_600);
+        assert_eq!(scan.winner, None);
+    }
+
     /// A factory scan with no winner yet (scanned some of the range, found nothing) round-trips
     /// with `winner: None` rather than a partially-populated triple.
     #[test]
@@ -501,6 +542,7 @@ mod tests {
             factory: "0xaaa".to_string(),
             scanned_to: 2_000,
             winner: None,
+            scan_floor: 0,
         };
         store.set_factory_scan("factory:2", &scan).unwrap();
         assert_eq!(
@@ -526,6 +568,7 @@ mod tests {
                     factory: "0xaaa".to_string(),
                     scanned_to: 5_000,
                     winner: Some(("0xbbb".to_string(), 100, 3)),
+                    scan_floor: 0,
                 },
             )
             .unwrap();
@@ -536,6 +579,7 @@ mod tests {
                     factory: "0xddd".to_string(),
                     scanned_to: 10,
                     winner: None,
+                    scan_floor: 0,
                 },
             )
             .unwrap();
@@ -546,6 +590,7 @@ mod tests {
                 factory: "0xddd".to_string(),
                 scanned_to: 10,
                 winner: None,
+                scan_floor: 0,
             })
         );
     }

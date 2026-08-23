@@ -832,6 +832,57 @@ pub fn bool_env_override(var: &str, default: bool) -> bool {
     }
 }
 
+/// Environment override for a `u64` block height. Returns `default` when unset, empty, or
+/// unparseable — never fails startup on a typo, matching [`poll_secs_override`]'s and
+/// [`bool_env_override`]'s fail-safe shape. Unlike the poll override there is no clamp: any block
+/// height is a legitimate value, and the only way to get it wrong is to aim it above the event you
+/// are looking for, which no bound this function could impose would catch.
+pub fn block_env_override(var: &str, default: u64) -> u64 {
+    match std::env::var(var) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(block) => {
+                if block != default {
+                    tracing::info!(var, block, default, "⛏️ scan genesis block overridden");
+                }
+                block
+            }
+            Err(_) => {
+                tracing::warn!(var, raw, default, "invalid block override — using default");
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+#[cfg(test)]
+mod block_override_tests {
+    #[test]
+    fn parses_overrides_and_falls_back_safely() {
+        std::env::set_var("TEST_BLOCK_A", "705530");
+        assert_eq!(super::block_env_override("TEST_BLOCK_A", 0), 705_530);
+        std::env::set_var("TEST_BLOCK_B", "  42  ");
+        assert_eq!(
+            super::block_env_override("TEST_BLOCK_B", 0),
+            42,
+            "surrounding whitespace is trimmed, as in the sibling overrides"
+        );
+        std::env::set_var("TEST_BLOCK_C", "0");
+        assert_eq!(
+            super::block_env_override("TEST_BLOCK_C", 900),
+            0,
+            "zero is a meaningful value here (genesis), not a rejected one"
+        );
+        std::env::set_var("TEST_BLOCK_D", "not-a-block");
+        assert_eq!(
+            super::block_env_override("TEST_BLOCK_D", 700),
+            700,
+            "garbage falls back to default"
+        );
+        assert_eq!(super::block_env_override("TEST_BLOCK_UNSET", 12), 12);
+    }
+}
+
 #[cfg(test)]
 mod bool_override_tests {
     #[test]
