@@ -139,6 +139,11 @@ pub struct FactoryScan {
     /// reading ("assume the scan began where it currently sits"), which grants it exactly one
     /// genesis fallback. Reading it as 0 instead would silently deny the fallback to precisely the
     /// cursors most likely to need it — one written by a rotation on an older build.
+    ///
+    /// The same reading cannot tell that stranded cursor apart from a healthy chain key that
+    /// simply has no Outbox yet — the two are byte-identical in a pre-migration record — so a still
+    /// Outbox-less chain key also gets the one rescan on its first resolve after upgrading. Expected
+    /// and bounded (see the README's factory-resolver section), not a sign either state is wrong.
     pub scan_floor: u64,
 }
 

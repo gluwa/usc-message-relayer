@@ -196,6 +196,13 @@ permanently: the cursor is persisted at the tip against that factory, so it read
 checkpoint and a restart entrenches the failure instead of clearing it. The rewind fires at most
 once per factory, so a factory that genuinely has no Outbox costs one extra scan and then settles.
 
+Expect that one-time rewind on the first resolve after upgrading to a build with this fallback,
+too, for any chain key whose checkpoint predates it and still has no Outbox: a bare pre-upgrade
+record carries no floor of its own, so it loads with one assumed at its cursor — the same reading
+that heals a rotation stranded on an older build. There is no way to tell that healthy "no Outbox
+yet" cursor apart from a stranded one after the fact, so both get the one rescan; a single `🪃` per
+still-Outbox-less chain key on upgrade day is expected, not an incident.
+
 `RELAYER_FACTORY_SCAN_GENESIS_BLOCK` (u64, default `0`) is the block every *from-scratch*
 `OutboxCreated` scan starts at — a first boot with no checkpoint, a rotation with the flag above
 disabled, and the rewind. Raising it to a height known to precede the chain key's factory

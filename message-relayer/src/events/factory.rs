@@ -149,9 +149,38 @@ struct ScanState {
     /// change, so each factory gets exactly one — bounding the recovery to a single extra full scan
     /// rather than one per 60 s re-resolve.
     genesis_fallback_done: bool,
+    /// The `confirmed` value the genesis fallback may not fire below, or `None` if a rotation was
+    /// just (re)detected and the next `resolve()` call still needs to stamp it in with that call's
+    /// `tip`. A factory just rotated to can have its own `OutboxCreated` sitting inside the last
+    /// `block_confirmation_depth` blocks — real, but outside `confirmed` — so a scan that has merely
+    /// caught up to `confirmed` and found nothing is not yet conclusive; it only becomes conclusive
+    /// once `confirmed` reaches the tip observed at rotation-detection time, which guarantees that
+    /// window has fully closed. `Some(0)` for a from-scratch scan or an in-place resume: neither is
+    /// reacting to a freshly observed rotation, so there is no such window to wait out.
+    fallback_eligible_from: Option<u64>,
 }
 
 impl ScanState {
+    /// Fresh scan state for a rotation onto `factory`, starting at `floor` —
+    /// [`rotation_scan_start`]'s result. Shared by both places a rotation is (re)detected: at
+    /// startup, when a persisted checkpoint is recorded against a different factory
+    /// (`FactoryResolver::initial_scan_state`), and mid-process, when the previously-resolved
+    /// factory itself changes (`FactoryResolver::resolve`). One constructor means both legs get the
+    /// identical reset — `scan_floor` seeded from `floor`, and a fresh `genesis_fallback_done` /
+    /// `fallback_eligible_from` — instead of risking one silently drifting from the other, and the
+    /// tests written against this constructor cover the mid-process leg too, not just the startup
+    /// one that happens to be easy to unit-test directly.
+    fn restarted_at(factory: Address, floor: u64) -> Self {
+        ScanState {
+            factory,
+            scanned_to: floor,
+            current: None,
+            scan_floor: floor,
+            genesis_fallback_done: false,
+            fallback_eligible_from: None,
+        }
+    }
+
     /// Record an `OutboxCreated` match at `(block, log_index)`, keeping it only if it is more
     /// recent than whatever is already recorded — order-independent, so it does not matter what
     /// order a chunk's logs (or successive chunks) arrive in.
@@ -213,21 +242,32 @@ fn rotation_scan_start(
 /// the tip against that very factory, so it reads back as a valid checkpoint and a restart makes
 /// the state stickier rather than clearing it.
 ///
-/// Three conditions, all necessary:
+/// Four conditions, all necessary:
 /// - `found_something` is false — a match makes the scan conclusive whatever floor it began at;
 /// - `scan_floor > genesis_block` — the scan began above the floor, so there is unlooked-at range
 ///   below it. A scan that already began at the floor has covered everything, and its "no Outbox"
 ///   verdict is the truth;
 /// - `already_used` is false — one rewind per factory, so a factory that genuinely has no
 ///   `OutboxCreated` settles back into the cheap tip-following steady state instead of rescanning
-///   the whole chain on every re-resolve.
+///   the whole chain on every re-resolve;
+/// - `confirmed >= fallback_eligible_from` — a factory just rotated to can have its own
+///   `OutboxCreated` sitting inside the last `block_confirmation_depth` blocks, real but not yet
+///   inside `confirmed`. Firing before that window closes would burn the one-shot rewind on a
+///   routine, healthy rotation whose event simply has not reached confirmation depth yet — not on
+///   one that is genuinely absent. See [`ScanState::fallback_eligible_from`].
 fn genesis_fallback_target(
     found_something: bool,
     scan_floor: u64,
     genesis_block: u64,
     already_used: bool,
+    confirmed: u64,
+    fallback_eligible_from: u64,
 ) -> Option<u64> {
-    (!found_something && !already_used && scan_floor > genesis_block).then_some(genesis_block)
+    (!found_something
+        && !already_used
+        && scan_floor > genesis_block
+        && confirmed >= fallback_eligible_from)
+        .then_some(genesis_block)
 }
 
 /// Production resolver: finds the Outbox for `route.chain_key` entirely from on-chain state, no
@@ -331,20 +371,18 @@ impl FactoryResolver {
                 // moment the "just restart it" reflex would otherwise entrench it.
                 scan_floor: persisted.scan_floor,
                 genesis_fallback_done: false,
+                // Not a rotation — this process is just continuing (or resuming, post-restart, an
+                // already-stranded) scan against the same factory. No freshly observed rotation
+                // means no confirmation-depth window to wait out.
+                fallback_eligible_from: Some(0),
             },
             Some(persisted) => {
-                let scanned_to = rotation_scan_start(
+                let floor = rotation_scan_start(
                     persisted.scanned_to,
                     resume_from_checkpoint,
                     genesis_block,
                 );
-                ScanState {
-                    factory,
-                    scanned_to,
-                    current: None,
-                    scan_floor: scanned_to,
-                    genesis_fallback_done: false,
-                }
+                ScanState::restarted_at(factory, floor)
             }
             None => ScanState {
                 factory,
@@ -355,6 +393,10 @@ impl FactoryResolver {
                 current: None,
                 scan_floor: genesis_block,
                 genesis_fallback_done: false,
+                // Not a rotation, and scan_floor == genesis_block here anyway, so the fallback's own
+                // `scan_floor > genesis_block` condition already excludes this scan — set for
+                // consistency with the other non-rotation arm, not because it changes behavior.
+                fallback_eligible_from: Some(0),
             },
         }
     }
@@ -444,14 +486,8 @@ impl OutboxResolver for FactoryResolver {
                 "🔁 factory rotation detected mid-process; restarting OutboxCreated discovery on \
                  the new factory"
             );
-            *scan = ScanState {
-                factory,
-                scanned_to: resume_from,
-                current: None,
-                scan_floor: resume_from,
-                // A fresh factory earns a fresh fallback: this is the transition that can overshoot.
-                genesis_fallback_done: false,
-            };
+            // A fresh factory earns a fresh fallback: this is the transition that can overshoot.
+            *scan = ScanState::restarted_at(factory, resume_from);
         }
 
         let tip = tokio::time::timeout(BLOCK_NUMBER_TIMEOUT, provider.get_block_number())
@@ -464,6 +500,13 @@ impl OutboxResolver for FactoryResolver {
             })?
             .with_context(|| format!("chain_key {chain_key}: failed to read chain head"))?;
         let confirmed = tip.saturating_sub(route.block_confirmation_depth);
+
+        // Stamp the fallback's grace threshold with this call's tip the first time it's needed
+        // (i.e. exactly the call that just (re)detected a rotation, above or on a prior call) —
+        // see `ScanState::fallback_eligible_from`. A no-op once it's already `Some`.
+        if scan.fallback_eligible_from.is_none() {
+            scan.fallback_eligible_from = Some(tip);
+        }
 
         let mut chunks = 0;
         while scan.scanned_to < confirmed && chunks < MAX_SCAN_CHUNKS_PER_CALL {
@@ -523,6 +566,8 @@ impl OutboxResolver for FactoryResolver {
                 scan.scan_floor,
                 self.genesis_block,
                 scan.genesis_fallback_done,
+                confirmed,
+                scan.fallback_eligible_from.unwrap_or(0),
             ) {
                 warn!(
                     chain_key,
@@ -575,11 +620,27 @@ impl OutboxResolver for FactoryResolver {
                 address,
                 current_since_block: Some(block),
             }),
-            None => anyhow::bail!(
-                "chain_key {chain_key}: no OutboxCreated event found for factory {factory} \
-                 (scanned {} to {confirmed}); this chain_key has no deployed Outbox yet",
-                scan.scan_floor
-            ),
+            None => {
+                // A nonzero floor is indistinguishable at runtime from a genuinely Outbox-less
+                // chain_key — the fallback that would otherwise catch it is disabled by the very
+                // same misconfiguration — so name it as a candidate cause whenever it could be one,
+                // the one breadcrumb on-call has no other way to find.
+                let genesis_hint = if self.genesis_block > 0 {
+                    format!(
+                        "; if this chain_key does have a deployed Outbox, verify its OutboxCreated \
+                         predates RELAYER_FACTORY_SCAN_GENESIS_BLOCK ({}) — a floor set above it \
+                         makes the event permanently unscannable, including by the genesis fallback",
+                        self.genesis_block
+                    )
+                } else {
+                    String::new()
+                };
+                anyhow::bail!(
+                    "chain_key {chain_key}: no OutboxCreated event found for factory {factory} \
+                     (scanned {} to {confirmed}); this chain_key has no deployed Outbox yet{genesis_hint}",
+                    scan.scan_floor
+                )
+            }
         }
     }
 }
@@ -787,27 +848,33 @@ mod tests {
     /// The T4-shaped failure this fallback exists for, in scan-state terms: a rotation onto a
     /// **pre-existing** factory resumes at the old factory's checkpoint, scans to the confirmed
     /// tip, and matches nothing — because the new factory's `OutboxCreated` was emitted far below.
-    /// The scan is complete but not conclusive, so it rewinds to the configured floor.
+    /// The scan is complete but not conclusive, so it rewinds to the configured floor. The grace
+    /// window has already closed (`confirmed` has reached `fallback_eligible_from`) in every case
+    /// below unless a test is specifically about that window — see
+    /// `genesis_fallback_waits_out_the_confirmation_window_after_a_rotation` for that.
     #[test]
     fn genesis_fallback_rewinds_a_resumed_scan_that_found_nothing() {
-        assert_eq!(genesis_fallback_target(false, 705_530, 0, false), Some(0));
+        assert_eq!(
+            genesis_fallback_target(false, 705_530, 0, false, 705_530, 0),
+            Some(0)
+        );
     }
 
     /// The three ways it correctly declines, each for a different reason.
     #[test]
     fn genesis_fallback_declines_when_the_scan_is_already_conclusive() {
         assert_eq!(
-            genesis_fallback_target(true, 705_530, 0, false),
+            genesis_fallback_target(true, 705_530, 0, false, 705_530, 0),
             None,
             "a match makes the scan conclusive whatever floor it began at"
         );
         assert_eq!(
-            genesis_fallback_target(false, 0, 0, false),
+            genesis_fallback_target(false, 0, 0, false, 0, 0),
             None,
             "a scan that began at the floor has covered everything; no Outbox is the truth"
         );
         assert_eq!(
-            genesis_fallback_target(false, 705_530, 0, true),
+            genesis_fallback_target(false, 705_530, 0, true, 705_530, 0),
             None,
             "one rewind per factory — otherwise an Outbox-less factory rescans every re-resolve"
         );
@@ -817,17 +884,36 @@ mod tests {
     #[test]
     fn genesis_fallback_targets_the_configured_genesis_block() {
         assert_eq!(
-            genesis_fallback_target(false, 705_530, 300_000, false),
+            genesis_fallback_target(false, 705_530, 300_000, false, 705_530, 0),
             Some(300_000)
         );
         assert_eq!(
-            genesis_fallback_target(false, 300_000, 300_000, false),
+            genesis_fallback_target(false, 300_000, 300_000, false, 300_000, 0),
             None
         );
         assert_eq!(
-            genesis_fallback_target(false, 250_000, 300_000, false),
+            genesis_fallback_target(false, 250_000, 300_000, false, 300_000, 0),
             None,
             "already below the floor: nothing above it went unscanned"
+        );
+    }
+
+    /// The fourth condition: a factory just rotated to can have its own `OutboxCreated` sitting
+    /// inside the unconfirmed tail, real but outside `confirmed` — an empty scan that has only
+    /// caught up to `confirmed` is not yet conclusive until `confirmed` reaches the tip observed at
+    /// rotation-detection time (`fallback_eligible_from`). Declines while that window is still
+    /// open; fires the instant it closes.
+    #[test]
+    fn genesis_fallback_waits_out_the_confirmation_window_after_a_rotation() {
+        assert_eq!(
+            genesis_fallback_target(false, 705_530, 0, false, 705_540, 705_550),
+            None,
+            "confirmed hasn't yet reached the tip observed when the rotation was detected"
+        );
+        assert_eq!(
+            genesis_fallback_target(false, 705_530, 0, false, 705_550, 705_550),
+            Some(0),
+            "confirmed has now caught up to that tip; the window has closed"
         );
     }
 
@@ -862,7 +948,19 @@ mod tests {
         );
         assert_eq!(scan.scan_floor, 300_000);
         assert_eq!(
-            genesis_fallback_target(false, scan.scan_floor, 300_000, scan.genesis_fallback_done),
+            scan.fallback_eligible_from,
+            Some(0),
+            "not a rotation; no window to wait out"
+        );
+        assert_eq!(
+            genesis_fallback_target(
+                false,
+                scan.scan_floor,
+                300_000,
+                scan.genesis_fallback_done,
+                300_000,
+                scan.fallback_eligible_from.unwrap_or(0),
+            ),
             None
         );
     }
@@ -885,7 +983,19 @@ mod tests {
         assert_eq!(scan.scan_floor, 705_530);
         assert!(!scan.genesis_fallback_done, "a reload re-arms the fallback");
         assert_eq!(
-            genesis_fallback_target(false, scan.scan_floor, 0, scan.genesis_fallback_done),
+            scan.fallback_eligible_from,
+            Some(0),
+            "not a rotation — just this process continuing an already-stranded scan"
+        );
+        assert_eq!(
+            genesis_fallback_target(
+                false,
+                scan.scan_floor,
+                0,
+                scan.genesis_fallback_done,
+                705_600,
+                scan.fallback_eligible_from.unwrap_or(0),
+            ),
             Some(0)
         );
     }
@@ -905,7 +1015,13 @@ mod tests {
         let resumed = FactoryResolver::initial_scan_state(new_factory, Some(&persisted), true, 0);
         assert_eq!(resumed.scan_floor, 12_344);
         assert_eq!(
-            genesis_fallback_target(false, resumed.scan_floor, 0, false),
+            resumed.fallback_eligible_from, None,
+            "a rotation always needs the next resolve() call to stamp the grace threshold in"
+        );
+        // Simulates that stamp having already happened and the window having closed — this test is
+        // about the floor condition, not the grace one (see the `_waits_out_` test for that).
+        assert_eq!(
+            genesis_fallback_target(false, resumed.scan_floor, 0, false, 12_344, 0),
             Some(0),
             "resumed above genesis: an empty result must rewind"
         );
@@ -914,9 +1030,28 @@ mod tests {
             FactoryResolver::initial_scan_state(new_factory, Some(&persisted), false, 0);
         assert_eq!(from_scratch.scan_floor, 0);
         assert_eq!(
-            genesis_fallback_target(false, from_scratch.scan_floor, 0, false),
+            genesis_fallback_target(false, from_scratch.scan_floor, 0, false, 0, 0),
             None,
             "already scanning from genesis: an empty result is final"
+        );
+    }
+
+    /// Both rotation-detection sites — startup, when a persisted checkpoint is recorded against a
+    /// different factory, and mid-process, when the resolved factory itself changes — reset through
+    /// this one constructor, so a future edit to the reset invariant is guaranteed to cover both
+    /// legs rather than only whichever call site happens to have a direct test.
+    #[test]
+    fn restarted_at_resets_for_a_fresh_rotation() {
+        let factory = address!("0000000000000000000000000000000000000003");
+        let scan = ScanState::restarted_at(factory, 12_344);
+        assert_eq!(scan.factory, factory);
+        assert_eq!(scan.scanned_to, 12_344);
+        assert_eq!(scan.scan_floor, 12_344);
+        assert_eq!(scan.current, None);
+        assert!(!scan.genesis_fallback_done);
+        assert_eq!(
+            scan.fallback_eligible_from, None,
+            "needs the next resolve() call's tip to set the grace threshold"
         );
     }
 }
