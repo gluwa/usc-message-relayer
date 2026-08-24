@@ -59,6 +59,10 @@ struct Entry {
     /// would never have seen it". `FactoryScan` keys only.
     #[serde(skip_serializing_if = "Option::is_none")]
     scan_floor: Option<u64>,
+    /// The confirmed-tip threshold the genesis fallback may not fire below — see
+    /// [`FactoryScan::fallback_eligible_from`]. `FactoryScan` keys only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_eligible_from: Option<u64>,
 }
 
 /// Deserialization-only shape: a bare JSON number is a checkpoint file written before per-entry
@@ -84,6 +88,10 @@ enum RawEntry {
         /// load rather than to 0 — see [`FactoryScan::scan_floor`] for why that direction.
         #[serde(default)]
         scan_floor: Option<u64>,
+        /// Absent in any file written before the confirmation-depth grace existed; mapped to 0 on
+        /// load — see [`FactoryScan::fallback_eligible_from`] for why that direction.
+        #[serde(default)]
+        fallback_eligible_from: Option<u64>,
     },
 }
 
@@ -102,6 +110,7 @@ impl From<RawEntry> for Entry {
                 winner_block,
                 winner_log_index,
                 scan_floor,
+                fallback_eligible_from,
             } => Entry {
                 block,
                 outbox,
@@ -110,6 +119,7 @@ impl From<RawEntry> for Entry {
                 winner_block,
                 winner_log_index,
                 scan_floor,
+                fallback_eligible_from,
             },
         }
     }
@@ -145,6 +155,18 @@ pub struct FactoryScan {
     /// Outbox-less chain key also gets the one rescan on its first resolve after upgrading. Expected
     /// and bounded (see the README's factory-resolver section), not a sign either state is wrong.
     pub scan_floor: u64,
+    /// The `confirmed` value the genesis fallback may not fire below — the tip observed when this
+    /// scan's floor was (re)established by a rotation, so a factory just rotated to gets the full
+    /// `block_confirmation_depth` window for its own `OutboxCreated` to become confirmed before an
+    /// empty scan is treated as conclusive. Persisted (unlike the in-process-only sentinel that
+    /// means "not yet stamped") so a restart mid-window carries the same threshold forward instead
+    /// of silently reopening as "already eligible" and firing the one-shot fallback on a routine,
+    /// still-settling rotation — exactly the race this mechanism exists to close.
+    ///
+    /// A record written before this field existed reads back as 0 (immediately eligible): it
+    /// predates the grace window entirely, so there is no threshold to recover, and reading
+    /// anything higher would risk blocking the fallback indefinitely on an old, unrelated cursor.
+    pub fallback_eligible_from: u64,
 }
 
 /// A JSON-file-backed map of `watcher key -> last fully-processed block` (+ optional Outbox
@@ -267,6 +289,7 @@ impl CheckpointStore {
             scanned_to: entry.block,
             winner,
             scan_floor: entry.scan_floor.unwrap_or(entry.block),
+            fallback_eligible_from: entry.fallback_eligible_from.unwrap_or(0),
         })
     }
 
@@ -292,6 +315,7 @@ impl CheckpointStore {
                 winner_block,
                 winner_log_index,
                 scan_floor: Some(scan.scan_floor),
+                fallback_eligible_from: Some(scan.fallback_eligible_from),
             },
         );
         Self::persist(&self.path, &guard)
@@ -502,6 +526,7 @@ mod tests {
             scanned_to: 5_000,
             winner: Some(("0xbbb".to_string(), 100, 3)),
             scan_floor: 0,
+            fallback_eligible_from: 4_800,
         };
         store.set_factory_scan("factory:2", &scan).unwrap();
         assert_eq!(store.get_factory_scan("factory:2"), Some(scan.clone()));
@@ -535,6 +560,26 @@ mod tests {
         assert_eq!(scan.winner, None);
     }
 
+    /// A checkpoint file written before `fallback_eligible_from` existed loads with it defaulted to
+    /// 0 (immediately eligible), not to the cursor — the opposite direction from `scan_floor`'s
+    /// migration, because there is no rotation-observation tip to recover here, and defaulting
+    /// higher would risk blocking the fallback indefinitely on an unrelated old cursor.
+    #[test]
+    fn factory_scan_without_a_persisted_grace_threshold_defaults_to_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        std::fs::write(
+            &path,
+            r#"{"factory:2":{"block":705600,"factory":"0xaaa","scan_floor":705530}}"#,
+        )
+        .unwrap();
+        let store = CheckpointStore::load(&path).unwrap();
+        let scan = store
+            .get_factory_scan("factory:2")
+            .expect("legacy record must still load");
+        assert_eq!(scan.fallback_eligible_from, 0);
+    }
+
     /// A factory scan with no winner yet (scanned some of the range, found nothing) round-trips
     /// with `winner: None` rather than a partially-populated triple.
     #[test]
@@ -548,6 +593,7 @@ mod tests {
             scanned_to: 2_000,
             winner: None,
             scan_floor: 0,
+            fallback_eligible_from: 0,
         };
         store.set_factory_scan("factory:2", &scan).unwrap();
         assert_eq!(
@@ -574,6 +620,7 @@ mod tests {
                     scanned_to: 5_000,
                     winner: Some(("0xbbb".to_string(), 100, 3)),
                     scan_floor: 0,
+                    fallback_eligible_from: 0,
                 },
             )
             .unwrap();
@@ -585,6 +632,7 @@ mod tests {
                     scanned_to: 10,
                     winner: None,
                     scan_floor: 0,
+                    fallback_eligible_from: 0,
                 },
             )
             .unwrap();
@@ -596,6 +644,7 @@ mod tests {
                 scanned_to: 10,
                 winner: None,
                 scan_floor: 0,
+                fallback_eligible_from: 0,
             })
         );
     }
