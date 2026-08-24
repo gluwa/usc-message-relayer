@@ -176,7 +176,9 @@ impl ScanState {
 /// The `- 1` matters: `scanned_to` means "scanned through this block, inclusive" and the next chunk
 /// starts at `scanned_to + 1`, so assigning `previous_scanned_to` verbatim would skip that boundary
 /// block on the new factory's log stream entirely — mirrors `events::outbox_rotation_is_safe`'s
-/// identical `saturating_sub(1)` treatment of `current_since_block` for the same reason.
+/// identical `saturating_sub(1)` treatment of `current_since_block` for the same reason. The
+/// `false` arm needs the identical treatment for the identical reason: assigning `genesis_block`
+/// verbatim would skip the floor itself, the one block a from-scratch scan most needs to cover.
 ///
 /// Resuming from near that height (rather than genesis) is an intentional trade: nothing strictly
 /// before it could have driven any delivery through the not-yet-current new Outbox, so a real
@@ -197,7 +199,7 @@ fn rotation_scan_start(
         // previous scan had already proven worth covering.
         previous_scanned_to.saturating_sub(1)
     } else {
-        genesis_block
+        genesis_block.saturating_sub(1)
     }
 }
 
@@ -346,7 +348,10 @@ impl FactoryResolver {
             }
             None => ScanState {
                 factory,
-                scanned_to: genesis_block,
+                // `- 1`, not `genesis_block` verbatim: see `rotation_scan_start`'s doc above for why
+                // assigning the floor straight to `scanned_to` would skip it. `scan_floor` takes the
+                // unadjusted value — it's "where the scan started", not a cursor.
+                scanned_to: genesis_block.saturating_sub(1),
                 current: None,
                 scan_floor: genesis_block,
                 genesis_fallback_done: false,
@@ -530,7 +535,9 @@ impl OutboxResolver for FactoryResolver {
                      once from the configured genesis block before reporting no Outbox"
                 );
                 scan.genesis_fallback_done = true;
-                scan.scanned_to = rewind_to;
+                // `- 1`, not `rewind_to` verbatim — same reasoning as `rotation_scan_start`'s doc:
+                // assigning the floor straight to `scanned_to` would skip it on the rescan.
+                scan.scanned_to = rewind_to.saturating_sub(1);
                 scan.scan_floor = rewind_to;
             }
         }
@@ -827,9 +834,11 @@ mod tests {
     /// `rotation_scan_start`'s two arms treat the floor differently on purpose: the from-scratch
     /// arm takes it, the resume arm keeps the checkpoint verbatim — even below the floor, since a
     /// checkpoint is a position and the floor only answers "where does a scan without one start?".
+    /// Both arms return `floor - 1`, though: whichever floor is picked, it is still a `scanned_to`
+    /// value, and the floor itself must not be skipped by the next chunk's `scanned_to + 1`.
     #[test]
     fn rotation_scan_start_floors_only_the_from_scratch_arm() {
-        assert_eq!(rotation_scan_start(691_905, false, 300_000), 300_000);
+        assert_eq!(rotation_scan_start(691_905, false, 300_000), 299_999);
         assert_eq!(
             rotation_scan_start(250_000, true, 300_000),
             249_999,
@@ -839,12 +848,18 @@ mod tests {
 
     /// With nothing persisted, a fresh scan starts at the configured floor rather than block 0 —
     /// and its `scan_floor` matches, so a first scan that finds nothing is immediately conclusive
-    /// instead of triggering a pointless rewind to the same place.
+    /// instead of triggering a pointless rewind to the same place. `scanned_to` sits one below the
+    /// floor (not at it) so the floor itself is the first block the next chunk actually scans.
     #[test]
     fn initial_scan_state_with_nothing_persisted_starts_at_the_configured_genesis() {
         let factory = address!("0000000000000000000000000000000000000001");
         let scan = FactoryResolver::initial_scan_state(factory, None, true, 300_000);
-        assert_eq!(scan.scanned_to, 300_000);
+        assert_eq!(scan.scanned_to, 299_999);
+        assert_eq!(
+            scan.scanned_to + 1,
+            300_000,
+            "the floor itself must be scanned, not skipped"
+        );
         assert_eq!(scan.scan_floor, 300_000);
         assert_eq!(
             genesis_fallback_target(false, scan.scan_floor, 300_000, scan.genesis_fallback_done),
