@@ -74,6 +74,21 @@ impl Artifact {
         Self { path, abi }
     }
 
+    /// First of `candidates` that exists, for a surface the contracts repo is mid-rename on.
+    /// Panics naming all of them if none is present, so a genuine disappearance still fails.
+    fn load_first(contracts: &Path, candidates: &[&str]) -> Self {
+        for rel in candidates {
+            if contracts.join(rel).is_file() {
+                return Self::load(contracts, rel);
+            }
+        }
+        panic!(
+            "none of {candidates:?} exist under {} — the contract was renamed again or the \
+             artifacts are incomplete; add the new name to the candidate list",
+            contracts.display()
+        )
+    }
+
     fn signatures(&self, kind: &str) -> Vec<String> {
         self.abi
             .iter()
@@ -295,11 +310,16 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         "OutboxNotSet()",
         &IAcknowledgmentValidator::OutboxNotSet::SELECTOR,
     );
-    // ProofInvalid is declared by the USCProofVerifier the validator delegates to; the revert
-    // bubbles through, so its selector is pinned against THAT artifact.
-    let verifier = Artifact::load(
+    // ProofInvalid is declared by the proof verifier the validator delegates to; the revert
+    // bubbles through, so its selector is pinned against THAT artifact. Accept either name: the
+    // contracts repo is mid-rename from USC to ASC and the two open PRs disagree about it, so
+    // taking whichever exists keeps this gate independent of the order they land in.
+    let verifier = Artifact::load_first(
         &contracts,
-        "common/USCProofVerifier.sol/USCProofVerifier.json",
+        &[
+            "common/ASCProofVerifier.sol/ASCProofVerifier.json",
+            "common/USCProofVerifier.sol/USCProofVerifier.json",
+        ],
     );
     verifier.assert_mirrored(
         "error",
@@ -308,36 +328,49 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
     );
 
     // --- RelayerContract (source chain) ---
-    let relayer = Artifact::load(&contracts, "RelayerContract.sol/RelayerContract.json");
-    relayer.assert_mirrored(
-        "function",
-        "getMessageInfo(bytes32)",
-        &IRelayerContract::getMessageInfoCall::SELECTOR,
-    );
-    relayer.assert_output_tuple(
-        "getMessageInfo",
-        "(address,uint32,uint256,uint256,uint256,uint256,uint256,bool,bool)",
-    );
-    relayer.assert_mirrored(
-        "function",
-        "claimDelivery(bytes32,bytes32,uint64,(uint8,bytes32,bytes),(bytes32,bytes32[]))",
-        &IRelayerContract::claimDeliveryCall::SELECTOR,
-    );
-    relayer.assert_mirrored(
-        "error",
-        "UnknownOperation(bytes32)",
-        &IRelayerContract::UnknownOperation::SELECTOR,
-    );
-    relayer.assert_mirrored(
-        "error",
-        "RelayAlreadySettled(bytes32)",
-        &IRelayerContract::RelayAlreadySettled::SELECTOR,
-    );
-    relayer.assert_mirrored(
-        "error",
-        "NativeTransferFailed(address,uint256)",
-        &IRelayerContract::NativeTransferFailed::SELECTOR,
-    );
+    //
+    // Checked against BOTH deployable fee ledgers. They are genuinely different contracts —
+    // `collectRelayerFee` has a different arity, Lite gates on `authorizedQuoters`, and Lite
+    // lacks nine of the errors our revert classifier matches on — but the surface this crate
+    // actually binds (`getMessageInfo`, `claimDelivery`, and the three settlement errors) is
+    // shared and must stay identical, because a route can be pointed at either. Asserting
+    // against only one leaves the other free to drift: the quoter service already targets Lite
+    // (its ADR 0001), so the uncovered one is the one production is heading for.
+    for artifact in [
+        "RelayerContract.sol/RelayerContract.json",
+        "RelayerContractLite.sol/RelayerContractLite.json",
+    ] {
+        let relayer = Artifact::load(&contracts, artifact);
+        relayer.assert_mirrored(
+            "function",
+            "getMessageInfo(bytes32)",
+            &IRelayerContract::getMessageInfoCall::SELECTOR,
+        );
+        relayer.assert_output_tuple(
+            "getMessageInfo",
+            "(address,uint32,uint256,uint256,uint256,uint256,uint256,bool,bool)",
+        );
+        relayer.assert_mirrored(
+            "function",
+            "claimDelivery(bytes32,bytes32,uint64,(uint8,bytes32,bytes),(bytes32,bytes32[]))",
+            &IRelayerContract::claimDeliveryCall::SELECTOR,
+        );
+        relayer.assert_mirrored(
+            "error",
+            "UnknownOperation(bytes32)",
+            &IRelayerContract::UnknownOperation::SELECTOR,
+        );
+        relayer.assert_mirrored(
+            "error",
+            "RelayAlreadySettled(bytes32)",
+            &IRelayerContract::RelayAlreadySettled::SELECTOR,
+        );
+        relayer.assert_mirrored(
+            "error",
+            "NativeTransferFailed(address,uint256)",
+            &IRelayerContract::NativeTransferFailed::SELECTOR,
+        );
+    }
 
     // --- OutboxFactory (source chain) ---
     let factory = Artifact::load(&contracts, "deployer/OutboxFactory.sol/OutboxFactory.json");
