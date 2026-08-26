@@ -1,6 +1,6 @@
 //! Solidity ↔ Rust ABI-surface drift detector (relayer side).
 //!
-//! `src/abi.rs` is a hand-maintained `sol!` mirror of the usc-contracts surface the relayer calls.
+//! `src/abi.rs` is a hand-maintained `sol!` mirror of the asc-contracts surface the relayer calls.
 //! The golden vectors police creditcoin3↔relayer agreement, but nothing enforced Solidity↔Rust
 //! agreement — and that drift is quiet: a renamed *error* doesn't break anything visibly, it just
 //! turns the revert classifier's selector match into dead code (found here: the Outbox renamed
@@ -14,9 +14,9 @@
 //! outputs aren't part of the selector), also pin the artifact's output tuple against the Rust
 //! struct layout, since a reordered field decodes silently into garbage.
 //!
-//! Runs wherever `USC_CONTRACTS_DIR` points at a compiled usc-contracts checkout; without the env
+//! Runs wherever `ASC_CONTRACTS_DIR` points at a compiled asc-contracts checkout; without the env
 //! var it is a no-op so plain `cargo test` stays green. creditcoin3's write-ability-e2e workflow
-//! (which checks out both this repo and usc-contracts) is the CI home for this check.
+//! (which checks out both this repo and asc-contracts) is the CI home for this check.
 
 use alloy::primitives::keccak256;
 use alloy::sol_types::{SolCall, SolError, SolEvent};
@@ -126,17 +126,32 @@ impl Artifact {
 
 #[test]
 fn mirrored_abi_surface_matches_compiled_contracts() {
-    let Ok(dir) = std::env::var("USC_CONTRACTS_DIR") else {
+    // `ASC_CONTRACTS_DIR` since the repository was renamed usc-contracts -> asc-contracts;
+    // `USC_CONTRACTS_DIR` stays accepted so existing local setups keep working.
+    let dir = std::env::var("ASC_CONTRACTS_DIR")
+        .or_else(|_| std::env::var("USC_CONTRACTS_DIR"))
+        .ok();
+    // Set by CI alongside the artifacts dir. An unset dir skipping is what a plain `cargo test`
+    // on a dev machine wants, but it also meant this gate never ran in CI at all — nothing here
+    // pointed it at any contracts. Any environment that means to enforce the gate sets this and
+    // gets a failure instead of a silent pass.
+    let strict = std::env::var("ABI_GATE_STRICT").is_ok();
+    let Some(dir) = dir else {
+        assert!(
+            !strict,
+            "ABI_GATE_STRICT is set but neither ASC_CONTRACTS_DIR nor USC_CONTRACTS_DIR is — the \
+             drift gate would have silently passed without checking anything"
+        );
         eprintln!(
-            "USC_CONTRACTS_DIR not set — skipping ABI-surface check (point it at a compiled \
-             usc-contracts checkout to enable)"
+            "ASC_CONTRACTS_DIR not set — skipping ABI-surface check (point it at a compiled \
+             asc-contracts checkout to enable)"
         );
         return;
     };
     let contracts = Path::new(&dir).join("artifacts/contracts/write-ability");
     assert!(
         contracts.is_dir(),
-        "USC_CONTRACTS_DIR is set but {} does not exist — run `npx hardhat compile` there first",
+        "contracts dir is set but {} does not exist — run `npx hardhat compile` there first",
         contracts.display()
     );
 
