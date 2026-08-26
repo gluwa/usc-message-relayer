@@ -148,6 +148,11 @@ jobs:
 
   cargo-test:
     runs-on: ubuntu-26.04
+    env:
+      # Whether the ABI drift gate can run at all. asc-contracts is private, so the checkout needs
+      # the org bot PAT — which is absent on Dependabot runs (they get no secrets) and in any fork.
+      # Folded into a boolean here so the steps below can gate on it without touching the value.
+      HAS_CONTRACTS_TOKEN: ${{ secrets.GLUWA_BOT_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -175,6 +180,7 @@ jobs:
       # gate has something to check, and set ABI_GATE_STRICT so it fails rather than skips if
       # this wiring ever breaks again.
       - name: Check out asc-contracts (for the ABI drift gate)
+        if: env.HAS_CONTRACTS_TOKEN == 'true'
         uses: actions/checkout@v7
         with:
           repository: gluwa/asc-contracts
@@ -185,11 +191,13 @@ jobs:
           token: ${{ secrets.GLUWA_BOT_TOKEN }}
 
       - name: Install Node.js
+        if: env.HAS_CONTRACTS_TOKEN == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: 24
 
       - name: Compile asc-contracts artifacts
+        if: env.HAS_CONTRACTS_TOKEN == 'true'
         working-directory: ./asc-contracts
         # `npm install`, not `npm ci`: the committed lockfile can lag package.json at the pinned
         # SHA and `npm ci` rejects that. Only the compiled artifacts matter here.
@@ -198,6 +206,15 @@ jobs:
           npx hardhat compile
           echo "ASC_CONTRACTS_DIR=$GITHUB_WORKSPACE/asc-contracts" >> "$GITHUB_ENV"
           echo "ABI_GATE_STRICT=1" >> "$GITHUB_ENV"
+
+      # A skipped gate must be visible. Without the token there are no artifacts to compare
+      # against, so ABI_GATE_STRICT is deliberately left unset and the test skips — but it says so
+      # in the run summary rather than passing quietly, which is the failure mode this PR exists
+      # to remove.
+      - name: Warn that the ABI drift gate is skipping
+        if: env.HAS_CONTRACTS_TOKEN != 'true'
+        run: |
+          echo "::warning title=ABI drift gate skipped::GLUWA_BOT_TOKEN is unavailable (Dependabot run, fork, or the secret is not configured), so asc-contracts could not be checked out and the Solidity<->Rust drift gate will skip. Add that secret to this repository to enforce it."
 
       - name: Run tests
         run: cargo test --workspace --locked
