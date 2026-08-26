@@ -1,6 +1,6 @@
 //! Solidity ↔ Rust ABI-surface drift detector (relayer side).
 //!
-//! `src/abi.rs` is a hand-maintained `sol!` mirror of the usc-contracts surface the relayer calls.
+//! `src/abi.rs` is a hand-maintained `sol!` mirror of the asc-contracts surface the relayer calls.
 //! The golden vectors police creditcoin3↔relayer agreement, but nothing enforced Solidity↔Rust
 //! agreement — and that drift is quiet: a renamed *error* doesn't break anything visibly, it just
 //! turns the revert classifier's selector match into dead code (found here: the Outbox renamed
@@ -14,9 +14,9 @@
 //! outputs aren't part of the selector), also pin the artifact's output tuple against the Rust
 //! struct layout, since a reordered field decodes silently into garbage.
 //!
-//! Runs wherever `USC_CONTRACTS_DIR` points at a compiled usc-contracts checkout; without the env
+//! Runs wherever `ASC_CONTRACTS_DIR` points at a compiled asc-contracts checkout; without the env
 //! var it is a no-op so plain `cargo test` stays green. creditcoin3's write-ability-e2e workflow
-//! (which checks out both this repo and usc-contracts) is the CI home for this check.
+//! (which checks out both this repo and asc-contracts) is the CI home for this check.
 
 use alloy::primitives::keccak256;
 use alloy::sol_types::{SolCall, SolError, SolEvent};
@@ -74,6 +74,21 @@ impl Artifact {
         Self { path, abi }
     }
 
+    /// First of `candidates` that exists, for a surface the contracts repo is mid-rename on.
+    /// Panics naming all of them if none is present, so a genuine disappearance still fails.
+    fn load_first(contracts: &Path, candidates: &[&str]) -> Self {
+        for rel in candidates {
+            if contracts.join(rel).is_file() {
+                return Self::load(contracts, rel);
+            }
+        }
+        panic!(
+            "none of {candidates:?} exist under {} — the contract was renamed again or the \
+             artifacts are incomplete; add the new name to the candidate list",
+            contracts.display()
+        )
+    }
+
     fn signatures(&self, kind: &str) -> Vec<String> {
         self.abi
             .iter()
@@ -126,17 +141,32 @@ impl Artifact {
 
 #[test]
 fn mirrored_abi_surface_matches_compiled_contracts() {
-    let Ok(dir) = std::env::var("USC_CONTRACTS_DIR") else {
+    // `ASC_CONTRACTS_DIR` since the repository was renamed usc-contracts -> asc-contracts;
+    // `USC_CONTRACTS_DIR` stays accepted so existing local setups keep working.
+    let dir = std::env::var("ASC_CONTRACTS_DIR")
+        .or_else(|_| std::env::var("USC_CONTRACTS_DIR"))
+        .ok();
+    // Set by CI alongside the artifacts dir. An unset dir skipping is what a plain `cargo test`
+    // on a dev machine wants, but it also meant this gate never ran in CI at all — nothing here
+    // pointed it at any contracts. Any environment that means to enforce the gate sets this and
+    // gets a failure instead of a silent pass.
+    let strict = std::env::var("ABI_GATE_STRICT").is_ok();
+    let Some(dir) = dir else {
+        assert!(
+            !strict,
+            "ABI_GATE_STRICT is set but neither ASC_CONTRACTS_DIR nor USC_CONTRACTS_DIR is — the \
+             drift gate would have silently passed without checking anything"
+        );
         eprintln!(
-            "USC_CONTRACTS_DIR not set — skipping ABI-surface check (point it at a compiled \
-             usc-contracts checkout to enable)"
+            "ASC_CONTRACTS_DIR not set — skipping ABI-surface check (point it at a compiled \
+             asc-contracts checkout to enable)"
         );
         return;
     };
     let contracts = Path::new(&dir).join("artifacts/contracts/write-ability");
     assert!(
         contracts.is_dir(),
-        "USC_CONTRACTS_DIR is set but {} does not exist — run `npx hardhat compile` there first",
+        "contracts dir is set but {} does not exist — run `npx hardhat compile` there first",
         contracts.display()
     );
 
@@ -280,11 +310,16 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         "OutboxNotSet()",
         &IAcknowledgmentValidator::OutboxNotSet::SELECTOR,
     );
-    // ProofInvalid is declared by the USCProofVerifier the validator delegates to; the revert
-    // bubbles through, so its selector is pinned against THAT artifact.
-    let verifier = Artifact::load(
+    // ProofInvalid is declared by the proof verifier the validator delegates to; the revert
+    // bubbles through, so its selector is pinned against THAT artifact. Accept either name: the
+    // contracts repo is mid-rename from USC to ASC and the two open PRs disagree about it, so
+    // taking whichever exists keeps this gate independent of the order they land in.
+    let verifier = Artifact::load_first(
         &contracts,
-        "common/USCProofVerifier.sol/USCProofVerifier.json",
+        &[
+            "common/ASCProofVerifier.sol/ASCProofVerifier.json",
+            "common/USCProofVerifier.sol/USCProofVerifier.json",
+        ],
     );
     verifier.assert_mirrored(
         "error",
@@ -293,36 +328,49 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
     );
 
     // --- RelayerContract (source chain) ---
-    let relayer = Artifact::load(&contracts, "RelayerContract.sol/RelayerContract.json");
-    relayer.assert_mirrored(
-        "function",
-        "getMessageInfo(bytes32)",
-        &IRelayerContract::getMessageInfoCall::SELECTOR,
-    );
-    relayer.assert_output_tuple(
-        "getMessageInfo",
-        "(address,uint32,uint256,uint256,uint256,uint256,uint256,bool,bool)",
-    );
-    relayer.assert_mirrored(
-        "function",
-        "claimDelivery(bytes32,bytes32,uint64,(uint8,bytes32,bytes),(bytes32,bytes32[]))",
-        &IRelayerContract::claimDeliveryCall::SELECTOR,
-    );
-    relayer.assert_mirrored(
-        "error",
-        "UnknownOperation(bytes32)",
-        &IRelayerContract::UnknownOperation::SELECTOR,
-    );
-    relayer.assert_mirrored(
-        "error",
-        "RelayAlreadySettled(bytes32)",
-        &IRelayerContract::RelayAlreadySettled::SELECTOR,
-    );
-    relayer.assert_mirrored(
-        "error",
-        "NativeTransferFailed(address,uint256)",
-        &IRelayerContract::NativeTransferFailed::SELECTOR,
-    );
+    //
+    // Checked against BOTH deployable fee ledgers. They are genuinely different contracts —
+    // `collectRelayerFee` has a different arity, Lite gates on `authorizedQuoters`, and Lite
+    // lacks nine of the errors our revert classifier matches on — but the surface this crate
+    // actually binds (`getMessageInfo`, `claimDelivery`, and the three settlement errors) is
+    // shared and must stay identical, because a route can be pointed at either. Asserting
+    // against only one leaves the other free to drift: the quoter service already targets Lite
+    // (its ADR 0001), so the uncovered one is the one production is heading for.
+    for artifact in [
+        "RelayerContract.sol/RelayerContract.json",
+        "RelayerContractLite.sol/RelayerContractLite.json",
+    ] {
+        let relayer = Artifact::load(&contracts, artifact);
+        relayer.assert_mirrored(
+            "function",
+            "getMessageInfo(bytes32)",
+            &IRelayerContract::getMessageInfoCall::SELECTOR,
+        );
+        relayer.assert_output_tuple(
+            "getMessageInfo",
+            "(address,uint32,uint256,uint256,uint256,uint256,uint256,bool,bool)",
+        );
+        relayer.assert_mirrored(
+            "function",
+            "claimDelivery(bytes32,bytes32,uint64,(uint8,bytes32,bytes),(bytes32,bytes32[]))",
+            &IRelayerContract::claimDeliveryCall::SELECTOR,
+        );
+        relayer.assert_mirrored(
+            "error",
+            "UnknownOperation(bytes32)",
+            &IRelayerContract::UnknownOperation::SELECTOR,
+        );
+        relayer.assert_mirrored(
+            "error",
+            "RelayAlreadySettled(bytes32)",
+            &IRelayerContract::RelayAlreadySettled::SELECTOR,
+        );
+        relayer.assert_mirrored(
+            "error",
+            "NativeTransferFailed(address,uint256)",
+            &IRelayerContract::NativeTransferFailed::SELECTOR,
+        );
+    }
 
     // --- OutboxFactory (source chain) ---
     let factory = Artifact::load(&contracts, "deployer/OutboxFactory.sol/OutboxFactory.json");
