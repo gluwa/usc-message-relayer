@@ -56,7 +56,9 @@ pub use config::{
     AttestorSet, AttestorSource, ChainRoute, Config, DeliveryConfig, P2pConfig, VoteCacheConfig,
 };
 pub use delivery::DeliveryJob;
-pub use events::{ConfigOverrideResolver, FactoryResolver, IndexedMessage, OutboxResolver};
+pub use events::{
+    ConfigOverrideResolver, FactoryResolver, IndexedMessage, OutboxResolver, RegistryResolver,
+};
 pub use p2p::MessageVote;
 pub use pool::{calculate_threshold, RouteAttestors};
 pub use prom::{Metrics, MetricsTrait, NoopMetrics, RelayerMetrics};
@@ -227,8 +229,15 @@ impl Server {
             .routes
             .iter()
             .map(|route| {
+                // Ordered most-specific first. An explicit address needs no discovery at all;
+                // a registry read is authoritative and cheap; scanning `OutboxCreated` is the
+                // legacy path and is spoofable, because the factory is permissionless and this
+                // binds the newest log (see `RegistryResolver`'s doc comment). Routes move off it
+                // by setting `outbox_registry_address`.
                 let resolver: Arc<dyn OutboxResolver> = if route.outbox_address.is_some() {
                     Arc::new(ConfigOverrideResolver)
+                } else if route.outbox_registry_address.is_some() {
+                    Arc::new(RegistryResolver)
                 } else {
                     Arc::new(FactoryResolver::new(checkpoint.clone()))
                 };

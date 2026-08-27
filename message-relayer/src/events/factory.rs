@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::abi::IOutboxFactory;
+use crate::abi::{IOutboxDeployer, IOutboxFactory};
 use crate::checkpoint::{CheckpointStore, FactoryScan};
 use crate::config::ChainRoute;
 use write_ability::protocol::chain_key_to_bytes32;
@@ -59,6 +59,83 @@ impl OutboxResolver for ConfigOverrideResolver {
                 route.chain_key
             )
         })?;
+        Ok(ResolvedOutbox {
+            address,
+            current_since_block: None,
+        })
+    }
+}
+
+/// Resolve the Outbox by reading the deployer/discovery registry, instead of scanning the
+/// factory's `OutboxCreated` logs.
+///
+/// This exists for a security reason rather than a tidiness one. `OutboxFactory.deployOutbox` is
+/// intentionally permissionless, and the CREATE2 salt binds `msg.sender`, so any account can
+/// deploy an Outbox for any chain key and emit an `OutboxCreated` that is byte-indistinguishable
+/// from a legitimate one. [`FactoryResolver`] binds the newest such log, so an attacker's
+/// deployment is permanently newest and the fleet follows a contract they control — including its
+/// fee registry and validator. The contract-side design comment justifies the permissionless
+/// factory on the grounds that an unauthorised caller "only spends its own gas on an Outbox the
+/// protocol never registers", which is true for a consumer that reads the registry and false for
+/// one that reads logs.
+///
+/// The registry only records deployments performed through `OutboxDeployer` (owner-gated as of
+/// asc-contracts#38), so it cannot be written by an outside caller.
+///
+/// Cheap by construction: one `eth_call` per resolve, no chunked `getLogs` sweep, no persisted
+/// scan cursor, and no genesis-fallback recovery path — none of which this resolver needs, which
+/// is why it is a fraction of [`FactoryResolver`]'s size.
+#[derive(Debug, Default)]
+pub struct RegistryResolver;
+
+#[async_trait]
+impl OutboxResolver for RegistryResolver {
+    async fn resolve(&self, route: &ChainRoute, provider: &DynProvider) -> Result<ResolvedOutbox> {
+        let chain_key = route.chain_key;
+        let registry = route.outbox_registry_address.with_context(|| {
+            format!(
+                "chain_key {chain_key} selected registry resolution without an \
+                 `outbox_registry_address` — this is a resolver-selection bug, not a config error"
+            )
+        })?;
+
+        // `chainKey` is `uint32` on the contract side while the pallet and these mirrors carry it
+        // as `u64`. Reject anything unrepresentable rather than truncating: a silently wrapped key
+        // would read the registry for a *different* chain and bind the wrong Outbox.
+        let chain_key_u32 = u32::try_from(chain_key).with_context(|| {
+            format!(
+                "chain_key {chain_key} exceeds the uint32 the Outbox registry is keyed by, so it \
+                 cannot be represented on-chain"
+            )
+        })?;
+
+        let deployer = IOutboxDeployer::new(registry, provider);
+        let address = tokio::time::timeout(
+            PRECOMPILE_CALL_TIMEOUT,
+            deployer.outboxOf(chain_key_u32).call(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "chain_key {chain_key}: outboxOf on registry {registry} timed out after \
+                 {PRECOMPILE_CALL_TIMEOUT:?}"
+            )
+        })?
+        .with_context(|| {
+            format!("chain_key {chain_key}: outboxOf call on registry {registry} failed")
+        })?;
+
+        if address.is_zero() {
+            anyhow::bail!(
+                "chain_key {chain_key}: registry {registry} has no Outbox for this chain key \
+                 (outboxOf returned the zero address) — deploy through OutboxDeployer, or point \
+                 `outbox_registry_address` at the registry that holds it"
+            );
+        }
+
+        // No creation block to report: the registry stores the address only. `current_since_block`
+        // is an optimisation for the message watcher's start height, and `None` simply means it
+        // uses the route's configured start rather than the Outbox's creation block.
         Ok(ResolvedOutbox {
             address,
             current_since_block: None,
@@ -702,6 +779,7 @@ mod tests {
             chain_key: 2,
             creditcoin_chain_id: 1,
             outbox_address: outbox,
+            outbox_registry_address: None,
             destination_rpc_url: "http://x".into(),
             inbox_address: address!("0000000000000000000000000000000000000002"),
             signer_key: None,
@@ -714,6 +792,14 @@ mod tests {
             threshold_override: None,
             ack: None,
             claim: None,
+        }
+    }
+
+    fn route_with_registry(registry: Option<Address>, chain_key: u64) -> ChainRoute {
+        ChainRoute {
+            chain_key,
+            outbox_registry_address: registry,
+            ..route_with(None)
         }
     }
 
@@ -745,6 +831,64 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("outbox_address"));
+    }
+
+    /// Selecting registry resolution without an address is a wiring mistake in `lib.rs`, not
+    /// something an operator can cause, so the message says so rather than blaming the config.
+    #[tokio::test]
+    async fn registry_resolver_fails_without_a_registry_address() {
+        let err = RegistryResolver
+            .resolve(&route_with_registry(None, 2), &unused_provider())
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("outbox_registry_address"), "{msg}");
+        assert!(msg.contains("resolver-selection bug"), "{msg}");
+    }
+
+    /// The contract keys `outboxOf` by `uint32` while routes carry `chain_key` as `u64`. A plain
+    /// `as u32` would wrap 2^32 to 0 and silently read the registry for a *different* chain, then
+    /// bind whatever Outbox that answered with — the exact class of silent mis-binding this
+    /// resolver exists to remove. It must refuse instead, and refuse before making any call.
+    #[tokio::test]
+    async fn registry_resolver_refuses_a_chain_key_wider_than_uint32() {
+        let registry = address!("00000000000000000000000000000000000000aa");
+        for key in [u64::from(u32::MAX) + 1, u64::MAX] {
+            let err = RegistryResolver
+                .resolve(
+                    &route_with_registry(Some(registry), key),
+                    &unused_provider(),
+                )
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("uint32"), "key {key}: {msg}");
+            // Would have wrapped to 0 and read a real (wrong) entry had we cast instead.
+            assert!(
+                !msg.contains("timed out"),
+                "key {key} reached the RPC: {msg}"
+            );
+        }
+    }
+
+    /// The widest key the registry can actually represent must pass the guard and proceed to the
+    /// call — otherwise the check is off by one and quietly rejects a legitimate chain key.
+    #[tokio::test]
+    async fn registry_resolver_accepts_the_largest_representable_chain_key() {
+        let registry = address!("00000000000000000000000000000000000000aa");
+        let err = RegistryResolver
+            .resolve(
+                &route_with_registry(Some(registry), u64::from(u32::MAX)),
+                &unused_provider(),
+            )
+            .await
+            .unwrap_err();
+        // Reaching the RPC (which cannot connect on port 1) proves the guard let it through.
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("uint32"),
+            "rejected a representable key: {msg}"
+        );
     }
 
     #[test]

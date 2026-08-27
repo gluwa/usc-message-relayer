@@ -22,7 +22,8 @@ use alloy::primitives::keccak256;
 use alloy::sol_types::{SolCall, SolError, SolEvent};
 use std::path::{Path, PathBuf};
 use write_ability::abi::{
-    IAcknowledgmentValidator, IInbox, IOutbox, IOutboxFactory, IRelayerContract, IVoteValidator,
+    IAcknowledgmentValidator, IInbox, IOutbox, IOutboxDeployer, IOutboxFactory, IRelayerContract,
+    IVoteValidator,
 };
 
 /// Canonical ABI type for one artifact input/output, expanding structs: `tuple` →
@@ -371,6 +372,23 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
             &IRelayerContract::NativeTransferFailed::SELECTOR,
         );
     }
+
+    // --- OutboxDeployer (source chain) ---
+    //
+    // `outboxOf` is what RegistryResolver reads instead of scanning the factory's logs. Pinning it
+    // here matters more than most: the whole point of reading the registry is that it cannot be
+    // spoofed, so a silently-renamed getter would send us back to the log scan without anyone
+    // noticing. Post-asc-contracts#38 the equivalent is `OutboxDiscovery.defaultOutbox`, which
+    // gets its own assertion when the pin moves.
+    let deployer = Artifact::load(
+        &contracts,
+        "deployer/OutboxDeployer.sol/OutboxDeployer.json",
+    );
+    deployer.assert_mirrored(
+        "function",
+        "outboxOf(uint32)",
+        &IOutboxDeployer::outboxOfCall::SELECTOR,
+    );
 
     // --- OutboxFactory (source chain) ---
     let factory = Artifact::load(&contracts, "deployer/OutboxFactory.sol/OutboxFactory.json");
