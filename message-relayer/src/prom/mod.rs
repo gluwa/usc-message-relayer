@@ -485,6 +485,12 @@ pub enum VoteOutcome {
     /// Dropped at the libp2p→pool hand-off because the pool was saturated (backpressure). The
     /// vote is not lost to the network — it is re-gossiped — so this is a safe shed under load.
     Dropped,
+    /// Verified, but its message was not indexed yet, so it is held until the Outbox watcher
+    /// catches up (see `pool::RouteState::early_votes`). Distinct from `Ignore` on purpose: these
+    /// used to be discarded, which cost every message a stall-detector timeout before its votes
+    /// were re-gossiped. A rising `Buffered` count with a healthy `Accept` count is the system
+    /// working; `Buffered` without `Accept` means messages are never getting indexed.
+    Buffered,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]

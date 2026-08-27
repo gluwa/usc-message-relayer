@@ -160,7 +160,12 @@ pub async fn run(
                     info!("indexed_rx channel closed; shutting pool down");
                     return Ok(());
                 };
-                state.note_indexed(indexed, metrics.as_ref());
+                if let Some(job) = state.note_indexed(indexed, metrics.as_ref()) {
+                    let label = "buffered-vote dispatch";
+                    if let Err((ck, mh)) = dispatch_delivery_job(&delivery_txs, job, label) {
+                        state.requeue_delivery(ck, mh, Instant::now());
+                    }
+                }
             }
             maybe = vote_rx.recv() => {
                 let Some(vote) = maybe else {
@@ -279,6 +284,30 @@ struct RouteState {
     /// Insertion order, used together with [`MessageSlot::inserted_at`] for TTL/LRU eviction.
     order: VecDeque<B256>,
     cache_max: usize,
+    /// Verified votes whose message the Outbox watcher has not indexed yet, keyed by message hash
+    /// and then by *recovered* signer.
+    ///
+    /// Attestors gossip a vote as soon as they observe a message, which is routinely before this
+    /// relayer has read the same message out of the Creditcoin logs. Those votes used to be
+    /// dropped, so every message waited for its stall-detector timeout and a reobservation round
+    /// before its votes were accepted — measured on usc-devnet as 233 deliveries against 236
+    /// reobservation requests, a ~41s median time-to-threshold against the few seconds the
+    /// pipeline is actually capable of, and a hard dependency on the reobservation path for
+    /// 100% of traffic.
+    ///
+    /// Bounded two ways. Within a hash, the key is the recovered signer and every signer must
+    /// already be in `attestors`, so an entry cannot exceed the attestor set. Across hashes,
+    /// `cache_max` applies with oldest-first eviction, and [`Self::prune_expired`] ages entries
+    /// out — a hash that is never indexed must not pin memory forever.
+    early_votes: HashMap<B256, EarlyVotes>,
+}
+
+/// Buffered votes for one not-yet-indexed message. Keyed by recovered signer for the same reason
+/// [`MessageSlot::signers`] is: a forged signature must not be able to occupy a real attestor's
+/// slot and displace their genuine vote.
+struct EarlyVotes {
+    signers: BTreeMap<Address, [u8; 65]>,
+    first_seen: Instant,
 }
 
 struct MessageSlot {
@@ -308,6 +337,7 @@ impl State {
                             attestors: r.attestors,
                             threshold: r.threshold,
                             by_message: HashMap::new(),
+                            early_votes: HashMap::new(),
                             order: VecDeque::new(),
                             cache_max: cap,
                         },
@@ -318,20 +348,27 @@ impl State {
         }
     }
 
-    fn note_indexed(&mut self, indexed: IndexedMessage, metrics: &dyn crate::prom::MetricsTrait) {
+    /// Returns a [`DeliveryJob`] when buffered votes already put this message at quorum, so the
+    /// caller dispatches immediately instead of waiting for the next `collect_ready_deliveries`
+    /// tick — otherwise the buffer would trade a stall-detector round trip for a tick delay.
+    fn note_indexed(
+        &mut self,
+        indexed: IndexedMessage,
+        metrics: &dyn crate::prom::MetricsTrait,
+    ) -> Option<DeliveryJob> {
         let chain_key = indexed.chain_key;
         let Some(route) = self.by_route.get_mut(&chain_key) else {
             warn!(
                 chain_key,
                 "indexed message for unconfigured chain_key — dropping"
             );
-            return;
+            return None;
         };
         let hash = indexed.message_hash;
         if route.by_message.contains_key(&hash) {
             // Re-org or duplicate finalized event; safe to ignore — keep the original slot.
             debug!(chain_key, %hash, "re-indexing existing message; keeping original slot");
-            return;
+            return None;
         }
         route.by_message.insert(
             hash,
@@ -349,7 +386,56 @@ impl State {
         );
         route.order.push_back(hash);
         route.evict_overflow();
+
+        // Adopt any votes that arrived before this message was indexed. Doing it here rather than
+        // waiting for re-gossip is the whole point of the buffer: it is what removes the
+        // stall-detector round trip from the common path.
+        let job = 'adopt: {
+            let Some(early) = route.early_votes.remove(&hash) else {
+                break 'adopt None;
+            };
+            let adopted = early.signers.len();
+            let slot = route
+                .by_message
+                .get_mut(&hash)
+                .expect("slot inserted immediately above");
+            // Re-check membership per signer: the attestor set can have rotated between the vote
+            // arriving and the message being indexed, and a vote from an attestor who is no longer
+            // in the set must not count toward the new threshold.
+            let mut dropped_by_rotation = 0usize;
+            for (signer, signature) in early.signers {
+                if route.attestors.contains(&signer) {
+                    slot.signers.insert(signer, signature);
+                    metrics.inc_vote(chain_key, VoteOutcome::Accept);
+                } else {
+                    dropped_by_rotation += 1;
+                    metrics.inc_vote(chain_key, VoteOutcome::Reject);
+                }
+            }
+            let signer_count = slot.signers.len();
+            debug!(
+                chain_key, %hash, adopted, dropped_by_rotation, signer_count,
+                "adopted buffered votes for newly indexed message"
+            );
+            if signer_count >= route.threshold {
+                info!(
+                    chain_key,
+                    %hash,
+                    signer_count,
+                    "✅ threshold reached from buffered votes — dispatching without waiting for \
+                     reobservation"
+                );
+            }
+            // `observe_threshold` is true, so this records `time_to_threshold` measured from the
+            // slot's `inserted_at` — a moment ago. That is not a broken metric: it has always
+            // meant "how long after *we* index a message do we reach quorum", and a buffered
+            // quorum legitimately reaches it instantly. Expect that histogram to collapse toward
+            // zero once this ships, and read attestation latency off the attestor side instead.
+            Self::dispatch_if_ready(chain_key, hash, route, metrics, true, Instant::now())
+        };
+
         metrics.set_pool_messages_pending(self.total_pending() as i64);
+        job
     }
 
     fn note_vote(
@@ -361,15 +447,18 @@ impl State {
         let route = self.by_route.get_mut(&chain_key)?;
 
         let hash = B256::from(vote.message_hash);
-        let Some(slot) = route.by_message.get_mut(&hash) else {
-            // PoC §6.2: chain-first allowlist — drop votes for messages we have not indexed.
-            // debug, not warn: this fires routinely (every message's first gossip round tends to
-            // arrive before the Outbox watcher has indexed it — see the ops-gotchas memory) and
-            // self-heals via re-gossip. Previously silent but for the `outcome` metric label —
-            // logged here so a triage pass has something to grep besides the counter.
-            debug!(chain_key, %hash, "vote for unindexed message dropped (chain-first allowlist)");
-            metrics.inc_vote(chain_key, VoteOutcome::Ignore);
+        if !route.by_message.contains_key(&hash) {
+            // Not indexed yet. Hold the vote rather than discarding it: it is almost always a
+            // legitimate attestor gossiping ahead of our own Outbox watcher, and dropping it cost
+            // every message a stall-detector timeout before the re-gossip was accepted. Verified
+            // before buffering — see `buffer_early_vote`. Nothing can be dispatched here:
+            // without an indexed message there is no payload or emitter to deliver, so quorum is
+            // evaluated in `note_indexed`.
+            route.buffer_early_vote(chain_key, hash, &vote, metrics);
             return None;
+        }
+        let Some(slot) = route.by_message.get_mut(&hash) else {
+            unreachable!("presence checked immediately above")
         };
         if slot.delivered || slot.terminal {
             debug!(chain_key, %hash, delivered = slot.delivered, terminal = slot.terminal,
@@ -751,6 +840,76 @@ fn delivery_retry_delay(attempts: u32) -> Duration {
 }
 
 impl RouteState {
+    /// Verify a vote for a not-yet-indexed message and hold it until the message arrives.
+    ///
+    /// Verification happens *before* buffering, and the entry is keyed on the **recovered**
+    /// signer rather than the claimed one. Both matter: buffering unverified votes keyed by a
+    /// caller-supplied address would let a forged signature occupy a real attestor's slot and
+    /// displace their genuine vote — the same poisoning the indexed path already guards against.
+    fn buffer_early_vote(
+        &mut self,
+        chain_key: u64,
+        hash: B256,
+        vote: &MessageVote,
+        metrics: &dyn crate::prom::MetricsTrait,
+    ) {
+        let claimed_signer = Address::from(vote.signer);
+        if !self.attestors.contains(&claimed_signer) {
+            warn!(chain_key, %hash, %claimed_signer,
+                "early vote rejected: signer not in attestor allowlist");
+            metrics.inc_vote(chain_key, VoteOutcome::Reject);
+            return;
+        }
+        let recovered = match recover_signer(&hash, &vote.signature) {
+            Ok(addr) => addr,
+            Err(err) => {
+                warn!(chain_key, %hash, %err, %claimed_signer,
+                    "early vote rejected: signature did not recover");
+                metrics.inc_vote(chain_key, VoteOutcome::Reject);
+                return;
+            }
+        };
+        if recovered != claimed_signer {
+            warn!(chain_key, %hash, %claimed_signer, %recovered,
+                "early vote rejected: recovered signer does not match claimed signer");
+            metrics.inc_vote(chain_key, VoteOutcome::Reject);
+            return;
+        }
+
+        let entry = self.early_votes.entry(hash).or_insert_with(|| EarlyVotes {
+            signers: BTreeMap::new(),
+            first_seen: Instant::now(),
+        });
+        entry.signers.insert(recovered, vote.signature);
+        let held = entry.signers.len();
+        self.evict_early_overflow();
+        debug!(chain_key, %hash, %recovered, held,
+            "buffered early vote for unindexed message");
+        metrics.inc_vote(chain_key, VoteOutcome::Buffered);
+    }
+
+    /// Bound the number of distinct not-yet-indexed hashes held, oldest first. Per-hash size is
+    /// already bounded by the attestor set, since every key is an allowlisted recovered signer.
+    ///
+    /// Reaching this cap requires an allowlisted attestor's key, because `buffer_early_vote`
+    /// applies the allowlist before inserting. So evicting a legitimate buffered vote by flooding
+    /// distinct hashes is not open to an arbitrary peer — it costs a compromised attestor, who has
+    /// strictly better attacks available. Oldest-first is still the right eviction order: the
+    /// oldest unindexed hash is the one least likely to ever be indexed.
+    fn evict_early_overflow(&mut self) {
+        while self.early_votes.len() > self.cache_max {
+            let Some(oldest) = self
+                .early_votes
+                .iter()
+                .min_by_key(|(_, v)| v.first_seen)
+                .map(|(k, _)| *k)
+            else {
+                break;
+            };
+            self.early_votes.remove(&oldest);
+        }
+    }
+
     fn evict_overflow(&mut self) {
         while self.by_message.len() > self.cache_max {
             let Some(oldest) = self.order.pop_front() else {
@@ -781,6 +940,13 @@ impl RouteState {
             self.by_message.remove(&hash);
         }
         self.order.retain(|h| self.by_message.contains_key(h));
+
+        // Early votes DO expire by age, unlike indexed slots above. A buffered hash that never
+        // gets indexed is not a slow message we owe delivery to — it is a message this route will
+        // never see (wrong chain, a rotated-out attestor's stale gossip, or an emitter we do not
+        // watch). Holding it forever would be an unbounded sink keyed on attacker-influenced data.
+        self.early_votes
+            .retain(|_, votes| now.duration_since(votes.first_seen) <= ttl);
     }
 }
 
@@ -856,8 +1022,11 @@ mod tests {
         assert_eq!(calculate_threshold(10), 7);
     }
 
+    /// An unverifiable vote for an unindexed message must not even reach the buffer: `[0u8; 65]`
+    /// has `v = 0`, which `recover_signer` rejects. Buffering unverified votes would be the
+    /// poisoning vector `buffer_early_vote` exists to avoid.
     #[test]
-    fn unknown_message_drops_vote_quietly() {
+    fn unknown_message_with_unverifiable_vote_is_not_buffered() {
         let route = route_for(
             2,
             vec![address!("000000000000000000000000000000000000000a")],
@@ -873,6 +1042,10 @@ mod tests {
         };
         assert!(state.note_vote(vote, metrics.as_ref()).is_none());
         assert_eq!(state.total_pending(), 0);
+        assert!(
+            state.by_route[&2].early_votes.is_empty(),
+            "an unverifiable vote must be rejected outright, not buffered"
+        );
     }
 
     // secp256k1 group order N, big-endian — used to build the malleable high-`s` equivalent
@@ -949,6 +1122,217 @@ mod tests {
         assert!(
             state.note_vote(mk(canonical), metrics.as_ref()).is_some(),
             "canonical vote must be accepted after a non-canonical one from the same signer"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Early-vote buffer. Attestors routinely gossip a vote before our own Outbox watcher has
+    // indexed the message (they sign at import; we index at finality). Dropping those votes cost
+    // every message a stall-detector round trip: measured on usc-devnet as 233 deliveries against
+    // 236 reobservation requests, median time-to-delivery 41s. Buffering removes that round trip
+    // from the common path.
+    // ---------------------------------------------------------------------------------------
+
+    /// Build a vote as `signer` for `hash`, optionally claiming a different address.
+    fn vote_for(
+        chain_key: u64,
+        hash: B256,
+        signer: &alloy::signers::local::PrivateKeySigner,
+        claimed: Option<Address>,
+    ) -> MessageVote {
+        MessageVote {
+            chain_key,
+            message_id: [7u8; 32],
+            message_hash: hash.0,
+            signer: claimed.unwrap_or_else(|| signer.address()).into_array(),
+            signature: canonical_sig(signer, &hash),
+        }
+    }
+
+    #[test]
+    fn early_votes_are_buffered_then_adopted_when_the_message_is_indexed() {
+        let signers: Vec<_> = (0x31u8..=0x33).map(test_signer).collect();
+        let addrs: Vec<Address> = signers.iter().map(|s| s.address()).collect();
+        let mut state = State::new(vec![route_for(2, addrs)], VoteCacheConfig::default());
+        let metrics = NoopMetrics::new();
+        let hash = B256::from([0x51u8; 32]);
+
+        // All three votes land before the watcher indexes the message. None can dispatch yet —
+        // without an indexed message there is no payload or emitter to deliver.
+        for s in &signers {
+            assert!(
+                state
+                    .note_vote(vote_for(2, hash, s, None), metrics.as_ref())
+                    .is_none(),
+                "a buffered vote cannot dispatch: the message is not indexed yet"
+            );
+        }
+        assert_eq!(state.by_route[&2].early_votes[&hash].signers.len(), 3);
+        assert_eq!(state.total_pending(), 0);
+
+        // Indexing adopts them and dispatches immediately, with no reobservation round trip.
+        let job = state
+            .note_indexed(indexed_for(2, hash), metrics.as_ref())
+            .expect("buffered quorum must dispatch on index");
+        assert_eq!(job.chain_key, 2);
+        assert_eq!(job.message_hash, hash);
+        assert!(
+            state.by_route[&2].early_votes.is_empty(),
+            "adopted votes must be drained out of the buffer"
+        );
+        assert_eq!(state.by_route[&2].by_message[&hash].signers.len(), 3);
+    }
+
+    #[test]
+    fn repeated_early_votes_from_one_signer_occupy_one_slot() {
+        let signer = test_signer(0x34);
+        let mut state = State::new(
+            vec![route_for(
+                2,
+                vec![signer.address(), test_signer(0x35).address()],
+            )],
+            VoteCacheConfig::default(),
+        );
+        let metrics = NoopMetrics::new();
+        let hash = B256::from([0x52u8; 32]);
+
+        for _ in 0..5 {
+            state.note_vote(vote_for(2, hash, &signer, None), metrics.as_ref());
+        }
+        assert_eq!(state.by_route[&2].early_votes[&hash].signers.len(), 1);
+
+        // One of two attestors is below the threshold of 2, so indexing must not dispatch.
+        assert!(state
+            .note_indexed(indexed_for(2, hash), metrics.as_ref())
+            .is_none());
+        assert_eq!(state.by_route[&2].by_message[&hash].signers.len(), 1);
+    }
+
+    #[test]
+    fn early_vote_from_a_non_attestor_is_not_buffered() {
+        let attestor = test_signer(0x36);
+        let outsider = test_signer(0x99);
+        let mut state = State::new(
+            vec![route_for(2, vec![attestor.address()])],
+            VoteCacheConfig::default(),
+        );
+        let metrics = NoopMetrics::new();
+        let hash = B256::from([0x53u8; 32]);
+
+        assert!(state
+            .note_vote(vote_for(2, hash, &outsider, None), metrics.as_ref())
+            .is_none());
+        assert!(
+            state.by_route[&2].early_votes.is_empty(),
+            "the allowlist must be applied before buffering, not after"
+        );
+    }
+
+    /// The buffered analogue of `non_canonical_vote_does_not_poison_dedup_slot`: a forged vote
+    /// claiming an attestor's address must not occupy that attestor's buffered slot, or an attacker
+    /// could displace real votes for a message we have not indexed yet — precisely the window the
+    /// buffer opens.
+    #[test]
+    fn forged_early_vote_cannot_occupy_a_real_attestors_buffered_slot() {
+        let attestor = test_signer(0x37);
+        let attacker = test_signer(0x9a);
+        let mut state = State::new(
+            vec![route_for(2, vec![attestor.address()])],
+            VoteCacheConfig::default(),
+        );
+        let metrics = NoopMetrics::new();
+        let hash = B256::from([0x54u8; 32]);
+
+        // Attacker signs with its own key but claims the attestor's address.
+        assert!(state
+            .note_vote(
+                vote_for(2, hash, &attacker, Some(attestor.address())),
+                metrics.as_ref()
+            )
+            .is_none());
+        assert!(
+            state.by_route[&2].early_votes.is_empty(),
+            "a claimed-signer mismatch must be rejected before it reaches the buffer"
+        );
+
+        // The attestor's genuine vote is still accepted and still reaches threshold (1).
+        state.note_vote(vote_for(2, hash, &attestor, None), metrics.as_ref());
+        assert!(
+            state
+                .note_indexed(indexed_for(2, hash), metrics.as_ref())
+                .is_some(),
+            "the genuine vote must survive the forgery attempt"
+        );
+    }
+
+    #[test]
+    fn buffered_vote_from_an_attestor_rotated_out_before_indexing_is_dropped() {
+        let old_attestor = test_signer(0x38);
+        let new_attestor = test_signer(0x39);
+        let mut state = State::new(
+            vec![route_for(2, vec![old_attestor.address()])],
+            VoteCacheConfig::default(),
+        );
+        let metrics = NoopMetrics::new();
+        let hash = B256::from([0x55u8; 32]);
+
+        state.note_vote(vote_for(2, hash, &old_attestor, None), metrics.as_ref());
+        assert_eq!(state.by_route[&2].early_votes[&hash].signers.len(), 1);
+
+        // Rotation lands while the vote is still buffered.
+        state.apply_attestor_set(route_for(2, vec![new_attestor.address()]), metrics.as_ref());
+
+        assert!(
+            state
+                .note_indexed(indexed_for(2, hash), metrics.as_ref())
+                .is_none(),
+            "a rotated-out attestor's buffered vote must not count toward the new threshold"
+        );
+        assert!(state.by_route[&2].by_message[&hash].signers.is_empty());
+    }
+
+    #[test]
+    fn early_vote_buffer_is_bounded_by_the_cache_cap() {
+        let signer = test_signer(0x3a);
+        let mut state = State::new(
+            vec![route_for(2, vec![signer.address()])],
+            VoteCacheConfig {
+                ttl_seconds: 600,
+                max_messages: 2,
+            },
+        );
+        let metrics = NoopMetrics::new();
+        for byte in 1u8..=4 {
+            let mut h = [0u8; 32];
+            h[0] = byte;
+            state.note_vote(vote_for(2, B256::from(h), &signer, None), metrics.as_ref());
+        }
+        assert_eq!(
+            state.by_route[&2].early_votes.len(),
+            2,
+            "distinct unindexed hashes are attacker-influenced, so the buffer must be capped"
+        );
+    }
+
+    #[test]
+    fn early_votes_expire_by_ttl() {
+        let signer = test_signer(0x3b);
+        let mut state = State::new(
+            vec![route_for(2, vec![signer.address()])],
+            VoteCacheConfig {
+                ttl_seconds: 0,
+                max_messages: 128,
+            },
+        );
+        let metrics = NoopMetrics::new();
+        let hash = B256::from([0x56u8; 32]);
+        state.note_vote(vote_for(2, hash, &signer, None), metrics.as_ref());
+        assert_eq!(state.by_route[&2].early_votes.len(), 1);
+
+        state.prune_expired();
+        assert!(
+            state.by_route[&2].early_votes.is_empty(),
+            "a hash that is never indexed must not be held forever"
         );
     }
 
