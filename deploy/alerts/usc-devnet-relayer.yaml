@@ -1,0 +1,227 @@
+# Grafana alert rules for the message relayer on usc-devnet.
+#
+# Apply with:
+#   grafanactl resources push alert-rules -f deploy/alerts/usc-devnet-relayer.yaml
+# or paste into Alerting > Alert rules > Import (folder "GrafanaCloud", uid 31SwFux7z).
+#
+# WHY THESE EXIST
+#
+# On 20 August, deliveries succeeded for two days while relay fees silently never settled. The
+# whole outage was a WARN nobody read. It was unalertable, for a reason that is worth stating
+# precisely: an unincremented Prometheus counter family emits *zero bytes*, so "settlement never
+# happened" and "settlement is not configured" and "the relayer is not running" all look identical
+# from the outside. Every expression below therefore ends in `or vector(0)` so the rule always has
+# a value to evaluate, and never silently degrades to NoData.
+#
+# Rules 1 and 2 work against today's metrics. Rule 3 needs relayer_settlement_queue_depth, added in
+# the same PR as this file, so it stays paused until a relayer carrying it is deployed. Unpausing it
+# is a one-line change and it is tracked in the "Road to cc3-devnet" work queue.
+#
+# Naming, folder, labels and receiver follow the existing "usc-devnet - attestor peer lag" rule.
+
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: usc-devnet - relayer pool
+    folder: GrafanaCloud
+    interval: 1m
+    rules:
+      # ---------------------------------------------------------------------------------------
+      # 1. A message reached the relayer and is not completing delivery.
+      #
+      # The relayer retries forever by design (C1r): giving up after a fixed budget used to strand
+      # messages permanently once the outbox checkpoint advanced past them. The cost of that
+      # correctness fix is that a genuinely stuck message produces an infinite, quiet WARN loop
+      # instead of a terminal state. This is the alert that closes it.
+      #
+      # min_over_time, not a bare `> 0`: under normal traffic the gauge is briefly non-zero while a
+      # message gathers votes and delivers. Requiring that it never touched zero across a full hour
+      # distinguishes "stuck" from "busy" — with ~9 deliveries/hour each taking seconds, a healthy
+      # pool returns to zero many times an hour.
+      #
+      # Verified: this gauge sat at exactly 1 for 2.5 days (24-27 Aug) on one under-funded message,
+      # retried 469 times, with no alert. It was 0 for the preceding 4.5 days of live traffic.
+      # ---------------------------------------------------------------------------------------
+      - title: usc-devnet - Relayer message stuck in pool
+        condition: C
+        for: 10m
+        noDataState: NoData
+        execErrState: Error
+        labels:
+          network: usc-devnet
+        annotations:
+          summary: usc-devnet - Relayer message stuck in pool
+          description: >-
+            relayer_pool_messages_pending never returned to 0 in the last hour. A message has
+            reached the relayer but is not completing delivery, and the relayer retries forever by
+            design, so this will not self-resolve and will not go terminal. Most likely cause is an
+            under-funded message: look for "delivery is under-funded - estimated gas exceeds the
+            funded gasLimit" in the relayer pod logs, which needs a topUpGasLimit call on the source
+            Outbox. The "delivery still failing after 5+ attempts" line carries an attempts= counter
+            showing how long it has been stuck. In healthy operation this gauge touches 0 many times
+            an hour even under load, so a full hour above 0 means stuck, not busy.
+        notification_settings:
+          receiver: Slack-Incident-Devnet
+        data:
+          - refId: A
+            datasourceUid: grafanacloud-prom
+            relativeTimeRange:
+              from: 3900
+              to: 0
+            model:
+              refId: A
+              editorMode: code
+              instant: true
+              range: false
+              expr: |
+                max(min_over_time(relayer_pool_messages_pending{cluster="usc-devnet-cluster"}[1h])) or vector(0)
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+                  reducer:
+                    type: last
+                  operator:
+                    type: and
+
+  - orgId: 1
+    name: usc-devnet - relayer settlement
+    folder: GrafanaCloud
+    interval: 1m
+    rules:
+      # ---------------------------------------------------------------------------------------
+      # 2. Settlement attempts are failing.
+      #
+      # `Failed` only increments when an ack or claim was actually attempted and did not resolve
+      # (proof-gen error, RPC failure, no receipt in time). It cannot fire on an idle route, which
+      # is what makes this rule sound today without any new metric.
+      #
+      # Threshold of 2 over an hour, not 0: a single transient RPC blip is normal and self-heals at
+      # the capped backoff. Three failures in an hour is a path that is down.
+      # ---------------------------------------------------------------------------------------
+      - title: usc-devnet - Relayer settlement attempts failing
+        condition: C
+        for: 15m
+        noDataState: NoData
+        execErrState: Error
+        labels:
+          network: usc-devnet
+        annotations:
+          summary: usc-devnet - Relayer settlement attempts failing
+          description: >-
+            More than 2 ack or claim attempts failed in the last hour on usc-devnet. Deliveries can
+            keep succeeding while this is broken, which is exactly how the 20 August outage went
+            unnoticed for two days: relay fees never settled and the only signal was a WARN. Check
+            proof-gen first (its archiver silently losing the ability to build continuity proofs was
+            the 20 August root cause), then the ack signer balance and the Creditcoin RPC. Split
+            ack vs claim with
+            sum by (outcome) (increase(relayer_ack_submissions_total[1h])) and the same for
+            relayer_claim_submissions_total.
+        notification_settings:
+          receiver: Slack-Incident-Devnet
+        data:
+          - refId: A
+            datasourceUid: grafanacloud-prom
+            relativeTimeRange:
+              from: 3900
+              to: 0
+            model:
+              refId: A
+              editorMode: code
+              instant: true
+              range: false
+              expr: |
+                (sum(increase(relayer_ack_submissions_total{cluster="usc-devnet-cluster", outcome="Failed"}[1h])) or vector(0))
+                +
+                (sum(increase(relayer_claim_submissions_total{cluster="usc-devnet-cluster", outcome="Failed"}[1h])) or vector(0))
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [2]
+                  reducer:
+                    type: last
+                  operator:
+                    type: and
+
+      # ---------------------------------------------------------------------------------------
+      # 3. The settlement queue never drains. PAUSED until a relayer with
+      #    relayer_settlement_queue_depth is deployed.
+      #
+      # This is the rule that actually catches the 20 August shape, and the reason the other two
+      # cannot. During that outage every proof fetch failed, and a failed fetch *defers* the tx
+      # rather than resolving it — so the tx sat in the queue indefinitely while the outcome
+      # counters barely moved. Queue depth is the only signal that stays pinned for the whole
+      # duration of such an outage.
+      #
+      # The `absent()` arm is the other half. The gauge is published on every ack tick regardless of
+      # whether there is work, so its absence means the settlement worker has never ticked — a
+      # different failure (misconfiguration, crashed task) that no counter can express, because a
+      # counter that never increments is indistinguishable from one that does not exist.
+      #
+      # min_over_time over 3h: the queue legitimately holds txs for minutes while destination
+      # finality and attestation complete. Never draining across three hours is not latency.
+      # ---------------------------------------------------------------------------------------
+      - title: usc-devnet - Relayer settlement queue not draining
+        condition: C
+        for: 15m
+        isPaused: true
+        noDataState: NoData
+        execErrState: Error
+        labels:
+          network: usc-devnet
+        annotations:
+          summary: usc-devnet - Relayer settlement queue not draining
+          description: >-
+            Either the relayer settlement queue never returned to empty in the last 3 hours, or
+            relayer_settlement_queue_depth is absent entirely. The first means settlement attempts
+            are being deferred indefinitely, which is the shape of the 20 August two-day outage: a
+            failing proof fetch re-defers the tx rather than resolving it, so the queue stays full
+            while the outcome counters barely move. The second means the ack worker has never
+            ticked, because that gauge is published every tick whether or not there is work. Start
+            with proof-gen, then the ack signer balance and the Creditcoin RPC.
+            PAUSED until a relayer carrying relayer_settlement_queue_depth is deployed to
+            usc-devnet — unpause then, and confirm with
+            relayer_settlement_queue_depth{cluster="usc-devnet-cluster"}.
+        notification_settings:
+          receiver: Slack-Incident-Devnet
+        data:
+          - refId: A
+            datasourceUid: grafanacloud-prom
+            relativeTimeRange:
+              from: 11100
+              to: 0
+            model:
+              refId: A
+              editorMode: code
+              instant: true
+              range: false
+              expr: |
+                (max(min_over_time(relayer_settlement_queue_depth{cluster="usc-devnet-cluster"}[3h])) or vector(0))
+                +
+                (absent(relayer_settlement_queue_depth{cluster="usc-devnet-cluster"}) or vector(0))
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+                  reducer:
+                    type: last
+                  operator:
+                    type: and
