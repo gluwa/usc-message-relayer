@@ -426,6 +426,11 @@ impl State {
                      reobservation"
                 );
             }
+            // `observe_threshold` is true, so this records `time_to_threshold` measured from the
+            // slot's `inserted_at` — a moment ago. That is not a broken metric: it has always
+            // meant "how long after *we* index a message do we reach quorum", and a buffered
+            // quorum legitimately reaches it instantly. Expect that histogram to collapse toward
+            // zero once this ships, and read attestation latency off the attestor side instead.
             Self::dispatch_if_ready(chain_key, hash, route, metrics, true, Instant::now())
         };
 
@@ -885,6 +890,12 @@ impl RouteState {
 
     /// Bound the number of distinct not-yet-indexed hashes held, oldest first. Per-hash size is
     /// already bounded by the attestor set, since every key is an allowlisted recovered signer.
+    ///
+    /// Reaching this cap requires an allowlisted attestor's key, because `buffer_early_vote`
+    /// applies the allowlist before inserting. So evicting a legitimate buffered vote by flooding
+    /// distinct hashes is not open to an arbitrary peer — it costs a compromised attestor, who has
+    /// strictly better attacks available. Oldest-first is still the right eviction order: the
+    /// oldest unindexed hash is the one least likely to ever be indexed.
     fn evict_early_overflow(&mut self) {
         while self.early_votes.len() > self.cache_max {
             let Some(oldest) = self
