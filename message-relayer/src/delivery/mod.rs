@@ -20,7 +20,7 @@
 //! does not block the others.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, Bytes, B256};
@@ -77,6 +77,14 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// `getMessageInfo` ABI-decodes to junk), so we ignore it and estimate rather than pin an
 /// unincludable `.gas()` on every delivery for the route.
 const MAX_FUNDED_GAS: u64 = 100_000_000;
+
+/// How far past `deliveryDeadline` local time must be before the top-up window counts as closed.
+///
+/// `RelayerContract._checkTopUp` compares the deadline against the *source chain's*
+/// `block.timestamp`, and this worker has no source-chain clock on the delivery path, so the margin
+/// absorbs host-to-chain skew. The asymmetry is deliberate: being late to give up costs a handful of
+/// extra retries, whereas being early would strand a message that could still have been rescued.
+const TOP_UP_DEADLINE_GRACE: Duration = Duration::from_secs(900);
 
 /// Bounded, permissionless `retryPendingMessage` schedule after a delivery lands in the
 /// `MessagePending` state (dApp callback reverted). Backoff gives the destination dApp time to
@@ -219,26 +227,26 @@ pub async fn run(
                 // to estimation. The read is bounded by FUNDED_GAS_READ_TIMEOUT: it runs in this
                 // serial worker's critical path, so an unbounded await on a stalled source RPC would
                 // wedge the whole route (and starve the cancel branch) — the same hazard RECEIPT_TIMEOUT guards.
-                let funded_gas = match (&source_provider, route.relayer_contract_address) {
+                let funding = match (&source_provider, route.relayer_contract_address) {
                     (Some(p), Some(relayer_contract)) => {
                         match tokio::time::timeout(
                             FUNDED_GAS_READ_TIMEOUT,
-                            funded_gas_limit(p, relayer_contract, job.message_id),
+                            read_message_funding(p, relayer_contract, job.message_id),
                         ).await {
-                            Ok(Ok(g)) => g,
+                            Ok(Ok(f)) => f,
                             Ok(Err(err)) => {
                                 warn!(chain_key, message_id = %job.message_id, %err,
                                     "could not read funded gasLimit; falling back to gas estimation (fee may be unclaimable)");
-                                None
+                                MessageFunding::unknown()
                             }
                             Err(_) => {
                                 warn!(chain_key, message_id = %job.message_id, timeout_secs = FUNDED_GAS_READ_TIMEOUT.as_secs(),
                                     "funded gasLimit read timed out; falling back to gas estimation (fee may be unclaimable)");
-                                None
+                                MessageFunding::unknown()
                             }
                         }
                     }
-                    _ => None,
+                    _ => MessageFunding::unknown(),
                 };
                 let outcome = match handle_job(
                     &route,
@@ -247,7 +255,7 @@ pub async fn run(
                     signer_address,
                     &broadcast_locks,
                     &job,
-                    funded_gas,
+                    funding,
                     metrics.as_ref(),
                 ).await {
                     Ok(outcome) => outcome,
@@ -279,28 +287,90 @@ pub async fn run(
 /// message has no funded route (payer unset / gasLimit 0) or the value is out of sane range, so
 /// delivery falls back to estimation; `Err` only on an RPC/transport failure (the caller logs and
 /// also falls back).
-async fn funded_gas_limit<P: Provider>(
+async fn read_message_funding<P: Provider>(
     source_provider: &P,
     relayer_contract: Address,
     message_id: B256,
-) -> Result<Option<u64>> {
+) -> Result<MessageFunding> {
     let ledger = IRelayerContract::new(relayer_contract, source_provider);
     let info = ledger
         .getMessageInfo(message_id)
         .call()
         .await
         .context("RelayerContract.getMessageInfo failed")?;
+
+    // Read from the same struct rather than a second call: `deliveryDeadline` and `relaySettled`
+    // arrive alongside `gasLimit` and were previously discarded, which is why an unrescuable
+    // message could be retried forever at no apparent cost.
+    let delivery_deadline = Some(info.deliveryDeadline.saturating_to::<u64>());
+    let relay_settled = info.relaySettled;
+
     if info.gasLimit.is_zero() {
-        return Ok(None);
+        return Ok(MessageFunding {
+            gas: None,
+            delivery_deadline,
+            relay_settled,
+        });
     }
     // Guard against a misconfigured contract address decoding to junk: an absurd gasLimit would
     // otherwise pin an unincludable `.gas()` on every delivery. Ignore it and estimate instead.
+    // The other fields decoded from the same junk are not trustworthy either, so drop them too and
+    // stay permissive — never terminate a delivery on the strength of a bad read.
     if info.gasLimit > alloy::primitives::U256::from(MAX_FUNDED_GAS) {
         tracing::warn!(%relayer_contract, gas_limit = %info.gasLimit,
             "RelayerContract.getMessageInfo returned an implausible gasLimit; ignoring (will estimate)");
-        return Ok(None);
+        return Ok(MessageFunding::unknown());
     }
-    Ok(Some(info.gasLimit.saturating_to::<u64>()))
+    Ok(MessageFunding {
+        gas: Some(info.gasLimit.saturating_to::<u64>()),
+        delivery_deadline,
+        relay_settled,
+    })
+}
+
+/// The source-chain fee-ledger state a delivery attempt needs: how much gas is funded, and whether
+/// a `topUpGasLimit` could still raise it.
+#[derive(Debug, Clone, Copy, Default)]
+struct MessageFunding {
+    /// Funded `gasLimit` to pin the delivery tx to, when it is non-zero and plausible.
+    gas: Option<u64>,
+    /// `MessageInfo.deliveryDeadline`, or `None` when the ledger could not be read.
+    delivery_deadline: Option<u64>,
+    /// `MessageInfo.relaySettled`.
+    relay_settled: bool,
+}
+
+impl MessageFunding {
+    /// Ledger state could not be established (no relayer contract configured, read error, read
+    /// timeout, or a junk decode). Deliberately permissive on every field: an unknown ledger must
+    /// behave exactly as it did before this tracking existed.
+    fn unknown() -> Self {
+        Self::default()
+    }
+
+    /// Why a `topUpGasLimit` can no longer rescue this message, or `None` if one could still land.
+    ///
+    /// Both conditions are hard reverts in `RelayerContract._checkTopUp`, so an under-funded
+    /// message in either state is undeliverable for good — no amount of retrying changes that.
+    fn top_up_foreclosed(&self, now: Option<u64>) -> Option<&'static str> {
+        if self.relay_settled {
+            // Clock-free and definitive: `_checkTopUp` reverts `RelayAlreadySettled` from here on.
+            return Some("relay fee already settled (RelayAlreadySettled)");
+        }
+        let (deadline, now) = (self.delivery_deadline?, now?);
+        let grace = TOP_UP_DEADLINE_GRACE.as_secs();
+        (now > deadline.saturating_add(grace))
+            .then_some("delivery deadline passed (DeliveryDeadlineReached)")
+    }
+}
+
+/// Local wall-clock as a unix timestamp, or `None` if the clock is before the epoch — in which case
+/// callers stay permissive rather than guessing.
+fn now_unix() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 /// Note on liveness: this function deliberately does **not** heartbeat. The caller's tick cannot
@@ -321,7 +391,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
     signer_address: Address,
     broadcast_locks: &Arc<crate::broadcast::BroadcastLocks>,
     job: &DeliveryJob,
-    funded_gas: Option<u64>,
+    funding: MessageFunding,
     metrics: &dyn crate::prom::MetricsTrait,
 ) -> Result<DeliveryResultKind> {
     let inbox = IInbox::new(route.inbox_address, provider);
@@ -377,7 +447,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
     // burning the relayer's gas for no claimable delivery. Estimate first; if the funded gas can't
     // cover it, don't submit — return non-terminally so the pool retries (leaving a window for a
     // `topUpGasLimit`) rather than dropping a message that becomes deliverable once topped up.
-    if let Some(gas) = funded_gas {
+    if let Some(gas) = funding.gas {
         // Bounded like the getMessageInfo read: this estimate sits on the same serial critical
         // path, so an unbounded await on a stalled destination RPC would wedge the route.
         let est = tokio::time::timeout(
@@ -394,6 +464,24 @@ async fn handle_job<P: Provider + Clone + 'static>(
         .await;
         match est {
             Ok(Ok(est)) if est > gas => {
+                // Retrying only makes sense while a `topUpGasLimit` could still raise the funded
+                // gas. Once the delivery deadline has passed or the relay fee is settled, a top-up
+                // reverts, so the message is undeliverable for good and the retry is pure waste —
+                // observed on usc-devnet as one message retried 469 times over 2.5 days, holding
+                // `pool_messages_pending` at 1 the whole time and drowning the stuck-pool signal.
+                if let Some(reason) = funding.top_up_foreclosed(now_unix()) {
+                    warn!(
+                        chain_key = route.chain_key,
+                        message_id = %job.message_id,
+                        estimate = est,
+                        funded = gas,
+                        reason,
+                        "delivery is under-funded and can no longer be topped up — giving up. The \
+                         funded gasLimit was set at publish time and cannot now be raised; this \
+                         needs fixing on the publisher/quoter side, not here."
+                    );
+                    return Ok(DeliveryResultKind::Terminal);
+                }
                 warn!(
                     chain_key = route.chain_key,
                     message_id = %job.message_id,
@@ -462,7 +550,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
             Bytes::from(job.payload.clone()),
             Bytes::from(job.votes_calldata.clone()),
         );
-        if let Some(gas) = funded_gas {
+        if let Some(gas) = funding.gas {
             tx = tx.gas(gas);
         }
         // `send()` is several RPC round trips (gas, fee, nonce, `eth_sendRawTransaction`) and alloy's
@@ -748,6 +836,75 @@ fn spawn_pending_retry<P: Provider + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -------------------------------------------------------------------------------------
+    // Top-up foreclosure. An under-funded delivery is retried on the assumption that a
+    // `topUpGasLimit` may still raise the funded gas. Both conditions below make that a hard
+    // revert in `RelayerContract._checkTopUp`, so retrying past them is unbounded waste — this is
+    // what let one usc-devnet message accumulate 469 attempts over 2.5 days.
+    // -------------------------------------------------------------------------------------
+
+    const T0: u64 = 1_787_610_830; // the deadline of the message that motivated this
+
+    fn funding(deadline: Option<u64>, relay_settled: bool) -> MessageFunding {
+        MessageFunding {
+            gas: Some(100_000),
+            delivery_deadline: deadline,
+            relay_settled,
+        }
+    }
+
+    #[test]
+    fn a_settled_relay_forecloses_top_up_without_consulting_the_clock() {
+        // Clock-free on purpose: `RelayAlreadySettled` does not depend on time, and passing `None`
+        // proves the check does not silently rely on a clock being available.
+        assert!(funding(Some(T0), true).top_up_foreclosed(None).is_some());
+        assert!(funding(None, true).top_up_foreclosed(None).is_some());
+    }
+
+    #[test]
+    fn a_deadline_past_the_grace_window_forecloses_top_up() {
+        let grace = TOP_UP_DEADLINE_GRACE.as_secs();
+        assert!(funding(Some(T0), false)
+            .top_up_foreclosed(Some(T0 + grace + 1))
+            .is_some());
+    }
+
+    #[test]
+    fn a_deadline_inside_the_grace_window_still_allows_top_up() {
+        // The contract compares against the *source chain's* clock, not ours, so a deadline that
+        // has only just passed by our reckoning must not strand a still-rescuable message.
+        let grace = TOP_UP_DEADLINE_GRACE.as_secs();
+        assert!(funding(Some(T0), false)
+            .top_up_foreclosed(Some(T0))
+            .is_none());
+        assert!(funding(Some(T0), false)
+            .top_up_foreclosed(Some(T0 + grace))
+            .is_none());
+    }
+
+    #[test]
+    fn a_healthy_message_is_never_foreclosed() {
+        assert!(funding(Some(T0), false)
+            .top_up_foreclosed(Some(T0 - 3600))
+            .is_none());
+    }
+
+    /// An unreadable ledger must behave exactly as it did before this tracking existed: retry.
+    /// Terminating a delivery on the strength of a failed read would turn a transient source-RPC
+    /// outage into permanent non-delivery, which is the failure class C1r exists to prevent.
+    #[test]
+    fn an_unknown_ledger_never_forecloses() {
+        let u = MessageFunding::unknown();
+        assert!(u.top_up_foreclosed(Some(T0 + 10_000_000)).is_none());
+        assert!(u.top_up_foreclosed(None).is_none());
+        assert!(u.gas.is_none(), "unknown funding must not pin a gas limit");
+    }
+
+    #[test]
+    fn a_missing_local_clock_does_not_foreclose_on_the_deadline_alone() {
+        assert!(funding(Some(T0), false).top_up_foreclosed(None).is_none());
+    }
 
     #[test]
     fn already_validated_matches_all_dialects() {
