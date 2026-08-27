@@ -170,6 +170,16 @@ groups:
       # different failure (misconfiguration, crashed task) that no counter can express, because a
       # counter that never increments is indistinguishable from one that does not exist.
       #
+      # NOTE the `max()` wrapped around `absent()`. It is load-bearing, not decoration. `absent()`
+      # returns a series carrying the selector's equality matchers (`{cluster="usc-devnet-cluster"}`),
+      # while `vector(0)` is unlabelled. `or` keeps right-hand series whose labels match nothing on
+      # the left, so `absent(...) or vector(0)` yields TWO series when the gauge is missing:
+      # `{cluster="..."} 1` and `{} 0`. The `+` then matches on the full label set, pairs `{}` with
+      # `{}`, discards the labelled absent signal, and returns a hard 0 — the rule evaluates as
+      # HEALTHY while the settlement worker is entirely gone. Verified against the live stack, where
+      # the gauge does not exist yet: the unwrapped form returns 0, the `max()` form returns 1.
+      # `max()` with no `by` drops all labels, so both sides are unlabelled and the arms add.
+      #
       # min_over_time over 3h: the queue legitimately holds txs for minutes while destination
       # finality and attestation complete. Never draining across three hours is not latency.
       # ---------------------------------------------------------------------------------------
@@ -210,7 +220,7 @@ groups:
               expr: |
                 (max(min_over_time(relayer_settlement_queue_depth{cluster="usc-devnet-cluster"}[3h])) or vector(0))
                 +
-                (absent(relayer_settlement_queue_depth{cluster="usc-devnet-cluster"}) or vector(0))
+                (max(absent(relayer_settlement_queue_depth{cluster="usc-devnet-cluster"})) or vector(0))
           - refId: C
             datasourceUid: __expr__
             model:
