@@ -44,6 +44,15 @@ pub trait MetricsTrait: Send + Sync + Debug {
     /// (see `crate::ack`'s `AckAndClaim` mode). Independent of `inc_ack_submission` since
     /// usc-contracts #23 decoupled the two settlements.
     fn inc_claim_submission(&self, chain_key: u64, outcome: SettlementOutcome);
+    /// Depth of the settlement queue for `chain_key` — delivered txs discovered but not yet
+    /// settled. Published every ack tick, so unlike the per-outcome counters it is present whether
+    /// or not any settlement work exists, which is what makes it usable as a liveness signal.
+    ///
+    /// A queue that *never returns to zero* is the silent-outage shape: a tx whose proof fetch
+    /// keeps failing is re-deferred rather than resolved, so it stays here indefinitely while the
+    /// outcome counters may barely move. Alert on `min_over_time(...) > 0` over a couple of hours,
+    /// and on `absent()` for the worker never having ticked at all.
+    fn set_settlement_queue_depth(&self, chain_key: u64, depth: i64);
 }
 
 /// Shared trait object — used to plumb metrics through services without leaking the concrete type.
@@ -72,6 +81,7 @@ impl MetricsTrait for NoopMetrics {
     fn inc_attestor_set_reload(&self, _chain_key: u64) {}
     fn inc_ack_submission(&self, _chain_key: u64, _outcome: SettlementOutcome) {}
     fn inc_claim_submission(&self, _chain_key: u64, _outcome: SettlementOutcome) {}
+    fn set_settlement_queue_depth(&self, _chain_key: u64, _depth: i64) {}
 }
 
 /// Concrete metrics container.
@@ -90,6 +100,7 @@ pub struct RelayerMetrics {
     attestor_set_reloads: Family<LabelChain, Counter<u64, AtomicU64>>,
     ack_submissions: Family<LabelSettlement, Counter<u64, AtomicU64>>,
     claim_submissions: Family<LabelSettlement, Counter<u64, AtomicU64>>,
+    settlement_queue_depth: Family<LabelChain, Gauge<i64, AtomicI64>>,
     cpu_usage_percent: Gauge<f64, AtomicU64>,
     memory_usage_bytes: Gauge<f64, AtomicU64>,
     thread_count: Gauge<i64, AtomicI64>,
@@ -185,6 +196,14 @@ impl RelayerMetrics {
             claim_submissions.clone(),
         );
 
+        let settlement_queue_depth = Family::default();
+        registry.register(
+            "relayer_settlement_queue_depth",
+            "Delivered txs discovered but not yet settled, per chain_key — published every ack \
+             tick so it is present even when there is no settlement work",
+            settlement_queue_depth.clone(),
+        );
+
         let cpu_usage_percent = Gauge::default();
         registry.register(
             "relayer_cpu_usage_percent",
@@ -244,6 +263,7 @@ impl RelayerMetrics {
             attestor_set_reloads,
             ack_submissions,
             claim_submissions,
+            settlement_queue_depth,
             cpu_usage_percent,
             memory_usage_bytes,
             thread_count,
@@ -388,6 +408,12 @@ impl MetricsTrait for RelayerMetrics {
             .get_or_create(&LabelSettlement { chain_key, outcome })
             .inc();
     }
+
+    fn set_settlement_queue_depth(&self, chain_key: u64, depth: i64) {
+        self.settlement_queue_depth
+            .get_or_create(&LabelChain { chain_key })
+            .set(depth);
+    }
 }
 
 /// Build the HTTP surface (`/metrics` + `/health` + `/votes/{message_hash}`). `query_tx` reaches the
@@ -516,6 +542,12 @@ pub enum SettlementOutcome {
     /// be retried. A sustained rise with no matching `Confirmed`/`Terminal` growth is exactly the
     /// silent-outage shape the settlement path has no other signal for (see the module docs).
     Failed,
+    /// Nothing was outstanding: no message in the tx required an ack, or no unsettled relay fee
+    /// remained. Counted rather than left silent so an idle settlement path is distinguishable
+    /// from a dead one — previously this case incremented nothing at all, which meant a route
+    /// that legitimately had no work and a route whose worker had stopped produced identical
+    /// (empty) metrics.
+    NothingToSettle,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -554,6 +586,26 @@ mod items {
 mod tests {
     use super::*;
 
+    /// The whole point of these two additions is that an idle settlement path is distinguishable
+    /// from a dead one. That requires the queue-depth gauge to be *present at zero* (a gauge set to
+    /// 0 still encodes; an unincremented counter family emits nothing) and the no-op outcome to
+    /// carry its own label value.
+    #[test]
+    fn an_idle_settlement_path_is_still_visible() {
+        let m = RelayerMetrics::new(&[8]);
+        m.set_settlement_queue_depth(8, 0);
+        m.inc_ack_submission(8, SettlementOutcome::NothingToSettle);
+        let body = m.encode();
+        assert!(
+            body.contains("relayer_settlement_queue_depth{chain_key=\"8\"} 0"),
+            "a zero queue depth must still be scrapeable, else absent() cannot tell idle from dead:\n{body}"
+        );
+        assert!(
+            body.contains("outcome=\"NothingToSettle\""),
+            "the no-op outcome needs its own label value:\n{body}"
+        );
+    }
+
     #[test]
     fn metrics_encode_round_trips() {
         let m = RelayerMetrics::new(&[2, 7]);
@@ -562,12 +614,14 @@ mod tests {
         m.inc_deliver_tx(7, DeliveryStatus::Submitted);
         m.inc_ack_submission(7, SettlementOutcome::Confirmed);
         m.inc_claim_submission(7, SettlementOutcome::Failed);
+        m.set_settlement_queue_depth(7, 3);
         let body = m.encode();
         assert!(body.contains("relayer_messages_indexed"));
         assert!(body.contains("relayer_votes_received"));
         assert!(body.contains("relayer_deliver_tx"));
         assert!(body.contains("relayer_ack_submissions"));
         assert!(body.contains("relayer_claim_submissions"));
+        assert!(body.contains("relayer_settlement_queue_depth"));
         assert!(body.contains("chain_keys=\"2,7\""));
     }
 

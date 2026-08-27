@@ -383,6 +383,14 @@ pub async fn run(
                     &mut done,
                 ).await;
 
+                // Publish the queue depth every tick, not only when there is work. This is the
+                // settlement path's liveness signal: the per-outcome counters say nothing while a
+                // tx is being re-deferred (a failing proof fetch defers rather than resolves), and
+                // they say nothing at all on a route with no settlement work — so an idle worker
+                // and a dead one produced identical metrics. A depth that never returns to zero is
+                // the shape of the two-day outage that hid behind a WARN.
+                metrics.set_settlement_queue_depth(chain_key, pending.len() as i64);
+
                 // Rate-limit pacing — see `crate::pacing`: a rate-limited failure arms a deferral
                 // window (checked at tick start); clean iterations decay and are never slowed.
                 pacer.after(rate_limited);
@@ -797,6 +805,14 @@ async fn acknowledge_tx<P: Provider>(
     };
 
     if !needs_ack && claim_ids.is_empty() {
+        // Count the no-op rather than returning silently. Without this, a route whose messages
+        // legitimately need no settlement is metrically identical to one whose settlement worker
+        // has stopped: both leave the outcome families empty, and an unincremented Prometheus
+        // family emits nothing at all.
+        metrics.inc_ack_submission(chain_key, SettlementOutcome::NothingToSettle);
+        if matches!(mode, SettlementMode::AckAndClaim { .. }) {
+            metrics.inc_claim_submission(chain_key, SettlementOutcome::NothingToSettle);
+        }
         return Ok(AckOutcome::Terminal(
             "nothing left to settle (no message requires an ack, no unsettled relay fee)".into(),
         ));

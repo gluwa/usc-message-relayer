@@ -56,6 +56,19 @@ impl PendingTxs {
         self.seen.contains_key(tx)
     }
 
+    /// How many txs are currently tracked, whether or not their retry time has come.
+    ///
+    /// Exported so the caller can publish it as a gauge: a settlement queue that never drains is
+    /// the exact shape of a silent settlement outage, and it is invisible in the per-outcome
+    /// counters because a tx whose proof fetch keeps failing is re-deferred rather than resolved.
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+
     pub fn remove(&mut self, tx: &B256) {
         self.seen.remove(tx);
     }
