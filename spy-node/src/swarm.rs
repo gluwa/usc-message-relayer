@@ -12,7 +12,7 @@
 //! that Rejected on local crypto judgment would P4-penalize peers for traffic the validators may
 //! accept. Only provably malformed frames (undecodable, topic/envelope mismatch) are Rejected.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -169,7 +169,7 @@ pub async fn run(
 
     info!(chains = chain_keys.len(), "✅ spy swarm online");
 
-    let mut peer_counts: HashMap<u64, usize> = HashMap::new();
+    let mut subscribed_peers: SubscribedPeers = HashMap::new();
     let mut health_tick = tokio::time::interval(HEALTH_PULSE);
     health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     health.heartbeat("swarm");
@@ -211,11 +211,57 @@ pub async fn run(
                     &setupdate_topic_to_chain,
                     &hub,
                     metrics.as_ref(),
-                    &mut peer_counts,
+                    &mut subscribed_peers,
                 );
             }
         }
     }
+}
+
+/// Distinct peers seen subscribed to each chain's vote topic.
+///
+/// A set, not a counter. The previous counter incremented on every gossipsub `Subscribed` and
+/// decremented on every `Unsubscribed`, which over-counts badly in practice: gossipsub emits no
+/// `Unsubscribed` when a peer simply disconnects, so each reconnect added one more and nothing ever
+/// took it away. On usc-devnet that read **52 subscribed peers against a verified 10-attestor
+/// fleet** — useless for fleet health, and actively misleading to anyone treating it as a peer
+/// count. Keying on `PeerId` makes the gauge idempotent under repeated `Subscribed` events and lets
+/// `ConnectionClosed` remove a peer that left without unsubscribing.
+type SubscribedPeers = HashMap<u64, HashSet<libp2p::PeerId>>;
+
+/// Record `peer_id` as subscribed to `chain_key`. Returns the new distinct count, or `None` if the
+/// peer was already known — a duplicate `Subscribed` must not move the gauge.
+fn note_subscribed(
+    peers: &mut SubscribedPeers,
+    chain_key: u64,
+    peer_id: libp2p::PeerId,
+) -> Option<usize> {
+    let entry = peers.entry(chain_key).or_default();
+    entry.insert(peer_id).then_some(entry.len())
+}
+
+/// Drop `peer_id` from `chain_key`. Returns the new distinct count, or `None` if it was not there.
+fn note_unsubscribed(
+    peers: &mut SubscribedPeers,
+    chain_key: u64,
+    peer_id: &libp2p::PeerId,
+) -> Option<usize> {
+    let entry = peers.get_mut(&chain_key)?;
+    entry.remove(peer_id).then_some(entry.len())
+}
+
+/// Drop `peer_id` from every chain it was subscribed to. Returns `(chain_key, new_count)` for each
+/// chain that actually changed, so a disconnect corrects every gauge the peer was counted in.
+fn note_disconnected(peers: &mut SubscribedPeers, peer_id: &libp2p::PeerId) -> Vec<(u64, usize)> {
+    peers
+        .iter_mut()
+        .filter_map(|(&chain_key, set)| set.remove(peer_id).then_some((chain_key, set.len())))
+        .collect()
+}
+
+fn report_peer_count(chain_key: u64, count: usize, hub: &Hub, metrics: &SpyMetrics) {
+    metrics.set_subscribed_peers(chain_key, i64::try_from(count).unwrap_or(i64::MAX));
+    hub.publish(SpyEvent::peer_status(chain_key, count));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -227,7 +273,7 @@ fn handle_swarm_event(
     setupdate_topic_to_chain: &HashMap<TopicHash, u64>,
     hub: &Hub,
     metrics: &SpyMetrics,
-    peer_counts: &mut HashMap<u64, usize>,
+    subscribed_peers: &mut SubscribedPeers,
 ) {
     match event {
         libp2p::swarm::SwarmEvent::Behaviour(RelayerBehaviorEvent::Identify(
@@ -275,10 +321,9 @@ fn handle_swarm_event(
             libp2p::gossipsub::Event::Subscribed { peer_id, topic },
         )) => {
             if let Some(&chain_key) = vote_topic_to_chain.get(&topic) {
-                let entry = peer_counts.entry(chain_key).or_default();
-                *entry += 1;
-                metrics.set_subscribed_peers(chain_key, i64::try_from(*entry).unwrap_or(i64::MAX));
-                hub.publish(SpyEvent::peer_status(chain_key, *entry));
+                if let Some(count) = note_subscribed(subscribed_peers, chain_key, peer_id) {
+                    report_peer_count(chain_key, count, hub, metrics);
+                }
             }
             trace!(%peer_id, %topic, "peer subscribed");
         }
@@ -286,10 +331,9 @@ fn handle_swarm_event(
             libp2p::gossipsub::Event::Unsubscribed { peer_id, topic },
         )) => {
             if let Some(&chain_key) = vote_topic_to_chain.get(&topic) {
-                let entry = peer_counts.entry(chain_key).or_default();
-                *entry = entry.saturating_sub(1);
-                metrics.set_subscribed_peers(chain_key, i64::try_from(*entry).unwrap_or(i64::MAX));
-                hub.publish(SpyEvent::peer_status(chain_key, *entry));
+                if let Some(count) = note_unsubscribed(subscribed_peers, chain_key, &peer_id) {
+                    report_peer_count(chain_key, count, hub, metrics);
+                }
             }
             trace!(%peer_id, %topic, "peer unsubscribed");
         }
@@ -299,8 +343,22 @@ fn handle_swarm_event(
         libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             debug!(%peer_id, "🔗 connection established");
         }
-        libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, .. } => {
-            debug!(%peer_id, "⛓️‍💥 connection closed");
+        libp2p::swarm::SwarmEvent::ConnectionClosed {
+            peer_id,
+            num_established,
+            ..
+        } => {
+            debug!(%peer_id, num_established, "⛓️‍💥 connection closed");
+            // gossipsub does NOT emit `Unsubscribed` when a peer disconnects — it drops the peer
+            // from its topic meshes silently. Without this, a peer that reconnects raises the
+            // gauge again on its fresh `Subscribed` and never lowers it, so the number climbs with
+            // churn instead of tracking the fleet. Only act once the *last* connection to the peer
+            // is gone; libp2p may hold several at a time.
+            if num_established == 0 {
+                for (chain_key, count) in note_disconnected(subscribed_peers, &peer_id) {
+                    report_peer_count(chain_key, count, hub, metrics);
+                }
+            }
         }
         libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             debug!(?peer_id, %error, "outgoing connection error");
@@ -456,6 +514,60 @@ fn recover_signer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------------------------
+    // Subscribed-peer accounting. The gauge this feeds read 52 against a verified 10-attestor
+    // fleet, because it was a counter that only ever went up on reconnect. These cover the three
+    // ways the set has to stay honest.
+    // ---------------------------------------------------------------------------------------
+
+    fn peer(seed: u8) -> libp2p::PeerId {
+        libp2p::identity::Keypair::ed25519_from_bytes([seed; 32])
+            .expect("valid key")
+            .public()
+            .to_peer_id()
+    }
+
+    #[test]
+    fn repeated_subscribed_from_one_peer_counts_once() {
+        let mut peers: SubscribedPeers = HashMap::new();
+        let p = peer(1);
+        assert_eq!(note_subscribed(&mut peers, 8, p), Some(1));
+        // A reconnect re-emits `Subscribed` with no intervening `Unsubscribed`. This is the exact
+        // event sequence that inflated the gauge to 52.
+        assert_eq!(note_subscribed(&mut peers, 8, p), None);
+        assert_eq!(note_subscribed(&mut peers, 8, p), None);
+        assert_eq!(peers[&8].len(), 1);
+    }
+
+    #[test]
+    fn unsubscribe_removes_only_that_peer_and_never_underflows() {
+        let mut peers: SubscribedPeers = HashMap::new();
+        note_subscribed(&mut peers, 8, peer(1));
+        note_subscribed(&mut peers, 8, peer(2));
+        assert_eq!(note_unsubscribed(&mut peers, 8, &peer(1)), Some(1));
+        // Unsubscribe from a peer we never counted, and from a chain we have no set for: both must
+        // be no-ops rather than driving a count negative, which the old saturating_sub masked.
+        assert_eq!(note_unsubscribed(&mut peers, 8, &peer(1)), None);
+        assert_eq!(note_unsubscribed(&mut peers, 99, &peer(2)), None);
+        assert_eq!(peers[&8].len(), 1);
+    }
+
+    #[test]
+    fn disconnect_clears_the_peer_from_every_chain_it_was_counted_in() {
+        let mut peers: SubscribedPeers = HashMap::new();
+        let leaving = peer(1);
+        note_subscribed(&mut peers, 8, leaving);
+        note_subscribed(&mut peers, 7, leaving);
+        note_subscribed(&mut peers, 8, peer(2));
+
+        let mut changed = note_disconnected(&mut peers, &leaving);
+        changed.sort_unstable();
+        assert_eq!(changed, vec![(7, 0), (8, 1)]);
+
+        // Nothing left to correct on a second disconnect for the same peer.
+        assert!(note_disconnected(&mut peers, &leaving).is_empty());
+    }
 
     /// Sign a vote with a real key and run it through `observe_vote`: it must Accept, stream one
     /// event, and annotate `signature_valid: true` with the recovered signer.
