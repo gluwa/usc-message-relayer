@@ -26,7 +26,9 @@ use write_ability::protocol::chain_key_to_bytes32;
 
 pub mod factory;
 
-pub use factory::{ConfigOverrideResolver, FactoryResolver, OutboxResolver, ResolvedOutbox};
+pub use factory::{
+    ConfigOverrideResolver, FactoryResolver, OutboxResolver, RegistryResolver, ResolvedOutbox,
+};
 
 /// Default poll cadence for re-checking whether [`OutboxResolver::resolve`] now returns a
 /// different address (an Outbox rotation). Independent of, and much slower than,

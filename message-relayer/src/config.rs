@@ -73,6 +73,11 @@ pub struct ChainRoute {
     pub chain_key: u64,
     pub creditcoin_chain_id: u64,
     pub outbox_address: Option<Address>,
+    /// `OutboxDeployer` (or, post-asc-contracts#38, `OutboxDiscovery`) on the source chain. When
+    /// set, the Outbox is resolved by reading that registry instead of scanning the factory's
+    /// `OutboxCreated` logs — see [`crate::events::RegistryResolver`] for why that matters.
+    /// Ignored when `outbox_address` is set, since an explicit address needs no discovery.
+    pub outbox_registry_address: Option<Address>,
     pub destination_rpc_url: String,
     pub inbox_address: Address,
     pub signer_key: Option<String>,
@@ -343,6 +348,10 @@ pub struct ChainRouteFile {
     pub creditcoin_chain_id: u64,
     #[serde(default)]
     pub outbox_address: Option<String>,
+    /// Set this to move the route off log-scanning discovery and onto an authoritative registry
+    /// read. See [`ChainRoute::outbox_registry_address`].
+    #[serde(default)]
+    pub outbox_registry_address: Option<String>,
     pub destination_rpc_url: String,
     pub inbox_address: String,
     #[serde(default)]
@@ -475,6 +484,17 @@ impl ChainRouteFile {
             .map(parse_address)
             .transpose()
             .with_context(|| format!("invalid outbox_address for chain_key {}", self.chain_key))?;
+        let outbox_registry_address = self
+            .outbox_registry_address
+            .as_deref()
+            .map(parse_address)
+            .transpose()
+            .with_context(|| {
+                format!(
+                    "invalid outbox_registry_address for chain_key {}",
+                    self.chain_key
+                )
+            })?;
         let relayer_contract_address = self
             .relayer_contract_address
             .as_deref()
@@ -572,6 +592,7 @@ impl ChainRouteFile {
             chain_key: self.chain_key,
             creditcoin_chain_id: self.creditcoin_chain_id,
             outbox_address,
+            outbox_registry_address,
             destination_rpc_url: self.destination_rpc_url,
             inbox_address,
             signer_key: self.signer_key,
