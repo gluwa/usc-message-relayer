@@ -7,7 +7,7 @@ authors = ["Gluwa Inc. Developer Support <support.dev@gluwa.com>"]
 edition = "2021"
 license = "Unlicense"
 publish = false
-repository = "https://github.com/gluwa/usc-message-relayer/"
+repository = "https://github.com/gluwa/asc-message-relayer/"
 version = "0.6.0"
 
 # Versions are kept aligned with the creditcoin3 workspace the attestor builds from —
