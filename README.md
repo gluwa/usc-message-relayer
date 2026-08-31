@@ -1,6 +1,6 @@
-# usc-message-relayer
+# asc-message-relayer
 
-[![CI](https://github.com/gluwa/usc-message-relayer/actions/workflows/ci.yml/badge.svg)](https://github.com/gluwa/usc-message-relayer/actions/workflows/ci.yml)
+[![CI](https://github.com/gluwa/asc-message-relayer/actions/workflows/ci.yml/badge.svg)](https://github.com/gluwa/asc-message-relayer/actions/workflows/ci.yml)
 
 Off-chain relayer for **USC write-ability** — Creditcoin's cross-chain messaging. It carries
 messages published on Creditcoin to destination EVM chains (attestor-vote-based), and carries
