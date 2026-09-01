@@ -22,8 +22,8 @@ use alloy::primitives::keccak256;
 use alloy::sol_types::{SolCall, SolError, SolEvent};
 use std::path::{Path, PathBuf};
 use write_ability::abi::{
-    IAcknowledgmentValidator, IInbox, IOutbox, IOutboxDeployer, IOutboxFactory, IRelayerContract,
-    IVoteValidator,
+    IAcknowledgmentValidator, IInbox, IMessageReceiver, IOutbox, IOutboxDeployer, IOutboxFactory,
+    IRelayerContract, IVoteValidator,
 };
 
 /// Canonical ABI type for one artifact input/output, expanding structs: `tuple` →
@@ -241,6 +241,18 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         "error",
         "MessageAlreadyValidated()",
         &IInbox::MessageAlreadyValidated::SELECTOR,
+    );
+
+    // --- MessageReceiverBase (destination chain) ---
+    // Only the duplicate guard is mirrored; delivery treats its selector as idempotent success.
+    let receiver = Artifact::load(
+        &contracts,
+        "abstract/MessageReceiverBase.sol/MessageReceiverBase.json",
+    );
+    receiver.assert_mirrored(
+        "error",
+        "MessageAlreadyProcessed()",
+        &IMessageReceiver::MessageAlreadyProcessed::SELECTOR,
     );
 
     // --- EOAValidator (destination chain) ---
