@@ -161,6 +161,19 @@ sol! {
         error MessageAlreadyValidated(bytes32 messageId);
     }
 
+    /// Destination-side receiver base (`MessageReceiverBase.sol`). Mirrored for one reason: its
+    /// duplicate guard reverts `MessageAlreadyProcessed` when a message that already ran the
+    /// receiver callback is delivered again (relayer restart replaying a checkpoint, or losing a
+    /// race past the Inbox's own guard). Delivery classifies that selector as idempotent success —
+    /// without it a replayed delivery logs a terminal ERROR and counts as `Reverted` for a message
+    /// that was in fact processed (seen on usc-devnet, 2026-09-01).
+    #[sol(rpc)]
+    #[derive(Debug)]
+    contract IMessageReceiver {
+        /// `messageId` already ran this receiver's callback; delivering it again is a no-op.
+        error MessageAlreadyProcessed(bytes32 messageId);
+    }
+
     #[sol(rpc)]
     #[derive(Debug)]
     contract IVoteValidator {

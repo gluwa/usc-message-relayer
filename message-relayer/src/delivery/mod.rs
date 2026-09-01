@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::abi::{IInbox, IRelayerContract};
+use crate::abi::{IInbox, IMessageReceiver, IRelayerContract};
 use crate::config::{ChainRoute, DeliveryConfig};
 use crate::prom::{DeliveryStatus, Metrics};
 use crate::revert::{has_selector, is_revert};
@@ -415,7 +415,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
             // PoC §6.5). Any other *revert* is deterministic, so we don't burn gas. A transport
             // failure (RPC blip, timeout) is neither — the pool retries it with backoff; treating
             // it as terminal would silently drop a deliverable message.
-            if revert_already_validated(&err) {
+            if revert_duplicate_delivery(&err) {
                 debug!(chain_key = route.chain_key, message_id = %job.message_id,
                     "simulate detected already-validated; idempotent success");
                 metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::AlreadyValidated);
@@ -500,7 +500,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
             // errors are retryable (we must not send unverified: an under-funded message would
             // OOG and be dropped as terminal — the exact failure this guard exists to prevent).
             Ok(Err(err)) => {
-                if revert_already_validated(&err) {
+                if revert_duplicate_delivery(&err) {
                     debug!(chain_key = route.chain_key, message_id = %job.message_id,
                         "estimate detected already-validated; idempotent success");
                     metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::AlreadyValidated);
@@ -633,7 +633,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
                     }
                 }
             }
-            Err(err) if revert_already_validated(&err) => {
+            Err(err) if revert_duplicate_delivery(&err) => {
                 // Lost the race to another relayer (PoC §6.5). Treat as success.
                 break SendOutcome::AlreadyValidated;
             }
@@ -741,15 +741,25 @@ enum SendOutcome {
 /// Whether a `deliverMessage` error means the inbox already accepted this message (idempotent
 /// success — we lost the race to another relayer, or a previous stuck attempt mined).
 ///
-/// Matched three ways because node dialects differ: the deployed `SimpleInbox` rejects duplicates
-/// with `require(..., "Already validated")` (a *string* revert), the custom error name covers
-/// future inbox versions on nodes that decode names, and the selector covers nodes that return
-/// raw revert data (see [`crate::revert`]).
-fn revert_already_validated(err: &impl std::fmt::Display) -> bool {
+/// Whether a delivery revert means the message was already delivered, so retrying is pointless and
+/// the outcome is an idempotent success. Two guards can say so, and both must be matched:
+///
+///  * the **Inbox** duplicate guard — `MessageAlreadyValidated` on current inboxes, or the deployed
+///    `SimpleInbox`'s `require(..., "Already validated")` string revert;
+///  * the **receiver** duplicate guard — `MessageReceiverBase.MessageAlreadyProcessed`, which fires
+///    when the callback already ran for this messageId. A restart replaying the checkpoint hit this
+///    on usc-devnet (2026-09-01): the delivery was long since processed, but because only the Inbox
+///    guard was matched here it logged a terminal ERROR and counted as `Reverted`.
+///
+/// Each is matched three ways because node dialects differ: the revert *string*, the decoded
+/// custom-error *name*, and the raw 4-byte *selector* (see [`crate::revert`]).
+fn revert_duplicate_delivery(err: &impl std::fmt::Display) -> bool {
     let s = err.to_string();
     s.contains("Already validated")
         || s.contains("MessageAlreadyValidated")
         || has_selector(&s, IInbox::MessageAlreadyValidated::SELECTOR)
+        || s.contains("MessageAlreadyProcessed")
+        || has_selector(&s, IMessageReceiver::MessageAlreadyProcessed::SELECTOR)
 }
 
 /// Bounded, detached best-effort `retryPendingMessage` attempts. Detached because it must not
@@ -907,24 +917,40 @@ mod tests {
     }
 
     #[test]
-    fn already_validated_matches_all_dialects() {
+    fn duplicate_delivery_matches_all_dialects() {
         // The deployed SimpleInbox string revert.
-        assert!(revert_already_validated(
+        assert!(revert_duplicate_delivery(
             &"execution reverted: Already validated"
         ));
         // Decoded custom-error name (future inbox versions).
-        assert!(revert_already_validated(
+        assert!(revert_duplicate_delivery(
             &"reverted: MessageAlreadyValidated"
         ));
         // Raw selector data (Creditcoin-style node).
         let sel = alloy::hex::encode(IInbox::MessageAlreadyValidated::SELECTOR);
-        assert!(revert_already_validated(&format!(
+        assert!(revert_duplicate_delivery(&format!(
             "VM Exception while processing transaction: revert, data: \"0x{sel}\""
         )));
+        // The receiver-side guard, decoded name (what a name-decoding node prints).
+        assert!(revert_duplicate_delivery(
+            &"reverted: MessageAlreadyProcessed"
+        ));
+        // The receiver-side guard as raw selector data — the usc-devnet 2026-09-01 case verbatim,
+        // which the Inbox-only matching classified as a terminal revert.
+        // Pin the selector to the on-chain artifact value so a mirror edit that changes the
+        // signature (and thus silently stops matching real reverts) fails here, not on devnet.
+        assert_eq!(
+            IMessageReceiver::MessageAlreadyProcessed::SELECTOR,
+            [0x73, 0x0a, 0xc1, 0xe2],
+        );
+        let sel = alloy::hex::encode(IMessageReceiver::MessageAlreadyProcessed::SELECTOR);
+        assert!(revert_duplicate_delivery(&format!(
+            "server returned an error response: error code 3: execution reverted, data: \"0x{sel}635ab2e71674df43451fb64cb3b06745c8ff56561727aaf688181774f5fb04c6\""
+        )));
         // A transport failure is not a duplicate.
-        assert!(!revert_already_validated(&"connection refused"));
+        assert!(!revert_duplicate_delivery(&"connection refused"));
         // An unrelated revert is not a duplicate either.
-        assert!(!revert_already_validated(
+        assert!(!revert_duplicate_delivery(
             &"execution reverted: VotesBelowThreshold"
         ));
     }
