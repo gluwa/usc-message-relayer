@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use alloy::primitives::Address;
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
@@ -53,6 +54,9 @@ pub trait MetricsTrait: Send + Sync + Debug {
     /// outcome counters may barely move. Alert on `min_over_time(...) > 0` over a couple of hours,
     /// and on `absent()` for the worker never having ticked at all.
     fn set_settlement_queue_depth(&self, chain_key: u64, depth: i64);
+    /// Native-token balance (in ether units) of the signer funding `role` on `chain_key`. Polled
+    /// by `crate::balance`; the low-balance dashboard threshold hangs off this.
+    fn set_signer_balance(&self, chain_key: u64, role: &'static str, address: Address, ether: f64);
 }
 
 /// Shared trait object — used to plumb metrics through services without leaking the concrete type.
@@ -82,6 +86,14 @@ impl MetricsTrait for NoopMetrics {
     fn inc_ack_submission(&self, _chain_key: u64, _outcome: SettlementOutcome) {}
     fn inc_claim_submission(&self, _chain_key: u64, _outcome: SettlementOutcome) {}
     fn set_settlement_queue_depth(&self, _chain_key: u64, _depth: i64) {}
+    fn set_signer_balance(
+        &self,
+        _chain_key: u64,
+        _role: &'static str,
+        _address: Address,
+        _ether: f64,
+    ) {
+    }
 }
 
 /// Concrete metrics container.
@@ -101,6 +113,7 @@ pub struct RelayerMetrics {
     ack_submissions: Family<LabelSettlement, Counter<u64, AtomicU64>>,
     claim_submissions: Family<LabelSettlement, Counter<u64, AtomicU64>>,
     settlement_queue_depth: Family<LabelChain, Gauge<i64, AtomicI64>>,
+    signer_balance: Family<LabelSigner, Gauge<f64, AtomicU64>>,
     cpu_usage_percent: Gauge<f64, AtomicU64>,
     memory_usage_bytes: Gauge<f64, AtomicU64>,
     thread_count: Gauge<i64, AtomicI64>,
@@ -204,6 +217,16 @@ impl RelayerMetrics {
             settlement_queue_depth.clone(),
         );
 
+        let signer_balance = Family::default();
+        registry.register(
+            "relayer_signer_balance_ether",
+            "Native-token balance, in ether units, of each signing wallet on the chain it spends \
+             gas on (delivery: the route's destination chain; ack/claim: the Creditcoin chain). \
+             Alert on a low threshold — an empty wallet fails sends with wording that reads like \
+             an RPC problem",
+            signer_balance.clone(),
+        );
+
         let cpu_usage_percent = Gauge::default();
         registry.register(
             "relayer_cpu_usage_percent",
@@ -264,6 +287,7 @@ impl RelayerMetrics {
             ack_submissions,
             claim_submissions,
             settlement_queue_depth,
+            signer_balance,
             cpu_usage_percent,
             memory_usage_bytes,
             thread_count,
@@ -414,6 +438,16 @@ impl MetricsTrait for RelayerMetrics {
             .get_or_create(&LabelChain { chain_key })
             .set(depth);
     }
+
+    fn set_signer_balance(&self, chain_key: u64, role: &'static str, address: Address, ether: f64) {
+        self.signer_balance
+            .get_or_create(&LabelSigner {
+                chain_key,
+                role,
+                address: address.to_string(),
+            })
+            .set(ether);
+    }
 }
 
 /// Build the HTTP surface (`/metrics` + `/health` + `/votes/{message_hash}`). `query_tx` reaches the
@@ -556,6 +590,15 @@ pub struct LabelChain {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct LabelSigner {
+    pub chain_key: u64,
+    pub role: &'static str,
+    /// Checksummed 0x address. A label, not a value, so one wallet reused across roles/chains
+    /// stays correlatable in queries.
+    pub address: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct LabelVote {
     pub chain_key: u64,
     pub outcome: VoteOutcome,
@@ -588,6 +631,26 @@ mod tests {
 
     /// The whole point of these two additions is that an idle settlement path is distinguishable
     /// from a dead one. That requires the queue-depth gauge to be *present at zero* (a gauge set to
+    /// Pins the wire shape the low-balance alert will query: metric name, the three labels, and
+    /// ether units (0.5, not 5e17) — a rename or a wei/ether mixup must fail here, not in a
+    /// silently never-firing alert.
+    #[test]
+    fn signer_balance_encodes_name_labels_and_ether_units() {
+        let m = RelayerMetrics::new(&[8]);
+        let addr: Address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+            .parse()
+            .unwrap();
+        m.set_signer_balance(8, "delivery", addr, 0.5);
+        let body = m.encode();
+        let line = body
+            .lines()
+            .find(|l| l.starts_with("relayer_signer_balance_ether{"))
+            .unwrap_or_else(|| panic!("no signer balance sample:\n{body}"));
+        for needle in ["chain_key=\"8\"", "role=\"delivery\"", "0xf39Fd6e5", " 0.5"] {
+            assert!(line.contains(needle), "missing {needle} in: {line}");
+        }
+    }
+
     /// 0 still encodes; an unincremented counter family emits nothing) and the no-op outcome to
     /// carry its own label value.
     #[test]

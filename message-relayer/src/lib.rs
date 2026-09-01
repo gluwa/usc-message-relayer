@@ -33,6 +33,7 @@ use tracing::{error, info, warn};
 pub mod abi;
 pub mod ack;
 pub mod attestor_set;
+pub mod balance;
 pub mod broadcast;
 pub mod checkpoint;
 pub mod claim;
@@ -408,6 +409,21 @@ impl Server {
             &mut tasks,
             "hardware metrics updater",
             RelayerMetrics::run_hardware_updater(self.prom_metrics.clone(), cancel.clone()),
+        );
+
+        // Signer balances (all roles, on the chain each spends gas on).
+        spawn_worker(
+            &mut tasks,
+            "signer balance watcher",
+            balance::run(
+                balance::targets_from_routes(
+                    &self.config.routes,
+                    &self.config.creditcoin_eth_rpc_url,
+                ),
+                metrics.clone(),
+                health.clone(),
+                cancel.clone(),
+            ),
         );
 
         // /metrics + /health.
