@@ -63,6 +63,18 @@ impl Health {
         }
     }
 
+    /// Every registered worker with the unix-millis of its last reported progress, sorted by
+    /// name. Read at `/metrics` scrape time to publish per-worker progress as a gauge — same
+    /// source of truth as `/health`, so the metric and the probe can never disagree about who
+    /// is wedged.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<(String, u64)> {
+        let guard = self.components.lock().expect("health mutex poisoned");
+        let mut out: Vec<(String, u64)> = guard.iter().map(|(n, &t)| (n.clone(), t)).collect();
+        out.sort();
+        out
+    }
+
     /// `(alive, stale_components)`. Alive iff every registered worker has reported within the
     /// deadline. The stale list is returned so `/health` can name the wedged worker in its body.
     #[must_use]

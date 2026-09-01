@@ -119,6 +119,7 @@ pub struct RelayerMetrics {
     thread_count: Gauge<i64, AtomicI64>,
     #[allow(dead_code)]
     start_time_seconds: Gauge<f64, AtomicU64>,
+    worker_last_success: Family<LabelWorker, Gauge<f64, AtomicU64>>,
 }
 
 impl RelayerMetrics {
@@ -260,6 +261,16 @@ impl RelayerMetrics {
             start_time_seconds.clone(),
         );
 
+        let worker_last_success = Family::default();
+        registry.register(
+            "relayer_worker_last_success_timestamp_seconds",
+            "Unix time of each worker's last successful poll iteration, from the same registry \
+             that backs /health. Workers heartbeat only on a successful iteration, so \
+             `time() - this` is how long the worker has made no forward progress — the signal \
+             that separates a healthy-but-idle relayer from a wedged one. Synced at scrape time.",
+            worker_last_success.clone(),
+        );
+
         registry.register(
             "relayer_server",
             "Relayer information",
@@ -292,6 +303,22 @@ impl RelayerMetrics {
             memory_usage_bytes,
             thread_count,
             start_time_seconds,
+            worker_last_success,
+        }
+    }
+
+    /// Publish per-worker progress from the `/health` registry into the gauge family. Called at
+    /// scrape time by the `/metrics` handler rather than on every heartbeat: the registry is the
+    /// single source of truth, workers keep a single reporting call, and the gauge appears the
+    /// moment a worker registers (a gauge that exists-at-some-value is the whole point — an
+    /// unincremented counter family would emit nothing and absence is indistinguishable from
+    /// health, the exact trap this metric closes).
+    pub fn sync_worker_progress(&self, health: &crate::health::Health) {
+        for (worker, last_ms) in health.snapshot() {
+            #[allow(clippy::cast_precision_loss)] // unix millis fit f64 exactly until year 287396
+            self.worker_last_success
+                .get_or_create(&LabelWorker { worker })
+                .set(last_ms as f64 / 1000.0);
         }
     }
 
@@ -464,9 +491,13 @@ pub fn build_router(
         .route("/health", get(health_handler))
         .route(
             "/metrics",
-            get(|Extension(m): Extension<Arc<RelayerMetrics>>| async move {
-                m.build_metrics_response()
-            }),
+            get(
+                |Extension(m): Extension<Arc<RelayerMetrics>>,
+                 Extension(health): Extension<Arc<crate::health::Health>>| async move {
+                    m.sync_worker_progress(&health);
+                    m.build_metrics_response()
+                },
+            ),
         )
         .route("/votes/{message_hash}", get(votes_handler))
         .layer(Extension(metrics))
@@ -599,6 +630,11 @@ pub struct LabelSigner {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct LabelWorker {
+    pub worker: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct LabelVote {
     pub chain_key: u64,
     pub outcome: VoteOutcome,
@@ -649,6 +685,37 @@ mod tests {
         for needle in ["chain_key=\"8\"", "role=\"delivery\"", "0xf39Fd6e5", " 0.5"] {
             assert!(line.contains(needle), "missing {needle} in: {line}");
         }
+    }
+
+    /// The idle-vs-hung gap this closes: on 2026-08-30 the relayer went silent for a day and the
+    /// only way to tell "healthy and idle" from "wedged" was log forensics — /health knew the
+    /// per-worker progress the whole time but Prometheus could not see it. The gauge must (a)
+    /// carry the worker name from the health registry verbatim, and (b) encode a plausible unix
+    /// time in SECONDS, so `time() - metric` alerting works.
+    #[test]
+    fn worker_progress_reaches_the_scrape_body() {
+        let m = RelayerMetrics::new(&[8]);
+        let h = crate::health::Health::new(crate::health::PROGRESS_DEADLINE);
+        h.heartbeat("outbox:8");
+        m.sync_worker_progress(&h);
+        let body = m.encode();
+        let line = body
+            .lines()
+            .find(|l| {
+                l.contains("relayer_worker_last_success_timestamp_seconds")
+                    && l.contains("outbox:8")
+            })
+            .unwrap_or_else(|| panic!("no sample for worker=\"outbox:8\":\n{body}"));
+        let value: f64 = line
+            .rsplit(' ')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("unparseable sample line: {line}"));
+        // A milliseconds value would be ~1.7e12 — three orders of magnitude past this bound.
+        assert!(
+            (1.0e9..1.0e10).contains(&value),
+            "expected unix SECONDS (~1.7e9), got {value} — a ms/seconds mixup breaks time()-based alerts"
+        );
     }
 
     /// 0 still encodes; an unincremented counter family emits nothing) and the no-op outcome to
