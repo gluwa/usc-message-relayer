@@ -244,7 +244,12 @@ mod tests {
         )
         .await
         .unwrap();
-        // Zero deadline: anything registered would already be stale.
+        // `Health::status` compares age with a strict `>`, so with the zero deadline a
+        // registration made in this same millisecond would still read as alive and mask a
+        // reintroduced register-then-park bug (Bugbot, #54). Let the clock tick first: after
+        // any positive age, a registered component is stale and only a never-registered one
+        // keeps /health green.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let (alive, stale) = health.status();
         assert!(alive, "idle balance watcher poisoned /health via {stale:?}");
     }
