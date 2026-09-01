@@ -107,13 +107,16 @@ pub async fn run(
     cancel: CancellationToken,
 ) -> Result<()> {
     const HEALTH_KEY: &str = "balance";
-    health.heartbeat(HEALTH_KEY);
 
+    // Register with /health only when there is actual work. Registering first and then parking
+    // would leave a registered-but-silent component, and past PROGRESS_DEADLINE the liveness
+    // probe would restart-loop a relayer that is idle by design (Bugbot, #54).
     if targets.is_empty() {
         debug!("no signing keys configured; balance watcher idle");
         cancel.cancelled().await;
         return Ok(());
     }
+    health.heartbeat(HEALTH_KEY);
 
     let mut providers: Vec<Option<Box<dyn Provider>>> = targets.iter().map(|_| None).collect();
     loop {
@@ -223,6 +226,27 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A watcher with nothing to watch must not register with /health: registered-then-parked
+    /// means a permanently stale component, and the liveness probe would restart-loop a relayer
+    /// that simply has no signing keys configured.
+    #[tokio::test]
+    async fn an_idle_watcher_never_registers_with_health() {
+        let health = crate::health::Health::new(std::time::Duration::ZERO);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        run(
+            Vec::new(),
+            Arc::new(crate::prom::NoopMetrics),
+            health.clone(),
+            cancel,
+        )
+        .await
+        .unwrap();
+        // Zero deadline: anything registered would already be stale.
+        let (alive, stale) = health.status();
+        assert!(alive, "idle balance watcher poisoned /health via {stale:?}");
     }
 
     /// An unparseable key is the used-by worker's error to raise with full context; the balance
