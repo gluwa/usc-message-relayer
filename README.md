@@ -246,9 +246,9 @@ for the wire protocol.
 ### Docker
 
 ```bash
-docker build -t gluwa/usc-message-relayer:$(git rev-parse --short HEAD) .
+docker build -t gluwa/asc-message-relayer:$(git rev-parse --short HEAD) .
 # from Apple Silicon for an amd64 cluster:
-docker buildx build --platform linux/amd64 -t gluwa/usc-message-relayer:<sha> --push .
+docker buildx build --platform linux/amd64 -t gluwa/asc-message-relayer:<sha> --push .
 ```
 
 Two-stage build; runtime is `debian:bookworm-slim` with the binary at `/bin/message-relayer`
@@ -256,7 +256,7 @@ Two-stage build; runtime is `debian:bookworm-slim` with the binary at `/bin/mess
 git SHA so what's running is never ambiguous.
 
 CI publishes images automatically (`.github/workflows/release.yml`): every push to `main` →
-`gluwa/usc-message-relayer:main` + `:main-<sha>`; every `v*` tag → `:vX.Y.Z` + `:latest`, plus a
+`gluwa/asc-message-relayer:main` + `:main-<sha>`; every `v*` tag → `:vX.Y.Z` + `:latest`, plus a
 GitHub Release with the linux-amd64 binary. Pull requests run fmt / clippy (`-D warnings`) /
 taplo / cargo-machete / tests / a no-push Docker build (`ci.yml`). Publishing requires the
 `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` repo secrets.

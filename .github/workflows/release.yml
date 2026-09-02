@@ -14,7 +14,10 @@ on:
 permissions: read-all
 
 env:
-  IMAGE: gluwa/usc-message-relayer
+  # Docker Hub repo name, which had lagged the GitHub rename (usc- -> asc-). The old
+  # gluwa/usc-message-relayer keeps its existing tags and is not deleted, so anything still
+  # pinned to a published usc- tag (e.g. 0.6.0) keeps pulling; new builds publish here.
+  IMAGE: gluwa/asc-message-relayer
 
 jobs:
   image:
