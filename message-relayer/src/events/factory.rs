@@ -1,9 +1,12 @@
 //! Outbox address resolution.
 //!
-//! Production: a factory contract on Creditcoin L1 maps `chainKey` → `Outbox` address (PoC PDF
-//! §4). PoC: the relayer falls back to the `outbox_address` set on each [`ChainRoute`] when no
-//! factory has been deployed yet. The trait is in place so swapping in the real factory is a
-//! one-impl change rather than a refactor across modules.
+//! Three [`OutboxResolver`] implementations, selected per route in `message-relayer::lib`'s
+//! resolver-selection block: [`ConfigOverrideResolver`] for an explicit `outbox_address`;
+//! [`RegistryResolver`] for a route pinned to a specific `outbox_registry_address`; and
+//! [`FactoryResolver`] for everything else, which reads the discovery-registry address off the
+//! chain-info precompile itself (see [`resolve_from_precompile_registry`]) and only falls back to
+//! scanning the factory's permissionless `OutboxCreated` logs when no registry is registered for
+//! the chain key yet.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -99,39 +102,7 @@ impl OutboxResolver for RegistryResolver {
             )
         })?;
 
-        // `chainKey` is `uint32` on the contract side while the pallet and these mirrors carry it
-        // as `u64`. Reject anything unrepresentable rather than truncating: a silently wrapped key
-        // would read the registry for a *different* chain and bind the wrong Outbox.
-        let chain_key_u32 = u32::try_from(chain_key).with_context(|| {
-            format!(
-                "chain_key {chain_key} exceeds the uint32 the Outbox registry is keyed by, so it \
-                 cannot be represented on-chain"
-            )
-        })?;
-
-        let deployer = IOutboxDeployer::new(registry, provider);
-        let address = tokio::time::timeout(
-            PRECOMPILE_CALL_TIMEOUT,
-            deployer.outboxOf(chain_key_u32).call(),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "chain_key {chain_key}: outboxOf on registry {registry} timed out after \
-                 {PRECOMPILE_CALL_TIMEOUT:?}"
-            )
-        })?
-        .with_context(|| {
-            format!("chain_key {chain_key}: outboxOf call on registry {registry} failed")
-        })?;
-
-        if address.is_zero() {
-            anyhow::bail!(
-                "chain_key {chain_key}: registry {registry} has no Outbox for this chain key \
-                 (outboxOf returned the zero address) — deploy through OutboxDeployer, or point \
-                 `outbox_registry_address` at the registry that holds it"
-            );
-        }
+        let address = outbox_from_registry(chain_key, registry, provider).await?;
 
         // No creation block to report: the registry stores the address only. `current_since_block`
         // is an optimisation for the message watcher's start height, and `None` simply means it
@@ -141,6 +112,145 @@ impl OutboxResolver for RegistryResolver {
             current_since_block: None,
         })
     }
+}
+
+/// Call `outboxOf(chainKey)` on `registry` and turn a zero answer into an error. Used only by
+/// [`RegistryResolver`]'s explicitly configured `registry` — kept on `outboxOf`/`OutboxDeployer`
+/// deliberately, matching PR #45's original reasoning: `outboxOf` exists at the pinned
+/// contracts SHA and is drift-gate-checked today, while the better long-term target,
+/// `OutboxDiscovery.defaultOutbox` (see [`default_outbox_from_discovery`]), depends on
+/// asc-contracts#38, still unmerged. Swapping this one too is a follow-up once that pin moves.
+async fn outbox_from_registry(
+    chain_key: u64,
+    registry: Address,
+    provider: &DynProvider,
+) -> Result<Address> {
+    // `chainKey` is `uint32` on the contract side while the pallet and these mirrors carry it
+    // as `u64`. Reject anything unrepresentable rather than truncating: a silently wrapped key
+    // would read the registry for a *different* chain and bind the wrong Outbox.
+    let chain_key_u32 = u32::try_from(chain_key).with_context(|| {
+        format!(
+            "chain_key {chain_key} exceeds the uint32 the Outbox registry is keyed by, so it \
+             cannot be represented on-chain"
+        )
+    })?;
+
+    let deployer = IOutboxDeployer::new(registry, provider);
+    let address = tokio::time::timeout(
+        PRECOMPILE_CALL_TIMEOUT,
+        deployer.outboxOf(chain_key_u32).call(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "chain_key {chain_key}: outboxOf on registry {registry} timed out after \
+             {PRECOMPILE_CALL_TIMEOUT:?}"
+        )
+    })?
+    .with_context(|| {
+        format!("chain_key {chain_key}: outboxOf call on registry {registry} failed")
+    })?;
+
+    if address.is_zero() {
+        anyhow::bail!(
+            "chain_key {chain_key}: registry {registry} has no Outbox for this chain key \
+             (outboxOf returned the zero address) — deploy through OutboxDeployer, or point \
+             `outbox_registry_address` at the registry that holds it"
+        );
+    }
+
+    Ok(address)
+}
+
+/// Call `defaultOutbox(chainKey)` on `discovery` and turn a zero answer into an error. Used only
+/// by [`resolve_from_precompile_registry`], whose registry address comes from the chain-info
+/// precompile rather than route config, so it is free to target the current interface directly
+/// instead of `outboxOf`/`OutboxDeployer` (see [`outbox_from_registry`]'s doc for why that one
+/// stays as-is). `defaultOutbox`, not `outboxOf`, is the confirmed source of truth: "the default
+/// deployed outbox for each chain via: `defaultOutbox(chainKey)` (not from deployer) because
+/// there will be multiple version[s] of outbox" (Kevin Nguyen, Slack, 28 Aug 2026).
+async fn default_outbox_from_discovery(
+    chain_key: u64,
+    discovery: Address,
+    provider: &DynProvider,
+) -> Result<Address> {
+    // `chainKey` is `uint32` on the contract side while the pallet and these mirrors carry it
+    // as `u64`. Reject anything unrepresentable rather than truncating: a silently wrapped key
+    // would read the registry for a *different* chain and bind the wrong Outbox.
+    let chain_key_u32 = u32::try_from(chain_key).with_context(|| {
+        format!(
+            "chain_key {chain_key} exceeds the uint32 the Outbox registry is keyed by, so it \
+             cannot be represented on-chain"
+        )
+    })?;
+
+    let discovery_contract = IOutboxDiscovery::new(discovery, provider);
+    let address = tokio::time::timeout(
+        PRECOMPILE_CALL_TIMEOUT,
+        discovery_contract.defaultOutbox(chain_key_u32).call(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "chain_key {chain_key}: defaultOutbox on registry {discovery} timed out after \
+             {PRECOMPILE_CALL_TIMEOUT:?}"
+        )
+    })?
+    .with_context(|| {
+        format!("chain_key {chain_key}: defaultOutbox call on registry {discovery} failed")
+    })?;
+
+    if address.is_zero() {
+        anyhow::bail!(
+            "chain_key {chain_key}: registry {discovery} has no default Outbox for this chain \
+             key (defaultOutbox returned the zero address)"
+        );
+    }
+
+    Ok(address)
+}
+
+/// Look up the discovery-registry address for `chain_key` from the chain-info precompile and, if
+/// one is registered, resolve the Outbox from it via [`default_outbox_from_discovery`]. This is
+/// what makes registry-based resolution the automatic default for [`FactoryResolver`] rather than
+/// something every route must opt into: no config change is needed once governance registers a
+/// discovery address for a chain key.
+///
+/// Returns `Ok(None)` — not an error — when no discovery address is registered for `chain_key`
+/// yet, so the caller falls through to the factory scan in that case. Any other failure (a
+/// registered-but-reverting registry, or one that answers zero) propagates as an error rather than
+/// silently falling back to the spoofable log scan.
+async fn resolve_from_precompile_registry(
+    chain_key: u64,
+    provider: &DynProvider,
+) -> Result<Option<ResolvedOutbox>> {
+    let chain_info = IChainInfo::new(CHAIN_INFO_PRECOMPILE, provider);
+    let discovery_result = tokio::time::timeout(
+        PRECOMPILE_CALL_TIMEOUT,
+        chain_info.get_outbox_discovery_address(chain_key).call(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "chain_key {chain_key}: get_outbox_discovery_address precompile call timed out \
+             after {PRECOMPILE_CALL_TIMEOUT:?}"
+        )
+    })?
+    .with_context(|| {
+        format!("chain_key {chain_key}: get_outbox_discovery_address precompile call failed")
+    })?;
+
+    if !discovery_result.exists || discovery_result.discoveryAddr.is_zero() {
+        return Ok(None);
+    }
+
+    let address =
+        default_outbox_from_discovery(chain_key, discovery_result.discoveryAddr, provider).await?;
+
+    Ok(Some(ResolvedOutbox {
+        address,
+        current_since_block: None,
+    }))
 }
 
 sol! {
@@ -159,6 +269,29 @@ sol! {
             external
             view
             returns (address factoryAddr, bool exists);
+
+        /// The Outbox discovery-registry contract governing `chainKey` (`OutboxDiscovery` in
+        /// asc-contracts), from `pallet_supported_chains::OutboxDiscoveries`. Unlike the factory
+        /// above, this address is safe to trust directly: it is only ever written through an
+        /// access-controlled deploy path, so `defaultOutbox` on it can be read straight into a
+        /// resolved Outbox instead of scanning `OutboxCreated` logs. `exists = false` (with
+        /// `discoveryAddr` the zero address) when nothing is registered for `chainKey`.
+        function get_outbox_discovery_address(uint64 chainKey)
+            external
+            view
+            returns (address discoveryAddr, bool exists);
+    }
+
+    /// `IOutboxDiscovery` (asc-contracts#38, unmerged as of this binding — not yet checked by the
+    /// `abi_surface` drift gate, same treatment as `IChainInfo` above). Confirmed as the source of
+    /// truth on Slack (Kevin Nguyen, 28 Aug 2026): "the default deployed outbox for each chain
+    /// via: defaultOutbox(chainKey) (not from deployer) because there will be multiple version[s]
+    /// of outbox".
+    #[sol(rpc)]
+    #[derive(Debug)]
+    contract IOutboxDiscovery {
+        /// The default Outbox for `chainKey`, or the zero address if none.
+        function defaultOutbox(uint32 chainKey) external view returns (address);
     }
 }
 
@@ -506,6 +639,20 @@ impl FactoryResolver {
 impl OutboxResolver for FactoryResolver {
     async fn resolve(&self, route: &ChainRoute, provider: &DynProvider) -> Result<ResolvedOutbox> {
         let chain_key = route.chain_key;
+
+        // Prefer a registered discovery registry over the factory's log stream — see
+        // `resolve_from_precompile_registry`. Falls through unchanged to the factory scan below
+        // when no registry is registered for this chain key yet, so migration is automatic and
+        // gradual: no config change needed once governance sets the discovery address on-chain,
+        // and a chain key not yet migrated keeps resolving exactly as before.
+        if let Some(resolved) = resolve_from_precompile_registry(chain_key, provider).await? {
+            info!(
+                chain_key,
+                address = %resolved.address,
+                "🧭 resolved Outbox on-chain (discovery registry)"
+            );
+            return Ok(resolved);
+        }
 
         let chain_info = IChainInfo::new(CHAIN_INFO_PRECOMPILE, provider);
         let factory_result = tokio::time::timeout(
